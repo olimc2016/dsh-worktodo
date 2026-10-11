@@ -1,0 +1,31 @@
+# pnpm 11 起，这类设置从这里读（package.json 的 pnpm 字段已不再被读取）。
+#
+# 这里显式**禁止** esbuild 跑构建脚本，原因：
+#   1. esbuild 通过自身的平台可选依赖（@esbuild/<platform>）已经带了预编译二进制，
+#      不需要 postinstall；
+#   2. 它的 postinstall 会调 PATH 上的 `node`，而 DSH 自带工具链的环境里往往只有
+#      捆绑的 node 可执行文件、PATH 上没有 `node`，允许构建反而会以
+#      `sh: node: command not found` 失败。
+# 显式写 false 可以让每次 install 的行为确定，也不会再出现「Ignored build scripts」提示。
+allowBuilds:
+  esbuild: false
+
+# 不自动安装 peer。
+#
+# 两个理由，都很实在：
+#   1. 本项目的平台包（@deepseek-ai/dsh-tools 等）声明为 peer，是**由 DSH 运行时提供**的
+#      （见 docs/verification.md 的解析说明），自己装一份只会多出一份副本、还可能版本漂移；
+#      DSH 给 profile 的 pnpm 配置也是 autoInstallPeers: false，这里保持一致。
+#   2. 我本地一直用 `--config.auto-install-peers=false` 装，如果这个设置不写进配置文件，
+#      CI 上一条普通的 `pnpm install --frozen-lockfile` 就会得到不同的解析结果、甚至因
+#      lockfile 不一致直接失败——「本地能跑、CI 红」的经典来源。
+autoInstallPeers: false
+
+# 跑脚本时把 node 可执行文件所在目录放到 PATH 最前面。
+#
+# 为什么需要：package.json 里的脚本（build / test / prepublishOnly）内部都调 `node`，
+# 而 **DSH 自带工具链的环境里 `node` 不在 PATH 上**——那里只有捆绑的 node 可执行文件，
+# 于是 `pnpm run build` 会以 `sh: node: command not found` 失败（本地实测踩到）。
+# 打开这个设置后，即使是用绝对路径调起来的 pnpm，脚本子进程也能找到 node。
+# 对普通开发者的终端没有任何影响（node 本来就在 PATH 上，前置一次是幂等的）。
+scriptsPrependNodePath: true

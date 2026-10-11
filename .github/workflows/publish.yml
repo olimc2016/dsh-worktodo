@@ -1,0 +1,78 @@
+# 发布到 npm。
+#
+# 触发方式：推 tag（v*，日常用这个）/ 手动（workflow_dispatch，可选直接发布或暂存）。
+#
+# 认证：**Trusted Publishing（OIDC）**，不需要任何 secret —— 仓库身份由 GitHub Actions 提供，
+# 运行时换一张短时 npm token。首版已用 token 手动发布过；从 0.1.1 起走这里。
+# 绑定位置（浏览器里完成 2FA 确认）：https://www.npmjs.com/package/dsh-worktodo/access
+#   Organization or user: olimc2016 / Repository: dsh-worktodo / Workflow filename: publish.yml / Environment: 留空
+#   ⚠️ 绑定页若让你选允许的动作，必须与本 workflow 走的分支一致：
+#        - 默认（推 tag 走暂存）→ 需要允许 `npm stage publish`（npm 推荐只开这一项）
+#        - 手动选 publish（直接上线）→ 需要允许 `npm publish`
+#
+# 为什么默认"暂存"而不是直接发布（两条官方依据）：
+#   1. npm 在 staged-publishing 文档里明确推荐：自动流程只负责暂存，**批准（2FA）由人类完成**；
+#      并建议把 trust relationship 配成只允许 `npm stage publish`、禁止 `npm publish`。
+#   2. 维护者的 2FA 是 WebAuthn 型（passkey / 安全密钥）：命令行做不了 WebAuthn，而
+#      `npm stage publish` **永不要求 2FA**、`npm publish` 需要"存在性证明"——
+#      所以"CI 暂存 + 网页完成 2FA 批准"是唯一顺畅的形态。
+#      网页端批准入口：npmjs.com → Staged Packages → Approve。
+#
+# 尚未在真机验证：本 workflow 需要一次真实的 tag 发布才算验证过。
+# 本地能验证到的是它调用的每一步：pnpm install --frozen-lockfile / pnpm test / pnpm run build / pnpm pack。
+name: publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'stage = 提交到暂存区（你去 npmjs.com 完成 2FA 批准）；publish = 直接上线（需绑定页允许 publish）'
+        type: choice
+        options:
+          - stage
+          - publish
+        default: stage
+
+permissions:
+  contents: read
+  id-token: write # OIDC 换取 npm 发布凭据，必需
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 顺序有讲究：pnpm 必须先于 setup-node，否则 setup-node 的 pnpm 缓存没有可缓存的对象
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dev deps
+        # 测试要加载官方 @deepseek-ai/dsh-tools 来校验工具 schema，所以必须装 devDependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build client bundle
+        run: pnpm run build
+
+      # 推 tag 走这条；手动触发时选了 stage 也走这条
+      - name: Stage the release (you approve it on npmjs.com with 2FA)
+        if: github.event_name == 'push' || inputs.mode == 'stage'
+        run: npm stage publish --provenance --access public
+
+      # 仅手动选择 publish 时走这条；绑定页必须允许 `npm publish`
+      - name: Publish directly (no approval step)
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'publish'
+        run: npm publish --provenance --access public

@@ -1,0 +1,12 @@
+{
+  "$schema": "../schema/plugin.schema.json",
+  "id": "olimc2016/dsh-worktodo",
+  "name": "dsh-worktodo",
+  "repository": "https://github.com/olimc2016/dsh-worktodo",
+  "category": "ui",
+  "description": {
+    "en": "A sidebar work todo panel with priorities, due dates, projects, overdue and this-week views. Todos persist across sessions in the Harness storage layer, and worktodo_* tools let the agent read and write the same list as the user.",
+    "zh": "侧栏工作待办面板：优先级、截止日期、项目、逾期与本周视图。待办跨会话持久保存在 Harness 存储层，并提供 worktodo_* 工具，让 agent 与用户读写同一份列表。"
+  },
+  "added": "2026-10-11"
+}

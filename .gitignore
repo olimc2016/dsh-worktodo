@@ -1,0 +1,23 @@
+# 依赖（pnpm 装出来的平台二进制很大，绝不要提交）
+node_modules/
+
+# 打包产物（Release 用的 tarball，用 npm pack 重新生成即可）
+*.tgz
+
+# 本地笔记 / 发布流程清单（含本机环境信息，不进公开仓库、不进 npm 包）
+publish-checklist.local.md
+
+# npm 凭据（如果按清单里那条 token 路径发布，会在这里写 token）：绝不能提交
+.npmrc
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+.tmp/

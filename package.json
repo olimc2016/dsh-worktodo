@@ -1,0 +1,128 @@
+{
+  "name": "dsh-worktodo",
+  "version": "0.1.0",
+  "description": "DSH 工作待办面板（社区插件，非官方）：归你所有、跨会话持久的工作待办——优先级 / 截止日期 / 项目 / 逾期与本周视图，agent 通过 worktodo_* 工具读写同一份列表。官方 todo_write 属于单个会话且只能整表替换，这份列表属于人。Human-owned cross-session work todo list for DeepSeek Harness: priorities, due dates, projects, overdue/week views and worktodo_* tools the agent shares with you.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "locale",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "todo",
+    "todo-list",
+    "task",
+    "task-management",
+    "worktodo",
+    "work",
+    "priority",
+    "due-date",
+    "deadline",
+    "overdue",
+    "checklist",
+    "panel",
+    "sidebar",
+    "待办",
+    "工作待办"
+  ],
+  "icon": "./icon.svg",
+  "meta": {
+    "title": "工作待办",
+    "description": "归你所有、跨会话持久的工作待办：优先级、截止日期、项目、逾期与本周视图，agent 也能读写同一份列表。"
+  },
+  "homepage": "https://github.com/olimc2016/dsh-worktodo#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/olimc2016/dsh-worktodo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/olimc2016/dsh-worktodo/issues"
+  },
+  "author": "oli20",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ]
+    }
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-home-paths": ">=0.1.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-storage-domain": ">=0.1.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.1 <0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-storage-domain": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-home-paths": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.4",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-home-paths": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-invariants": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-ptc-runtime": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox-policy": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-scope": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-user-approval": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-util-values": "0.2.0-rc.2",
+    "esbuild": "^0.28.2"
+  },
+  "scripts": {
+    "build": "node tools/build-client.mjs",
+    "watch": "node tools/build-client.mjs --watch",
+    "test": "node tools/verify-all.mjs",
+    "prepublishOnly": "node tools/build-client.mjs && node tools/verify-all.mjs"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "license": "MIT"
+}

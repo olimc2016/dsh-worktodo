@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="工作待办">
+  <!-- 底色用实心圆角块：任何主题（深/浅）下都能看清，不依赖宿主背景色 -->
+  <rect x="2" y="2" width="44" height="44" rx="12" fill="#2563EB"/>
+  <!-- 第一行：已勾选的事（勾 + 删除线感的短线） -->
+  <path d="M12.5 16.5l3.2 3.2 6.3-6.8" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="26" y="14.5" width="10" height="3" rx="1.5" fill="#FFFFFF" opacity="0.75"/>
+  <!-- 第二行：进行中的事（空心圈） -->
+  <circle cx="14.2" cy="27.5" r="3.4" fill="none" stroke="#FFFFFF" stroke-width="2.4"/>
+  <rect x="26" y="26" width="10" height="3" rx="1.5" fill="#FFFFFF" opacity="0.75"/>
+  <!-- 第三行：还没开始的事（空心圈，更淡） -->
+  <circle cx="14.2" cy="37.5" r="3.4" fill="none" stroke="#FFFFFF" stroke-width="2.4" opacity="0.6"/>
+  <rect x="26" y="36" width="7" height="3" rx="1.5" fill="#FFFFFF" opacity="0.55"/>
+</svg>

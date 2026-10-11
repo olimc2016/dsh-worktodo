@@ -1,0 +1,16 @@
+# worktodo bundle patch：把自己插进 DSH 的 profile 层栈。
+# 宿主半侧（Node）由 Loader 按 `name` 加载 lib/index.js；
+# 浏览器半侧由 package.json 的 dsh.client 声明并组合成 bundle。
+#
+# row id 必须唯一：这里用 `worktodo`（与包名短名一致，也用于面板 slot id 与 /worktodo 路由前缀）。
+# 官方 @deepseek-ai/dsh-tool-todo 占的是 `tool-todo`，不冲突——两者互补：
+# 官方那份是单个 agent 会话的计划（整表替换、三态），本插件是人的跨会话工作待办。
+- insert:
+    - id: worktodo
+      name: 'dsh-worktodo'
+      config:
+        # 留空即用默认值：优先官方 storage（$DSH_HOME/storages），
+        # storage 不可用时回退 $DSH_HOME/worktodo/todos.json。
+        # 想固定存到自己的路径（例如放进 git 仓库）就写 storePath：
+        # storePath: /Users/me/notes/worktodo.json
+        {}
