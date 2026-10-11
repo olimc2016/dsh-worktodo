@@ -11,12 +11,16 @@
  * 存储指向临时目录，绝不碰用户真实的 ~/.dsh。
  */
 import { Readable } from 'node:stream';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 // DSH 判定「工具返回值是否 lossless JSON」用的就是这一个函数（见 assertLossless 的说明）
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values';
 import { apply } from '../lib/index.js';
+
+// 版本断言从 package.json 动态读：硬编码会让每次发版都变红
+// （0.1.0 → 0.1.1 时正是这样被自己抓到的）
+const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 let passed = 0;
 const failures = [];
@@ -179,7 +183,7 @@ await test('health 自检报告存储位置、版本与工具注册结果', asyn
   eq(body.store.kind, 'file');
   eq(body.count, 0);
   // 版本与工具注册结果：排查「源码改动生效了没 / 工具静默没注册」就看这两个字段
-  eq(body.version, '0.1.0');
+  eq(body.version, pkgVersion);
   eq(body.tools.status, 'registered');
   eq(body.tools.registered, 6);
   eq(body.tools.names.includes('worktodo_add'), true);
