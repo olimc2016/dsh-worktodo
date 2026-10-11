@@ -4,8 +4,13 @@
 
 ## 0.1.1
 
-### 修复
+### 修复（重要）
 
+- **装出来的插件根本无法启动**：0.1.0 把运行期真正 import 的三个官方平台包（`@deepseek-ai/dsh-tools`、
+  `@deepseek-ai/dsh-storage-domain`、`@deepseek-ai/dsh-home-paths`）只声明为 `peerDependencies`，
+  于是从 npm / GitHub 装出来的包**没有任何可解析的平台包**，DSH 启动时该插件直接加载失败
+  （实测：工具全部消失，`worktodo_list` 报 `unknown tool`）。现在改为 `dependencies`——
+  实测从 GitHub 安装后，从插件自身位置三个包都能解析。
 - **npm 包页面没有 README**：0.1.0 是经「暂存发布」（staged publishing）上线的，而实测那条路径**不会写入 registry 的 `readme` 字段**
   （同机对照：普通 `publish` 的包 `readme` 有 8193 字符，本包 0 字符），于是包页面没有 README。
   本版改为**直接发布**——OIDC 下同样不需要人类 2FA，所以并没有牺牲自动化。

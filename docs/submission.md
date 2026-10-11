@@ -8,7 +8,7 @@
 > dsh plugin --profile desktop add github:olimc2016/dsh-worktodo
 > ```
 >
-> 这条路已实测（见 `docs/verification.md`：只解析 1 个包、316 KB、无需构建授权）。
+> 这条路已实测（见 `docs/verification.md`：顶层 1 个包 + 3 个官方平台包、约 12 MB、无需构建授权）。
 > 等 npm 那关过了，同一个条目会自动变成可一键安装——install 命令取自 npm 包，不取自仓库。
 
 ---

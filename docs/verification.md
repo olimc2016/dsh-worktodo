@@ -333,9 +333,10 @@ granular token」，而现在这个 token 两者都不是。
 后，普通 `pnpm add dsh-worktodo` 都是**干净的 316 KB、无嵌套 node_modules**。
 所以这是**安装器行为**，对任何带 devDependencies 的插件都一样。
 
-**处理**：那棵 `node_modules` 只是开发依赖、运行时用不到，已删除 → profile 回到 **316 KB**，
-并且这**正好造出了最忠实的"真 registry 形态"**（包内零依赖），重启 DSH 后即可验证
-「发布产物能否在 DSH 里正常加载 + 平台包是否由拦截层提供 + lossless-JSON 修复是否生效」。
+**当时的处理（❌ 错的，已在 0.1.1 更正）**：我判断"那棵 `node_modules` 只是开发依赖、运行时用不到"，
+于是把它删掉，以为顺便造出了"真 registry 形态"（包内零依赖）。**这个判断是错的**——见下面那节：
+删掉之后 DSH 重启时**插件直接加载失败**，因为那三个官方平台包正是运行期 import 的东西。
+真正的修法是把它们从 `peerDependencies` 改成 `dependencies`（0.1.1），不是删本地副本。
 
 ## ⚠️ ⚠️ 用 `dsh plugin remove` 卸载 link 安装的插件，会清空被链接仓库的 `node_modules`
 
@@ -567,6 +568,55 @@ npm error 404  'dsh-worktodo@0.1.1' is not in this registry.
 **顺带查到的**：`GET https://registry.npmjs.org/-/package/<pkg>/trust` 这个接口**存在**（返回
 `401 Bearer token authorization is required`），但需要 npm 凭据；没有公开的匿名查询方式，所以核对只能看
 <https://www.npmjs.com/package/dsh-worktodo/access>。
+
+## ❌→✅ 插件启动失败：只声明 `peerDependencies` 是错的（0.1.1 修复）
+
+**用户报告**：「代办启动失败了」。实测确认插件确实没加载——我自己的工具调用直接报
+`Error: unknown tool "worktodo_list"`（工具全没了）。
+
+### 根因
+
+profile 里装的是 registry 版、而我此前删掉了包内的 `node_modules`，于是从安装位置解析平台包直接失败：
+
+```
+✗ ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/dsh-tools'
+  imported from ~/.dsh/profiles/desktop/node_modules/dsh-worktodo/
+```
+
+而且 **profile 根目录的 `@deepseek-ai/` 是空的**——也就是说在这个 DSH 版本里，
+**运行期并不会替插件提供平台包**；插件必须自己带上，或者被 `link:` 到有 `node_modules` 的目录。
+
+### 修法（照"能正常工作的那个插件"来）
+
+对照 `dsh-token-meter-panel`（一直在正常工作）的声明方式：
+
+```json
+"dependencies": { "@deepseek-ai/dsh-home-paths": "^0.2.0-rc.2", "@deepseek-ai/schemastery": "^3.18.2" }
+```
+
+于是把运行期真正 import 的三个平台包从 `peerDependencies` 移到 `dependencies`：
+
+| 包 | 用途 |
+|---|---|
+| `@deepseek-ai/dsh-tools` | `defineTool` |
+| `@deepseek-ai/dsh-storage-domain` | `defineDomain` |
+| `@deepseek-ai/dsh-home-paths` | 存储路径 |
+
+（`@deepseek-ai/cordis` 与 `@deepseek-ai/dsh-tool-todo` 只出现在 **JSDoc / 注释**里，不是运行期 import，
+所以 cordis 仍作为可选 peer 保留，`dsh-tool-todo` 根本不声明。）
+
+### 实测验证
+
+| 检查 | 结果 |
+|---|---|
+| 从 GitHub 安装（`pnpm add github:olimc2016/dsh-worktodo`） | 顶层 1 个包 + 3 个官方平台包 ✓ |
+| 从**插件自身位置** import 三个平台包 | **全部可解析** ✓（修复前全部 `ERR_MODULE_NOT_FOUND`） |
+| profile 侧（`link:` 形态） | 三个包全部可解析 ✓ |
+| 安装体积 | 约 **12 MB**（其中约 8 MB 是官方 `dsh-tools` 依赖的 zod）——README 里的 "316 KB / 零依赖" 表述已按实测更正 |
+
+**教训（值得记住）**：官方文档说"平台包由运行时提供、不要声明为依赖"，但**这个 DSH 版本的实际行为不是那样**
+（profile 根的 `@deepseek-ai/` 是空的，实测启动失败）。**能工作的那个插件怎么声明，就怎么声明**——
+同机对照比文档更可靠。此外：**"零依赖"是个诱人但危险的卖点**，它把"装出来能不能跑"赌在了一个未验证的运行时行为上。
 
 ## 回滚方式
 

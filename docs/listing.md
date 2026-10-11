@@ -5,7 +5,7 @@
 > 2026-10 观察：DSH 主线进入 0.2.x 后，一批同类插件被版本闸门拒绝；同期有人在大批「占名」
 > （npm 上 `dsh-planner`、`dsh-focus`、`dsh-checklist`、`dsh-standup`、`dsh-tasks`、`dsh-workdesk`
 > 全是 v0.0.1 且描述写着 "Name reserved; first release in development"）。
-> 所以文案把「兼容 0.2.x / 零 npm 依赖 / 归人所有而非属于会话」这三条提到最前面——它们是当前最有效的差异点。
+> 所以文案把「兼容 0.2.x / 运行期只依赖 3 个官方平台包 / 归人所有而非属于会话」这三条提到最前面——它们是当前最有效的差异点。
 
 ---
 
@@ -13,7 +13,7 @@
 
 **名称**：工作待办（dsh-worktodo）
 
-**一句话**：兼容 DSH 0.2.x、零 npm 依赖的工作待办面板——优先级、截止日期、项目、逾期与本周视图，agent 通过 `worktodo_*` 工具读写**同一份**列表。
+**一句话**：兼容 DSH 0.2.x、运行期只依赖 3 个官方平台包的工作待办面板——优先级、截止日期、项目、逾期与本周视图，agent 通过 `worktodo_*` 工具读写**同一份**列表。
 
 **简介（约 150 字）**：
 官方 `todo_write` 是**单个 agent 会话**的计划：整表替换、只有三态、官方明说「不存在跨会话共享列表的方式」，
@@ -27,7 +27,7 @@
 
 **分类**：任务管理 / 侧栏面板 / Web UI
 
-**安装**（两条；GitHub 那条**已实测**可用，见 `docs/verification.md`——只解析 1 个包、316 KB、无需构建授权）：
+**安装**（两条；GitHub 那条**已实测**可用，见 `docs/verification.md`——顶层 1 个包 + 3 个官方平台包、约 12 MB、无需构建授权）：
 
 ```bash
 dsh plugin --profile desktop add github:olimc2016/dsh-worktodo   # 不依赖 npm 包
@@ -36,7 +36,7 @@ dsh plugin --profile desktop add dsh-worktodo                    # npm 包发布
 
 **亮点**：
 1. **装得上**：兼容 DSH 0.2.x（0.2.0-rc.2 实测）；同类插件不少仍锁在 0.1.x 会被版本闸门拒绝
-2. **零 npm 运行期依赖**（`dependencies: {}`），平台包全部声明为可选 peer
+2. **运行期只依赖 3 个官方平台包**（`@deepseek-ai/dsh-tools` / `dsh-storage-domain` / `dsh-home-paths`），**无任何第三方依赖**
 3. **归人所有**：跨会话、跨项目持久，重启与换会话都还在——与「会话一关就翻篇」的 `todo_write` 互补
 4. **逐项编辑**：按 id / 完整标题 / 唯一标题前缀定位单条修改，不会像整表替换那样动到其他条目
 5. **富字段**：优先级（高/普通/低）、截止日期（支持 `today` / `tomorrow` / `+3d` 这类相对写法）、项目、备注

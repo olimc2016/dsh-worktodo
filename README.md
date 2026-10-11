@@ -2,7 +2,7 @@
 
 **归你所有、跨会话持久的工作待办。** DSH 侧栏一个独立面板，agent 通过 `worktodo_*` 工具读写**同一份**列表。
 
-> 兼容 **DSH 0.2.x**（0.2.0-rc.2 实测）· **零 npm 依赖**（`dependencies: {}`）· 社区插件，非官方
+> 兼容 **DSH 0.2.x**（0.2.0-rc.2 实测）· 运行期只依赖 **3 个官方平台包**（无任何第三方依赖）· 社区插件，非官方
 
 > **关于本文里的路径**：提到 `docs/`、`tools/` 等目录时，指的是**仓库**里的文件——它们不在 npm 发布包内。
 > 仓库地址：<https://github.com/olimc2016/dsh-worktodo>
@@ -38,7 +38,12 @@ dsh plugin --profile desktop add github:olimc2016/dsh-worktodo
 
 这条路是实测过的（见 `docs/verification.md`）：仓库里提交了浏览器半侧的构建产物 `lib/client.js`，
 包内没有 `prepare`/`install` 这类构建脚本，所以 **git 安装不需要任何构建授权**，也不会把开发依赖装进来
-——`pnpm` 直接安装的实测值：只解析 **1 个包**、整个安装 **316 KB**、包内无嵌套 `node_modules`，且安装结果与 npm 发布包逐一相同。
+——实测（从 GitHub 安装）：顶层解析 **1 个包** + 3 个官方平台包，安装约 **12 MB**（其中约 8 MB 是官方 `@deepseek-ai/dsh-tools` 依赖的 zod），
+包内含已构建的 `lib/client.js`，**无需构建授权**。
+
+> **为什么平台包必须是 `dependencies` 而不是 peer**：0.1.0 曾只声明 peer，结果从 npm/GitHub 装出来的包里
+> **没有任何可解析的平台包**，DSH 启动时该插件直接加载失败（工具全部消失）。0.1.1 起改为 `dependencies`——
+> 实测安装后从插件自身位置三个包都能解析。
 （注意：DSH 的插件安装器会额外在包目录里装一次开发依赖，本机观察到 22 MB；那是安装器行为、与包本身无关，
 删掉不影响运行——见 `docs/verification.md`。）
 

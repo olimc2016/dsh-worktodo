@@ -3,7 +3,7 @@
 
 **A work todo list that belongs to you, not to a session.** A dedicated DSH sidebar panel, plus `worktodo_*` tools so the agent reads and writes **the same** list you do.
 
-> Works with **DSH 0.2.x** (tested on 0.2.0-rc.2) · **zero npm runtime dependencies** (`dependencies: {}`) · community plugin, unofficial
+> Works with **DSH 0.2.x** (tested on 0.2.0-rc.2) · runtime deps are **3 official platform packages only** (no third-party deps) · community plugin, unofficial
 
 > **About the paths in this file**: references to `docs/`, `tools/` and similar point into the **repository** —
 > those files are not part of the npm package. Repository: <https://github.com/olimc2016/dsh-worktodo>
@@ -37,7 +37,8 @@ dsh plugin --profile desktop add github:olimc2016/dsh-worktodo
 
 This path is verified (see `docs/verification.md`): the browser half's build output `lib/client.js` is committed,
 and the package declares no `prepare`/`install` build script, so a git install needs **no build authorization**
-and pulls none of the development dependencies — measured with plain `pnpm`: **1 package** resolved, **316 KB** installed,
+measurement (install from GitHub): **1 top-level package** plus the 3 official platform packages, about **12 MB** installed
+(~8 MB of that is zod, pulled in by the official `@deepseek-ai/dsh-tools`), and no development dependencies.
 no nested `node_modules`, and the installed tree matches the npm tarball file for file.
 
 **Option 2: from npm** (once the package is published)
