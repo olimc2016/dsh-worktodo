@@ -67,12 +67,15 @@ jobs:
       - name: Build client bundle
         run: pnpm run build
 
-      # 推 tag 走这条；手动触发时选了 stage 也走这条
-      - name: Stage the release (you approve it on npmjs.com with 2FA)
-        if: github.event_name == 'push' || inputs.mode == 'stage'
-        run: npm stage publish --provenance --access public
-
-      # 仅手动选择 publish 时走这条；绑定页必须允许 `npm publish`
-      - name: Publish directly (no approval step)
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'publish'
+      # 默认走直接发布：实测「暂存发布」不会写入 registry 的 readme 字段，
+      # 结果是 npm 包页面没有 README（对照：普通 publish 的包 readme 正常）。
+      # 直接发布在 OIDC 下不需要人类 2FA，所以这里也不牺牲自动化。
+      # 绑定页必须允许 `npm publish`。
+      - name: Publish (direct; OIDC, no human 2FA needed)
+        if: github.event_name == 'push' || inputs.mode == 'publish'
         run: npm publish --provenance --access public
+
+      # 需要「人类把关」时用手动触发的 stage：CI 提交到暂存区，你在 npmjs.com 按指纹批准
+      - name: Stage instead (you approve it on npmjs.com with 2FA)
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'stage'
+        run: npm stage publish --provenance --access public

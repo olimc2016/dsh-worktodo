@@ -1,6 +1,6 @@
 {
   "name": "dsh-worktodo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH 工作待办面板（社区插件，非官方）：归你所有、跨会话持久的工作待办——优先级 / 截止日期 / 项目 / 逾期与本周视图，agent 通过 worktodo_* 工具读写同一份列表。官方 todo_write 属于单个会话且只能整表替换，这份列表属于人。Human-owned cross-session work todo list for DeepSeek Harness: priorities, due dates, projects, overdue/week views and worktodo_* tools the agent shares with you.",
   "type": "module",
   "main": "lib/index.js",
