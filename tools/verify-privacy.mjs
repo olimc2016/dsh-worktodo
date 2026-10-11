@@ -21,6 +21,10 @@ import { userInfo } from 'node:os';
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '..');
 const me = userInfo().username;
+// "当前用户名"这条规则只在**开发者本机**跑：CI 上的用户名是通用词（GitHub 是 `runner`），
+// 会与文档里正常的英文词（例如 "ubuntu runner"）误撞；而 CI 本来就无从得知开发者本机的用户名。
+// 与用户名无关、CI 也能查的那条（家目录绝对路径）在任何环境都保留。
+const inCi = Boolean(process.env.CI);
 
 let passed = 0;
 let failed = 0;
@@ -70,7 +74,8 @@ const OK_IPV4_PREFIX = ['127.', '0.0.0.0', '1.2.3.4', '192.0.2.', '198.51.100.',
 
 const RULES = [
   ['家目录绝对路径', /\/Users\/(?!me\/)[^/\s"')]+|\/home\/(?!me\/)[^/\s"')]+/g],
-  // 真实用户名只在够长时才查，避免 'me' / 'ci' 这类短名造成噪音
+  // 真实用户名只在够长时才查，避免 'me' / 'ci' 这类短名噪音。
+  // 注意：CI 环境下这条会被**跳过**（见下方 inCi 判定），但规则仍保留在此，好让两侧的检查条数一致。
   ...(me.length >= 4 ? [[`当前用户名（${'*'.repeat(me.length)}）`, new RegExp(`\\b${me}\\b`, 'g')]] : []),
   ['npm token 形状', /npm_[A-Za-z0-9]{20,}/g],
   // 要求等号后跟一段像凭据的值：这样文档里单纯提到 `_authToken=` 不会误报
@@ -136,11 +141,15 @@ process.stdout.write('\n逐规则扫描\n');
 const distHits = scan(dist);
 const trackedHits = scan(tracked);
 for (const [name] of RULES) {
+  // CI 上跳过"当前用户名"这条：CI 的用户名是通用词（GitHub 是 `runner`），会与文档里正常的英文词误撞；
+  // 而 CI 本来就无从得知开发者本机的用户名。与用户名无关的家目录路径规则在任何环境都照查。
+  const skip = inCi && name.startsWith('当前用户名');
   for (const [surface, hits] of [['npm 发布包', distHits], ['git 跟踪文件', trackedHits]]) {
-    const found = hits.get(name);
+    const found = skip ? [] : hits.get(name);
     check(`${surface}：${name}`, found.length === 0, found.slice(0, 3).join(' | '));
   }
 }
+if (inCi) process.stdout.write('  （CI 环境：已跳过「当前用户名」规则——它只在开发者本机有意义）\n');
 
 process.stdout.write('\n发布包文档完整性（npm 页面上读者只看得到包内文件）\n');
 
