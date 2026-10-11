@@ -118,7 +118,10 @@ Adds one catalog entry: catalog/plugins/olimc2016--dsh-worktodo.json
 ## 二、dsh-plugin.org / DSH Plugin Hub
 
 - 仓库 `dshplugin/dsh-plugin-hub`，npm 包名 `dsh-plugin`（v1.6.x），README 自称收录 9,463 个
-- 收录方式：**加 `dsh-plugin` 话题自动发现** + 官网 `/zh/submit` 表单
+- 收录方式：**只靠 `dsh-plugin` 话题自动发现**——原文（`README.zh.md`/`README.en.md` 第 194 行）：
+  > 将你的插件发布到 GitHub 并添加 `dsh-plugin` topic，即可被 DSH Plugin 插件目录**自动发现与收录**。
+  > Publish your plugin to GitHub and add the `dsh-plugin` topic — it will be discovered and indexed automatically.
+- 也就是说：**无需提 PR、无需表单**，加话题即可（本仓库已推送，只差话题这一下）
 - 动作：先确认话题已加，再去 <https://dsh-plugin.org/zh/submit> 填表（填仓库地址 + npm 包名即可）
 
 ## 三、awesome 清单仓库（PR 加一行）
