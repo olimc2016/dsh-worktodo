@@ -85,6 +85,12 @@ curl -s https://registry.npmjs.org/dsh-worktodo \
 
 - 若发现为 0：用直接发布补一版（版本号要 +1，npm 不允许覆盖已发布的版本号）。
 
+**Q：CI 里发布报 `404 … is not in this registry`？**
+几乎一定是 **Trusted Publisher 没生效**。核对 <https://www.npmjs.com/package/<包名>/access>：
+Provider=GitHub Actions、owner、repository、**Workflow filename 必须与文件名逐字一致（`publish.yml`）**、
+Environment 留空，并且**允许的动作必须包含 `npm publish`**（只开 `stage publish` 时直接发布会以这个 404 被拒）。
+注意：**provenance 签名成功不代表认证成功**——provenance 走的是 GitHub 的 OIDC，与 npm 的绑定是两件事。
+
 ## 常见问题（都是这次踩过的）
 
 **Q：为什么没有验证码可收？**

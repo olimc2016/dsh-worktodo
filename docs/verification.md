@@ -528,6 +528,46 @@ $ pnpm add github:olimc2016/dsh-worktodo
 
 （同一个 token 的仓库权限是 `admin/maintain/push/triage/pull` 全真，推送正常——所以这是**权限类别**问题，不是 token 坏了。）
 
+## CI 发布路径**首次真跑**（第二十三轮）：测试绿了，npm 侧认证没过
+
+这是 `publish.yml` 第一次在真实仓库上跑，结果把两个问题一次暴露出来（这正是它存在的意义）：
+
+### ① 先修掉两个自身缺陷（都已修并推送）
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| `test` workflow 每次 push 都红 | `smoke-host` 里**硬编码**了 `eq(body.version, '0.1.0')`，改版本号即红 | 改成从 `package.json` 动态读 |
+| 修完仍红 | 发布面审计用**当前用户名**扫文件；CI 的用户名是通用词 `runner`，与文档里正常的 "ubuntu runner" **误撞** | 该规则改为**仅在开发者本机生效**（CI 跳过并打印说明）；与用户名无关的「家目录绝对路径」规则在任何环境照查。检查条数在两侧一致（30 项） |
+
+修完后 `test` workflow **成功** ✓（这本身也验证了 CI 的工具链与 9 个测试文件在 Linux/Node 22+24 下都能跑）。
+
+### ② 发布步骤被 npm 拒绝：**Trusted Publisher 没生效**
+
+`publish` workflow 的步骤结论：检出 ✓ → 安装 ✓ → 测试 ✓ → 构建 ✓ → **Publish ✗**。日志原文：
+
+```
+npm notice name: dsh-worktodo      npm notice version: 0.1.1
+npm notice filename: dsh-worktodo-0.1.1.tgz
+npm notice package size: 79.3 kB    npm notice total files: 18
+npm notice publish Signed provenance statement with source and build information from GitHub Actions
+npm notice publish Provenance statement published to transparency log: https://search.sigstore.dev/?logIndex=3199540291
+npm error code E404
+npm error 404 Not Found - PUT https://registry.npmjs.org/dsh-worktodo - Not found
+npm error 404  'dsh-worktodo@0.1.1' is not in this registry.
+```
+
+**读法**：打包与 provenance 都正常（provenance 用的是 GitHub 的 OIDC，与 npm 认证无关，所以它成功**不能**证明绑定生效）；
+`404 … is not in this registry` 是 npm 对**未认证发布**的典型回应——也就是 **npm 没把这次 OIDC 身份认成该包的 trusted publisher**。
+
+两种可能，都要在网页上核对：
+1. **绑定字段与实际不符**（最常见是 **workflow filename** 写成了别的值，或仓库/owner 写错）；
+2. **绑定只允许 `npm stage publish`**（`npm trust` 的 `--allow-publish` / `--allow-stage-publish` 之分）——
+   那么直接发布会像上面这样被拒，必须把 `npm publish` 也允许。
+
+**顺带查到的**：`GET https://registry.npmjs.org/-/package/<pkg>/trust` 这个接口**存在**（返回
+`401 Bearer token authorization is required`），但需要 npm 凭据；没有公开的匿名查询方式，所以核对只能看
+<https://www.npmjs.com/package/dsh-worktodo/access>。
+
 ## 回滚方式
 
 ```bash
