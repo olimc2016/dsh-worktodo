@@ -213,8 +213,13 @@ test('dsh.client 声明完整（缺了面板不会被组合进 bundle）', () =>
   eq(Array.isArray(pkg.dsh?.client?.inject) && pkg.dsh.client.inject.length > 0, true, 'dsh.client.inject 为空：');
 });
 
-test('没有运行期依赖（git 安装只应解析出 1 个包）', () => {
-  eq(Object.keys(pkg.dependencies ?? {}).length, 0);
+test('运行期依赖必须且只能是被 import 的平台包', () => {
+  // 这条曾经断言"零运行期依赖"——那个设计是错的：只声明 peer 时，npm/git 装出来的插件
+  // 解析不到平台包，DSH 启动时会直接加载失败（实测：unknown tool "worktodo_list"）。
+  const required = ['@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-storage-domain', '@deepseek-ai/dsh-home-paths'];
+  const deps = Object.keys(pkg.dependencies ?? {});
+  eq(required.filter((d) => !deps.includes(d)), [], '缺少运行期 import 的平台包（装出来会启动失败）：');
+  eq(deps.filter((d) => !required.includes(d)), [], '出现了非平台包的运行期依赖（应当为零）：');
 });
 
 test('git 安装分类与上游一致：入口已提交、且不需要构建授权', () => {
