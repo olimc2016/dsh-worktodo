@@ -57,6 +57,10 @@ jobs:
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Ensure a recent npm
+        # `npm stage publish` 需要 npm ≥ 11.15，而 node 22 自带的是 npm 10.x
+        run: npm install -g npm@latest
+
       - name: Install dev deps
         # 测试要加载官方 @deepseek-ai/dsh-tools 来校验工具 schema，所以必须装 devDependencies
         run: pnpm install --frozen-lockfile
@@ -67,15 +71,14 @@ jobs:
       - name: Build client bundle
         run: pnpm run build
 
-      # 默认走直接发布：实测「暂存发布」不会写入 registry 的 readme 字段，
-      # 结果是 npm 包页面没有 README（对照：普通 publish 的包 readme 正常）。
-      # 直接发布在 OIDC 下不需要人类 2FA，所以这里也不牺牲自动化。
-      # 绑定页必须允许 `npm publish`。
-      - name: Publish (direct; OIDC, no human 2FA needed)
-        if: github.event_name == 'push' || inputs.mode == 'publish'
-        run: npm publish --provenance --access public
-
-      # 需要「人类把关」时用手动触发的 stage：CI 提交到暂存区，你在 npmjs.com 按指纹批准
-      - name: Stage instead (you approve it on npmjs.com with 2FA)
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'stage'
+      # 推 tag 默认走**暂存**：实测这个绑定当前只授权暂存——直接发布会被 npm 以
+      # `404 … is not in this registry` 拒绝（＝没被认成该包的 trusted publisher）。
+      # 暂存不需要人类 2FA；批准（一次点击）由维护者在 npmjs.com 完成。
+      - name: Stage the release (you approve it on npmjs.com — one click)
+        if: github.event_name == 'push' || inputs.mode == 'stage'
         run: npm stage publish --provenance --access public
+
+      # 绑定页若允许了 `npm publish`，可用手动触发走直接发布（README 才会进包页面）
+      - name: Publish directly (needs the binding to allow `npm publish`)
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'publish'
+        run: npm publish --provenance --access public
