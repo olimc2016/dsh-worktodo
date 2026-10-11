@@ -176,6 +176,17 @@ node -e "import('/tmp/catalog/scripts/lib/catalog-entry.mjs').then(async m => { 
 **我们的包已发布（`dsh-worktodo@0.1.0`，含 `dsh.bundle`），所以条目会直接带安装命令，而不是仅浏览。**
 这一点在首版发布前写下的旧预期已经过时，以本节为准。
 
+## 三点六、凭据能力边界（实测）
+
+| 要做的事 | fine-grained PAT（只授权 `dsh-worktodo`） | classic PAT（`repo`） |
+|---|---|---|
+| 推送插件仓库 | ✓ 实测可以 | ✓ |
+| 设仓库话题（`dsh-plugin`） | **✗ 403**（需 Administration 权限） | ✓ |
+| fork 目录仓 `imsai-sh/awesome-deepseek-harness-plugins` | **✗ 403**（细粒度不能 fork 他仓） | ✓ |
+| 提收录 PR | ✗ | ✓（fork 后推分支 + 开 PR） |
+
+结论：**推送用细粒度就够；话题与 fork 要么在网页点，要么用 classic `repo` token。**
+
 ## 四、提交后核对
 
 - [x] npm 上 `npm view dsh-worktodo version` 返回 **0.1.0** ✓（已发布；1024 Store 只从 npm 安装）

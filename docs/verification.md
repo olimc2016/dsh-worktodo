@@ -505,6 +505,29 @@ curl -s https://registry.npmjs.org/dsh-worktodo | python3 -c "import json,sys; d
 3. 顺便：该版本还会带上本仓库已修好的文档（三份文档里的绝对仓库地址说明）——
    因为 npm 页面显示的正是 registry 里那份 README。
 
+## 推送成功 + 真实 GitHub 安装验证（第二十三轮）
+
+仓库 `olimc2016/dsh-worktodo` 已推送（`main -> main`），**远端 40 个文件**，
+`package.json` / `cordis.patch.yml` / `lib/index.js` / `lib/client.js` / `src/client/index.js` / `README.md` / `LICENSE`
+逐个用 `git cat-file -e origin/main:<path>` 核对存在 ✓。
+
+**最后一条没验过的安装路径也验通了**（之前是对着本地忠实模拟仓；这次是**真远端**）：
+
+```
+$ pnpm add github:olimc2016/dsh-worktodo
++ dsh-worktodo 0.1.0        （316 KB，包内无嵌套 node_modules，lib/client.js 在，
+                             dsh.bundle.patch = ./cordis.patch.yml）
+```
+
+### 细粒度 token 做不了的两件事（都实测确认，非猜测）
+
+| 操作 | 结果 | 原因 / 替代 |
+|---|---|---|
+| `PUT /repos/.../topics` 设话题 | **403** `Resource not accessible by personal access token` | 话题需要额外的 Administration 权限 → 改用网页 About 齿轮里填（10 秒）。**这件事有意义**：DSH Plugin Hub 就是靠 `dsh-plugin` 话题自动发现的 |
+| `POST /repos/imsai-sh/awesome-deepseek-harness-plugins/forks` | **403** 同上 | 细粒度 token 不能 fork 别的仓库 → 收录 PR 要么网页点几下，要么换 classic `repo` token |
+
+（同一个 token 的仓库权限是 `admin/maintain/push/triage/pull` 全真，推送正常——所以这是**权限类别**问题，不是 token 坏了。）
+
 ## 回滚方式
 
 ```bash
