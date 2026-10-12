@@ -528,6 +528,19 @@ function QuickAdd({ t, onAdd, busy }) {
   const [parsed, setParsed] = React.useState(null);
   const [manual, setManual] = React.useState(false); // 用户手动改过日期/时间
   const [flagOpen, setFlagOpen] = React.useState(false);
+  // 点"整块胶囊"都要弹出选择器：Safari 里带值的 date/time 输入光靠点击只会聚焦，
+  // 所以统一主动调 showPicker()（不可用时退回 focus+click）
+  const dateRef = React.useRef(null);
+  const timeRef = React.useRef(null);
+  const openPicker = (ref) => {
+    const el = ref.current;
+    if (!el) return;
+    if (typeof el.showPicker === 'function') {
+      try { el.showPicker(); return; } catch { /* 某些环境不允许，走下面的兜底 */ }
+    }
+    el.focus();
+    try { el.click(); } catch { /* 忽略 */ }
+  };
 
   // 输入防抖 300ms 再解析（每按一键就解析会闪烁）
   React.useEffect(() => {
@@ -623,12 +636,13 @@ function QuickAdd({ t, onAdd, busy }) {
         key: 'due',
         className: `wt-chip${parsed && parsed.due ? ' is-parsed' : ''}`,
         title: t('dueLabel'),
+        onClick: (event) => { event.preventDefault(); openPicker(dateRef); },
         style: { position: 'relative', cursor: 'pointer', color: due ? C.label : C.label3, borderColor: parsed && parsed.due ? C.brand : undefined },
       }, [
         React.createElement(IconCal, { key: 'i' }),
         React.createElement('span', { key: 'v' }, due ? `${today === due ? t('todayWord') : due}${parsed && parsed.due ? ` · ${t('fromParsed')}` : ''}` : t('dateUnset')),
         React.createElement('input', {
-          key: 'in', type: 'date', value: due, 'aria-label': t('dueLabel'),
+          key: 'in', ref: dateRef, type: 'date', value: due, 'aria-label': t('dueLabel'),
           style: { position: 'absolute', inset: 0, opacity: 0, border: 0, padding: 0, width: '100%', height: '100%', cursor: 'pointer' },
           onChange: (event) => setDate(event.target.value),
         }),
@@ -638,12 +652,13 @@ function QuickAdd({ t, onAdd, busy }) {
         key: 'time',
         className: `wt-chip${parsed && parsed.dueTime ? ' is-parsed' : ''}`,
         title: t('dueTimeLabel'),
+        onClick: (event) => { event.preventDefault(); openPicker(timeRef); },
         style: { position: 'relative', cursor: 'pointer', color: dueTime ? C.label : C.label3, borderColor: parsed && parsed.dueTime ? C.brand : undefined },
       }, [
         React.createElement(IconClock, { key: 'i' }),
         React.createElement('span', { key: 'v' }, `${timeLabel}${parsed && parsed.dueTime ? ` · ${t('fromParsed')}` : ''}`),
         React.createElement('input', {
-          key: 'in', type: 'time', value: dueTime, 'aria-label': t('dueTimeLabel'),
+          key: 'in', ref: timeRef, type: 'time', value: dueTime, 'aria-label': t('dueTimeLabel'),
           style: { position: 'absolute', inset: 0, opacity: 0, border: 0, padding: 0, width: '100%', height: '100%', cursor: 'pointer' },
           onChange: (event) => setTime(event.target.value),
         }),
