@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh-worktodo · 快速添加设计稿 v5（定稿）</title>
+<style>
+  :root {
+    --dsw-alias-label-primary:#1b1c1f; --dsw-alias-label-secondary:#55575d; --dsw-alias-label-tertiary:#8a8d94;
+    --dsw-alias-border-l1:#e6e7ea; --dsw-alias-border-l2:#d5d7dc; --dsw-alias-bg-layer-1:#f6f7f9;
+    --dsw-alias-brand-primary:#2f6fed; --dsw-alias-state-warn-primary:#d98a00;
+    --dsw-alias-state-error-primary:#d93b3b; --dsw-alias-state-success-primary:#1a9e63;
+    --dsw-font-family:-apple-system,"SF Pro Text","PingFang SC",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:26px 28px 60px;background:#fff;color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family);font-size:13px;line-height:1.6}
+  h1{font-size:20px;margin:0 0 6px}
+  h2{font-size:15px;margin:28px 0 10px;padding-top:14px;border-top:1px solid var(--dsw-alias-border-l1)}
+  .lead{color:var(--dsw-alias-label-secondary);max-width:840px}
+  .note{color:var(--dsw-alias-label-tertiary);font-size:12px}
+  .grid{display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start}
+  .panel{width:372px;padding:14px;border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .panel-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+  .panel-title{font-weight:700;font-size:14px}
+  .caption{width:372px;font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+  .caption b{color:var(--dsw-alias-label-primary)}
+  .row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .input{flex:1 1 140px;min-width:0;font:inherit;font-size:12.5px;padding:6px 9px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:#fff;color:inherit}
+  .btn{font:inherit;font-size:12px;padding:6px 11px;border-radius:8px;cursor:pointer;border:1px solid var(--dsw-alias-border-l2);background:#fff;color:var(--dsw-alias-label-secondary)}
+  .btn-primary{background:var(--dsw-alias-brand-primary);border-color:transparent;color:#fff;font-weight:600}
+  .icon-btn{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:8px;cursor:pointer;border:1px solid var(--dsw-alias-border-l2);background:#fff;color:var(--dsw-alias-label-secondary)}
+  .icon-btn.on{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}
+  .chip{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:4px 7px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);cursor:pointer}
+  .chip.solid{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-label-primary);background:#fff}
+  .chip .x{color:var(--dsw-alias-label-tertiary)}
+  .flag-btn{display:inline-flex;align-items:center;gap:4px;font:inherit;font-size:11.5px;padding:5px 8px;border-radius:9px;cursor:pointer;background:transparent;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary)}
+  .flag-btn.on{border-color:currentColor;background:color-mix(in srgb,currentColor 12%,transparent)}
+  .flag-high{color:var(--dsw-alias-state-error-primary)}
+  .flag-normal{color:var(--dsw-alias-state-warn-primary)}
+  .flag-low,.flag-none{color:var(--dsw-alias-label-tertiary)}
+  .popover{margin-top:8px;padding:10px;border-radius:12px;border:1px solid var(--dsw-alias-border-l2);box-shadow:0 8px 24px rgba(0,0,0,.12);background:#fff;width:fit-content}
+  .hintbar{font-size:11.5px;color:var(--dsw-alias-label-tertiary);margin-top:7px}
+  .cal{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;font-size:11.5px;text-align:center;width:232px}
+  .cal span{padding:4px 0;border-radius:6px;color:var(--dsw-alias-label-secondary)}
+  .cal .dw{color:var(--dsw-alias-label-tertiary);font-size:10.5px}
+  .cal .sel{background:var(--dsw-alias-brand-primary);color:#fff;font-weight:600}
+  .cal .today{outline:1px solid var(--dsw-alias-border-l2)}
+  .time-list{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;font-size:11.5px;width:200px}
+  .time-list span{padding:5px 0;text-align:center;border-radius:6px;color:var(--dsw-alias-label-secondary)}
+  .time-list .sel{background:var(--dsw-alias-brand-primary);color:#fff;font-weight:600}
+  .todo-row{display:flex;align-items:center;gap:8px;padding:6px 0 6px 8px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+  .todo-row:last-child{border-bottom:0}
+  .todo-row .t{flex:1 1 auto}
+  .bar-high{border-left:2px solid var(--dsw-alias-state-error-primary)}
+  svg{display:block}
+  table.rules{border-collapse:collapse;width:100%;max-width:940px;margin-top:8px}
+  table.rules th,table.rules td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12.5px;vertical-align:top}
+  table.rules th{color:var(--dsw-alias-label-secondary);font-weight:600;white-space:nowrap}
+  .kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;padding:1px 5px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px}
+  .no{color:var(--dsw-alias-state-error-primary);font-weight:600}
+</style>
+</head>
+<body>
+
+<h1>dsh-worktodo · 快速添加设计稿 v5（定稿）</h1>
+<p class="lead">
+  <b>两行布局</b>：第一行是<b>待办内容 + 添加</b>；第二行<b>更小</b>，放<b>日期 / 时间 / 优先级</b>三项设置。
+  参考滴答清单的"边说边解析"：标题里打了"明天下午3点"，第二行的日期时间会<b>自动被填上</b>（并把日期词从标题摘掉）。
+  四条决定不变：<b>①识别不到就不设</b>；<b>②日期词摘出来</b>；<b>③日期/时钟/优先级入口常驻</b>（没有加号）；<b>④只选时间＝今天</b>。
+</p>
+
+<h2>1 · 主界面：两行布局</h2>
+<div class="grid">
+  <div class="panel">
+    <div class="panel-head"><span class="panel-title">工作待办</span></div>
+
+    <!-- 第一行：内容 + 添加 -->
+    <div class="row" style="gap:8px">
+      <input class="input" style="flex:1 1 auto" value="交周报 明天下午3点" aria-label="记一件事">
+      <button class="btn btn-primary">添加</button>
+    </div>
+
+    <!-- 第二行（更小）：日期 / 时间 / 优先级 -->
+    <div class="row" style="margin-top:9px;gap:10px;font-size:11.5px">
+      <button class="chip solid" title="点开选日期" style="font-size:11.5px">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.2" y="3.4" width="11.6" height="10.4" rx="2"/><path d="M2.2 6.6h11.6M5.4 2.2v2.4M10.6 2.2v2.4"/></svg>
+        明天（10-13）<span class="note">· 识别</span>
+      </button>
+      <button class="chip solid" title="点开选时间" style="font-size:11.5px">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.9V8l2.2 1.4"/></svg>
+        15:00<span class="x">✕</span>
+      </button>
+      <button class="chip" title="点开选优先级" style="font-size:11.5px">
+        <svg width="13" height="13" viewBox="0 0 16 16"><path d="M3.6 1.6v13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none" stroke-dasharray="1.5 1.5"/><path d="M5.2 2.4h7.4L11 5.2l1.6 2.8H5.2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-dasharray="1.5 1.5"/></svg>
+        优先级 · 无
+      </button>
+    </div>
+
+    <div class="hintbar">第一行回车即添加；第二行的三项都是"点一下就能改"，<b>不点也完全不影响</b>最常见的那条路径。</div>
+  </div>
+  <div class="caption">
+    <p><b>为什么分两行</b>：372px 里挤五个控件（输入框+旗+日历+时钟+添加）每个都太窄；拆开后<b>第一行可以专心打字</b>，第二行虽然更小但三项都看得见、点得到。</p>
+    <p><b>第二行是"当前值"不是"按钮"</b>：直接显示已选内容（`明天（10-13）`、`15:00`、`优先级 · 无`），点开才是选择器——比一排无字图标更好读，也不用记图标含义。</p>
+    <p><b>识别到就点亮</b>：标题里的"明天下午3点"被解析后，第二行对应两项变成高亮（蓝边），并标注"· 识别"，让人知道这是自己打出来的、可以撤销。</p>
+    <p class="note">未识别到日期时第二行显示 <b>日期 · 未设</b>（灰），不硬填今天。</p>
+  </div>
+</div>
+
+<h2>2 · 三种输入，三种结果（④只选时间＝今天 也在这里）</h2>
+<div class="grid">
+  <div class="panel">
+    <div class="note">① 有日期 + 相对时间</div>
+    <div class="row" style="gap:8px"><input class="input" style="flex:1 1 auto" value="交周报 明天下午3点"><button class="btn btn-primary">添加</button></div>
+    <div class="row" style="margin-top:8px;gap:10px;font-size:11.5px">
+      <span class="chip solid" style="font-size:11.5px">📅 明天（10-13）<span class="note">· 识别</span></span>
+      <span class="chip solid" style="font-size:11.5px">🕐 15:00</span>
+      <span class="chip" style="font-size:11.5px">🏳 优先级 · 无</span>
+    </div>
+    <div class="hintbar">保存：标题「交周报」，due=10-13，dueTime=15:00</div>
+  </div>
+  <div class="panel">
+    <div class="note">② 什么都没认出来 → <b>不设日期</b>（决定①）</div>
+    <div class="row" style="gap:8px"><input class="input" style="flex:1 1 auto" value="等对方回复报价"><button class="btn btn-primary">添加</button></div>
+    <div class="row" style="margin-top:8px;gap:10px;font-size:11.5px">
+      <span class="chip" style="font-size:11.5px">📅 日期 · 未设</span>
+      <span class="chip" style="font-size:11.5px">🕐 时间 · 未设</span>
+      <span class="chip" style="font-size:11.5px">🏳 优先级 · 无</span>
+    </div>
+    <div class="hintbar">保存：标题原样，due=null——不硬塞"今天"，不制造假承诺</div>
+  </div>
+  <div class="panel">
+    <div class="note">③ 只有时间、没有日期 → <b>今天</b>（决定④）</div>
+    <div class="row" style="gap:8px"><input class="input" style="flex:1 1 auto" value="给客户回电话 15:00"><button class="btn btn-primary">添加</button></div>
+    <div class="row" style="margin-top:8px;gap:10px;font-size:11.5px">
+      <span class="chip solid" style="font-size:11.5px">📅 今天（10-12）<span class="note">· 自动补</span></span>
+      <span class="chip solid" style="font-size:11.5px">🕐 15:00</span>
+      <span class="chip" style="font-size:11.5px">🏳 优先级 · 无</span>
+    </div>
+    <div class="hintbar">保存：due=今天，dueTime=15:00；"今天"是明确写出来的，用户看得见</div>
+  </div>
+</div>
+
+<h2>3 · 会认哪些说法</h2>
+<table class="rules">
+  <tr><th>你打的字</th><th>识别为</th><th>说明</th></tr>
+  <tr><td>今天 / 明天 / 后天 / 大后天</td><td>+0 / +1 / +2 / +3 天</td><td>最常用，第一期必做</td></tr>
+  <tr><td>周一 / 周1 / 星期一 / 礼拜一 / 下周一 / 下周三</td><td>最近的该星期几（已过则下周）／下周对应日</td><td>你点名的场景</td></tr>
+  <tr><td>3 天后 / +3d / 五天后</td><td>相对天数</td><td><code>+3d</code> 现已支持</td></tr>
+  <tr><td>10月20日 / 10/20 / 2026-10-20</td><td>绝对日期（省年份取最近一次）</td><td></td></tr>
+  <tr><td>今晚 / 明早 / 中午 / 明天下午</td><td>日期 + 默认时间（晚 20:00、早 09:00、中午 12:00、下午 15:00）</td><td>只有更具体时间没出现时才兜底</td></tr>
+  <tr><td>下午3点 / 3点半 / 15:00 / 上午10点</td><td>15:00 / 15:30 / 15:00 / 10:00</td><td>没日期则配今天（决定④）</td></tr>
+  <tr><td>下个月 5 号 / 月底</td><td>对应日期</td><td>二期，先列出不承诺</td></tr>
+</table>
+
+<h2>4 · 弹层：日历 / 时钟 / 优先级（都常驻入口）</h2>
+<div class="grid">
+  <div class="panel">
+    <div class="note">点日历图标</div>
+    <div class="popover">
+      <div class="row" style="justify-content:space-between;font-size:12px;font-weight:600"><span>2026 年 10 月</span><span class="note">‹ ›</span></div>
+      <div class="cal" style="margin-top:6px">
+        <span class="dw">一</span><span class="dw">二</span><span class="dw">三</span><span class="dw">四</span><span class="dw">五</span><span class="dw">六</span><span class="dw">日</span>
+        <span></span><span></span><span></span><span>1</span><span>2</span><span>3</span><span>4</span>
+        <span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span><span>11</span>
+        <span class="today">12</span><span class="sel">13</span><span>14</span><span>15</span><span>16</span><span>17</span><span>18</span>
+        <span>19</span><span>20</span><span>21</span><span>22</span><span>23</span><span>24</span><span>25</span>
+        <span>26</span><span>27</span><span>28</span><span>29</span><span>30</span><span>31</span><span></span>
+      </div>
+      <div class="hintbar">实现用系统原生 <span class="kbd">type=date</span>（手机上就是系统日历），此处仅示意选中态。</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="note">点时钟图标（只选时间 → 今天）</div>
+    <div class="popover">
+      <div class="row" style="justify-content:space-between;font-size:12px;font-weight:600"><span>时间</span><span class="note">今天</span></div>
+      <div class="time-list" style="margin-top:6px">
+        <span>13:00</span><span>13:30</span><span>14:00</span><span class="sel">15:00</span>
+        <span>15:30</span><span>16:00</span><span>16:30</span><span>17:00</span>
+      </div>
+      <div class="hintbar">还没选日期时，选完时间自动补"今天"，并显示在胶囊里。</div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="note">点优先级旗</div>
+    <div class="popover">
+      <div class="row" style="gap:4px">
+        <button class="flag-btn flag-none on">无</button>
+        <button class="flag-btn flag-high">高</button>
+        <button class="flag-btn flag-normal">中</button>
+        <button class="flag-btn flag-low">低</button>
+      </div>
+      <div class="hintbar">默认「无」；高=红、中=琥珀、低=灰、无=虚线空心。</div>
+    </div>
+  </div>
+</div>
+
+<h2>5 · 列表行怎么显示优先级</h2>
+<div class="grid">
+  <div class="panel">
+    <div class="todo-row bar-high">
+      <span class="t">把 v0.1.0 发到 npm</span>
+      <span class="flag-btn flag-high on" style="pointer-events:none"><svg width="13" height="13" viewBox="0 0 16 16"><path d="M3.6 1.6v13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/><path d="M5.2 2.4h7.4L11 5.2l1.6 2.8H5.2z" fill="currentColor" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></span>
+    </div>
+    <div class="todo-row" style="padding-left:10px">
+      <span class="t">写本周周报</span>
+      <span class="flag-btn flag-normal" style="pointer-events:none"><svg width="13" height="13" viewBox="0 0 16 16"><path d="M3.6 1.6v13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/><path d="M5.2 2.4h7.4L11 5.2l1.6 2.8H5.2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></span>
+    </div>
+    <div class="todo-row" style="padding-left:10px">
+      <span class="t">整理下季度材料</span>
+      <span class="flag-btn flag-low" style="pointer-events:none"><svg width="13" height="13" viewBox="0 0 16 16"><path d="M3.6 1.6v13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/><path d="M5.2 2.4h7.4L11 5.2l1.6 2.8H5.2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></span>
+    </div>
+    <div class="todo-row" style="padding-left:10px">
+      <span class="t" style="color:var(--dsw-alias-label-secondary)">等对方回复报价</span>
+      <span class="note">← 无优先级：不显示旗子</span>
+    </div>
+  </div>
+  <div class="caption">
+    <p><b>高</b>：左缘 2px 红条 + 实心红旗 → 一屏扫过去最快看出哪些卡着人。<br>
+       <b>中</b>：琥珀描边旗。 <b>低</b>：灰实线旗。 <b>无</b>：不显示（默认档不制造噪音）。</p>
+    <p class="note">颜色全部来自宿主主题 token（error / warn / label-tertiary），深色模式自动跟随；<b>不引入蓝色</b>（DSH 没有 info 语义色，借 brand 会被误读成"可点击"）。</p>
+  </div>
+</div>
+
+<h2>6 · 行为细则</h2>
+<table class="rules">
+  <tr><th>场景</th><th>行为</th><th>为什么</th></tr>
+  <tr><td>第一行回车</td><td>直接添加（第二行不填也照加）</td><td>最常见路径一步完成</td></tr>
+  <tr><td>第二行三项</td><td>显示<b>当前值</b>（日期 / 时间 / 优先级），点开才选</td><td>比一排无字图标好读，且任何一项都不影响"直接加"</td></tr>
+  <tr><td>识别到日期/时间</td><td>标题里的日期词<b>摘出来</b>落到字段；胶囊显示（含"明天→10-13"折算）</td><td>决定②；标题保持"事情本身"，字段结构化</td></tr>
+  <tr><td>识别不到</td><td><b>不设日期</b>，不出现胶囊</td><td>决定①；不制造假承诺</td></tr>
+  <tr><td>只选了时间</td><td>自动补<b>今天</b>，并在胶囊里写明"今天"</td><td>决定④；补全必须让用户看见</td></tr>
+  <tr><td>点胶囊 ✕</td><td>撤销日期/时间；继续输入会重新解析</td><td>识别结果必须可撤、可改</td></tr>
+  <tr><td>删除日期</td><td>时间一并清除</td><td>数据模型约束（无日期则无时间），不制造矛盾态</td></tr>
+  <tr><td>添加成功后</td><td>标题清空；日期/时间/优先级保留</td><td>连着录同一天的几件事不用重设</td></tr>
+  <tr><td>Esc</td><td>清空当前输入与解析结果</td><td>随时能退出，不留半截状态</td></tr>
+  <tr><td>键盘 / 读屏</td><td>Tab：输入框 → 旗 → 日历 → 时钟 → 添加；图标都有 <span class="kbd">aria-label</span></td><td>键盘与读屏必须能完成同一件事</td></tr>
+  <tr><td>手机</td><td>原生日历与时间转盘</td><td>跟随系统习惯</td></tr>
+  <tr><td>"今天/明天"</td><td>胶囊与列表显示文字，不显示日期数字</td><td>人读的是"什么时候"，不是"哪一天"</td></tr>
+</table>
+
+<h2>7 · 明确不做的（已否决）</h2>
+<table class="rules">
+  <tr><th class="no">✗ 不做</th><th>原因</th></tr>
+  <tr><td>加号按钮（含通栏大加号）</td><td>你的决定：去掉。图标直接可见，不点也能用</td></tr>
+  <tr><td>新增表单整块展开/收起</td><td>快速添加应当始终在、始终可用</td></tr>
+  <tr><td>无优先级时显示灰旗</td><td>默认档不占视觉噪音</td></tr>
+  <tr><td>用蓝色表示"低"</td><td>主题没有 info 语义色；借 brand 会与"可点击"冲突</td></tr>
+  <tr><td>识别不到就默认今天</td><td>决定①：不设</td></tr>
+</table>
+
+<p class="note" style="margin-top:22px">认可后进入实现：<b>扩展日期解析</b>（后天/周X/下周一/X月X日/今晚/下午3点/3点半…）→ <b>输入时实时识别并显示胶囊</b>（可撤销/可改）→ <b>日历与时钟弹层常驻入口</b> → <b>四档优先级 + 列表行规则</b>。数据模型新增 <code>priority: none</code>（现有记录不动）。</p>
+
+</body>
+</html>

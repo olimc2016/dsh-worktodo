@@ -81,6 +81,8 @@ const mk = (input, id) => createRecord(input, { now: NOW, id });
 
 console.log('日期工具');
 
+import { parseNaturalDue } from '../src/parse-due.mjs';
+
 test('dayKey 用本地时区而不是 UTC', () => {
   // 本地 00:30 的 UTC 日期在前一天（东八区），必须是本地日期
   const t = new Date(2026, 9, 14, 0, 30, 0).getTime();
@@ -365,6 +367,40 @@ test('applyManualOrder 与 manual 排序：拖过的在前且按 order 升序，
   eq(order[2], 'B', '没拖过的按自动规则垫后：');
   // 纯函数：不改入参
   eq(a.order, null, 'applyManualOrder 不应修改入参：');
+});
+
+// ---- 自然语言日期解析（人类面板与 worktodo_* 工具共用同一份） ----
+
+test('parseNaturalDue：认日期/时间，并把认出来的词从标题里摘掉', () => {
+  const now = Date.parse('2026-10-12T10:00:00+08:00'); // 2026-10-12 是周一
+  const table = [
+    // 输入, 期望标题, 期望 due, 期望 dueTime
+    ['交周报 明天下午3点', '交周报', '2026-10-13', '15:00'],
+    ['买菜 明天', '买菜', '2026-10-13', null],
+    ['等对方回复报价', '等对方回复报价', null, null],
+    ['给客户回电话 15:00', '给客户回电话', '2026-10-12', '15:00'],
+    ['下午3点半 开会', '开会', '2026-10-12', '15:30'],
+    ['买菜 后天', '买菜', '2026-10-14', null],
+    ['开评审会 下周一上午10点', '开评审会', '2026-10-19', '10:00'],
+    ['周一例会改到周三', '周一例会改到', '2026-10-14', null],
+    ['周1 对齐进度', '对齐进度', '2026-10-12', null],
+    ['10月20日 交材料', '交材料', '2026-10-20', null],
+    ['2026-11-01 交报告', '交报告', '2026-11-01', null],
+    ['3天后 回访客户', '回访客户', '2026-10-15', null],
+    ['+3d 复诊', '复诊', '2026-10-15', null],
+    ['今晚 跟客户吃饭', '跟客户吃饭', '2026-10-12', '20:00'],
+    // 保守性：普通数字不能被当成日期（宁可漏，不可误吞）
+    ['买3个苹果', '买3个苹果', null, null],
+    ['发 2 封邮件', '发 2 封邮件', null, null],
+  ];
+  for (const [input, title, due, dueTime] of table) {
+    const r = parseNaturalDue(input, now);
+    eq(r.title, title, `标题（"${input}"）：`);
+    eq(r.due, due, `日期（"${input}"）：`);
+    eq(r.dueTime, dueTime, `时间（"${input}"）：`);
+  }
+  // 摘掉的词要能追溯到原文片段（面板据此显示"从标题识别"）
+  eq(parseNaturalDue('交周报 明天下午3点', now).matched, ['明天', '下午', '3点']);
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);
