@@ -11,6 +11,7 @@ import {
   WorkTodoError,
   adoptSessionTodos,
   createRecord,
+  groupByProject,
   dayKey,
   dayStart,
   filterRecords,
@@ -288,6 +289,53 @@ test('行文本包含状态框、id、截止与逾期标记', () => {
   eq(line.includes('[ ]'), true);
   eq(line.includes('a'), true);
   eq(line.includes('已逾期 2026-10-10'), true);
+});
+
+// ---- 按项目分组（面板的「按项目」视图）----
+
+test('groupByProject：未归类永远排在最后，且 project 为 null', () => {
+  const now = Date.parse('2026-10-11T09:00:00+08:00');
+  const records = [
+    createRecord({ title: 'A', project: 'alpha' }, { now, id: 'a' }),
+    createRecord({ title: 'C' }, { now, id: 'c' }),
+  ];
+  const buckets = groupByProject(records, now);
+  eq(buckets.length, 2);
+  eq(buckets[0].project, 'alpha');
+  eq(buckets[buckets.length - 1].project, null);
+  eq(buckets[buckets.length - 1].key, '');
+});
+
+test('groupByProject：未完成多的项目排前面', () => {
+  const now = Date.parse('2026-10-11T09:00:00+08:00');
+  const records = [
+    createRecord({ title: 'a1', project: 'alpha' }, { now, id: 'a1' }),
+    createRecord({ title: 'a2', project: 'alpha' }, { now, id: 'a2' }),
+    createRecord({ title: 'b1', project: 'beta' }, { now, id: 'b1' }),
+  ];
+  const buckets = groupByProject(records, now);
+  eq(buckets.map((b) => b.project), ['alpha', 'beta']);
+  eq(buckets[0].open, 2);
+  eq(buckets[1].open, 1);
+});
+
+test('groupByProject：桶内统计 total/open/overdue，且已完成不计入 open', () => {
+  const now = Date.parse('2026-10-11T09:00:00+08:00');
+  const records = [
+    createRecord({ title: 'x', project: 'alpha', due: '2026-10-01' }, { now, id: 'x' }),      // 逾期
+    createRecord({ title: 'y', project: 'alpha' }, { now, id: 'y' }),
+    createRecord({ title: 'z', project: 'alpha', status: 'completed' }, { now, id: 'z' }),
+  ];
+  const [alpha] = groupByProject(records, now);
+  eq(alpha.total, 3);
+  eq(alpha.open, 2);
+  eq(alpha.overdue, 1);
+  // 桶内仍是视图排序：未完成在前
+  eq(alpha.todos[alpha.todos.length - 1].status, 'completed');
+});
+
+test('groupByProject：空输入得到空数组，不凭空造桶', () => {
+  eq(groupByProject([], Date.now()), []);
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);

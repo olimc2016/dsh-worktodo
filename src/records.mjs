@@ -360,6 +360,49 @@ export function groupRecords(records, now = Date.now()) {
  * @param {number} [now]
  * @returns {{total: number, open: number, overdue: number, today: number, doing: number, completed: number, completedToday: number}}
  */
+/**
+ * 按项目分组：面板的「按项目」视图。
+ *
+ * 规则：
+ *   - 没写 project 的记录归入「未归类」桶（project 为 null，永远排在最后）；
+ *   - 桶的排序：未完成条数多的在前 → 未完成里最早的截止日期更早的在前 → 名字字典序；
+ *   - 桶内沿用 sortForView（未完成在前、高优先级在前、临近截止在前）；
+ *   - 每个桶附 total / open / overdue，面板可直接显示「项目名 · 未完成/总数」。
+ *
+ * @param {object[]} records
+ * @param {number} [now]
+ * @returns {{project: string|null, key: string, todos: object[], total: number, open: number, overdue: number}[]}
+ */
+export function groupByProject(records, now = Date.now()) {
+  const today = dayKey(now);
+  const buckets = new Map();
+  for (const record of records) {
+    const project = record.project ?? null;
+    const key = project ?? '';
+    if (!buckets.has(key)) buckets.set(key, { project, key, todos: [], total: 0, open: 0, overdue: 0 });
+    const bucket = buckets.get(key);
+    bucket.todos.push(record);
+    bucket.total += 1;
+    if (record.status !== 'completed') {
+      bucket.open += 1;
+      if (record.due && record.due < today) bucket.overdue += 1;
+    }
+  }
+  const list = [...buckets.values()];
+  for (const bucket of list) bucket.todos = sortForView(bucket.todos);
+  const earliestOpenDue = (bucket) =>
+    bucket.todos.filter((t) => t.status !== 'completed' && t.due).map((t) => t.due).sort()[0] ?? '9999-99-99';
+  return list.sort((a, b) => {
+    // 未归类永远最后：它不是一个真正的项目
+    if ((a.project === null) !== (b.project === null)) return a.project === null ? 1 : -1;
+    if (a.open !== b.open) return b.open - a.open;
+    const da = earliestOpenDue(a);
+    const db = earliestOpenDue(b);
+    if (da !== db) return da < db ? -1 : 1;
+    return (a.project ?? '').localeCompare(b.project ?? '');
+  });
+}
+
 export function statsOf(records, now = Date.now()) {
   const today = dayKey(now);
   const stats = { total: records.length, open: 0, overdue: 0, today: 0, doing: 0, completed: 0, completedToday: 0 };

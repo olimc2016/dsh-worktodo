@@ -67,7 +67,7 @@ git tag v0.1.1 && git push origin main --tags
 - **路线 B**：CI 跑完，版本进入暂存区 → 你打开 <https://www.npmjs.com> →
   **Staged Packages** → 找到 `dsh-worktodo@0.1.1` → **Approve** → 完成 2FA → 上线。
 
-CI 的三个门（都会在日志里体现）：`pnpm install --frozen-lockfile` → `pnpm test`（161 例）→ `pnpm run build`。
+CI 的三个门（都会在日志里体现）：`pnpm install --frozen-lockfile` → `pnpm test`（166 例）→ `pnpm run build`。
 
 ## ⚠️ 发布方式会影响 **npm 页面上的 README**
 

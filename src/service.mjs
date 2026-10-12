@@ -17,6 +17,7 @@ import {
   createRecord,
   dayKey,
   filterRecords,
+  groupByProject,
   groupRecords,
   patchRecord,
   resolveRef,
@@ -101,10 +102,23 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
     });
     if (!picked.ok) return picked;
 
+    // 项目视图用的分组：**不套 project 收窄**，否则面板上只剩当前项目、没法切到别处
+    const forProjects = attempt(() => {
+      let subset = records;
+      if (query) {
+        const needle = String(query).trim().toLowerCase();
+        subset = subset.filter((r) => r.title.toLowerCase().includes(needle) || (r.notes ?? '').toLowerCase().includes(needle));
+      }
+      return filterRecords(subset, filter, now);
+    });
+    if (!forProjects.ok) return forProjects;
+
     return {
       ok: true,
       todos: picked.value,
       groups: groupRecords(picked.value, now),
+      // 「按项目」视图：每个项目一个桶，附 total/open/overdue
+      projectGroups: groupByProject(forProjects.value, now),
       // 统计基于**全部**记录，而不是当前筛选结果：面板顶部的「逾期 3 条」不该因为
       // 用户切到「已完成」标签就变成 0
       stats: statsOf(records, now),

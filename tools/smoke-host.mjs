@@ -462,6 +462,31 @@ try {
   rmSync(root, { recursive: true, force: true });
 } catch { /* 清理失败不影响结论 */ }
 
+await test('GET /list 的载荷带 projectGroups（面板「按项目」视图所需）', async () => {
+  // 先自建两条（含项目与未归类），再断言分桶——前面的用例已经把存储清空了
+  await call(routes.get('/worktodo/create').handler, {
+    method: 'POST', url: '/worktodo/create',
+    body: { title: '按项目分组 A', project: 'alpha' },
+  });
+  await call(routes.get('/worktodo/create').handler, {
+    method: 'POST', url: '/worktodo/create',
+    body: { title: '按项目分组 B' },
+  });
+  const response = await call(routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all' });
+  eq(response.statusCode, 200);
+  const buckets = response.json()?.data?.projectGroups;
+  eq(Array.isArray(buckets), true, 'projectGroups 应当是数组：');
+  eq(buckets.some((b) => b.project === 'alpha'), true, '应当有 alpha 桶：');
+  eq(buckets.some((b) => b.project === null), true, '应当有未归类桶（project 为 null）：');
+  for (const bucket of buckets) {
+    eq(typeof bucket.total, 'number');
+    eq(typeof bucket.open, 'number');
+    eq(typeof bucket.overdue, 'number');
+    eq(Array.isArray(bucket.todos), true);
+  }
+  eq(buckets[buckets.length - 1].project, null, '未归类必须在最后一个桶：');
+});
+
 console.log(`\n${passed} 通过，${failures.length} 失败`);
 if (failures.length) {
   for (const f of failures) console.error(`- ${f.label}: ${f.error?.stack ?? f.error}`);

@@ -63,6 +63,9 @@ const zh = {
   'groupWeek': '本周',
   'groupLater': '以后',
   'groupCompleted': '已完成',
+  'viewDue': '按截止',
+  'viewProject': '按项目',
+  'noProject': '未归类',
   'expand': '展开',
   'collapse': '收起',
   'empty': '还没有待办',
@@ -122,6 +125,9 @@ const en = {
   'groupWeek': 'This week',
   'groupLater': 'Later',
   'groupCompleted': 'Completed',
+  'viewDue': 'By due',
+  'viewProject': 'By project',
+  'noProject': 'Uncategorized',
   'expand': 'Expand',
   'collapse': 'Collapse',
   'empty': 'No to-dos yet',
@@ -228,6 +234,16 @@ const STYLE_TEXT = `
   flex-direction: column; align-items: stretch; gap: 6px;
   border: 1px solid ${C.border1}; background: ${C.layer1};
 }
+.wt-seg {
+  display: inline-flex; align-items: center; border-radius: 8px; overflow: hidden;
+  border: 1px solid ${C.border}; background: ${C.bg2};
+}
+.wt-seg-btn {
+  appearance: none; border: 0; background: transparent; color: ${C.label2};
+  font: inherit; font-size: 11.5px; line-height: 1; padding: 5px 9px; cursor: pointer;
+}
+.wt-seg-btn.is-on { background: ${C.hover}; color: ${C.label}; font-weight: 600; }
+.wt-seg-btn:hover { color: ${C.label}; }
 .wt-group-head {
   display: flex; align-items: center; gap: 7px; padding: 3px 8px; border-radius: 8px;
   cursor: pointer; user-select: none; color: ${C.label2};
@@ -690,7 +706,7 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave }) {
 /* ------------------------------------------------------------------ *
  * 分组：空组整块不渲染，避免五个空标题堆在面板上
  * ------------------------------------------------------------------ */
-function Group({ label, items, closed, t, today, onToggleOpen, onToggleTodo, onRemove, onSave }) {
+function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTodo, onRemove, onSave }) {
   const list = asArray(items);
   if (!list.length) return null;
   return React.createElement('div', { style: { marginTop: 6 } }, [
@@ -704,7 +720,7 @@ function Group({ label, items, closed, t, today, onToggleOpen, onToggleTodo, onR
     }, [
       React.createElement(IconChevron, { key: 'c', open: !closed }),
       React.createElement('span', { key: 'l', style: { fontWeight: 600, fontSize: 12 } }, label),
-      React.createElement('span', { key: 'n', style: { fontSize: 11, color: C.label3 } }, String(list.length)),
+      React.createElement('span', { key: 'n', style: { fontSize: 11, color: C.label3 } }, meta || String(list.length)),
       React.createElement('span', { key: 'sp', style: { flex: 1 } }),
       React.createElement('span', { key: 'h', style: { fontSize: 11, color: C.label3 } }, closed ? t('expand') : t('collapse')),
     ]),
@@ -791,6 +807,8 @@ function WorkTodoPanel(props) {
   const [pending, setPending] = React.useState(0);
   // 「已完成」默认折叠（做完的事不用占满屏幕），其余默认展开
   const [closed, setClosed] = React.useState({ completed: true });
+  // 视图：按截止（默认）或按项目
+  const [view, setView] = React.useState('due');
 
   /**
    * 所有写操作的统一外壳：成功清掉错误条，失败把宿主的 error 原文放上去，
@@ -879,7 +897,17 @@ function WorkTodoPanel(props) {
   const store = data?.store ?? null;
   const num = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
   const overdueCount = num(stats.overdue);
-  const totalVisible = GROUPS.reduce((sum, group) => sum + asArray(groups[group.key]).length, 0);
+  // 视图分桶：按截止（原有 GROUPS）或按项目（宿主给的 projectGroups，附 未完成/总数/逾期）
+  const projectGroups = asArray(data?.projectGroups);
+  const viewGroups = view === 'project'
+    ? projectGroups.map((bucket) => ({
+      key: `p:${bucket?.key ?? ''}`,
+      label: bucket?.project ? String(bucket.project) : t('noProject'),
+      meta: `${num(bucket?.open)}/${num(bucket?.total)}${num(bucket?.overdue) ? ` · ${t('statOverdue')} ${num(bucket.overdue)}` : ''}`,
+      items: bucket?.todos,
+    }))
+    : GROUPS.map((group) => ({ key: group.key, label: t(group.label), items: groups[group.key] }));
+  const totalVisible = viewGroups.reduce((sum, group) => sum + asArray(group.items).length, 0);
 
   const chips = [
     { key: 'open', label: t('statOpen'), value: num(stats.open) },
@@ -908,6 +936,22 @@ function WorkTodoPanel(props) {
         React.createElement('span', { key: 'l', style: { color: C.label3 } }, chip.label),
         React.createElement('b', { key: 'v', style: { fontWeight: 650 } }, String(chip.value)),
       ])),
+      React.createElement('span', { key: 'view', className: 'wt-seg' }, [
+        React.createElement('button', {
+          key: 'due',
+          type: 'button',
+          className: `wt-seg-btn${view === 'due' ? ' is-on' : ''}`,
+          title: t('viewDue'),
+          onClick: () => setView('due'),
+        }, t('viewDue')),
+        React.createElement('button', {
+          key: 'proj',
+          type: 'button',
+          className: `wt-seg-btn${view === 'project' ? ' is-on' : ''}`,
+          title: t('viewProject'),
+          onClick: () => setView('project'),
+        }, t('viewProject')),
+      ]),
       React.createElement('span', { key: 'sp', style: { flex: 1 } }),
       React.createElement('button', {
         key: 'rf',
@@ -980,10 +1024,11 @@ function WorkTodoPanel(props) {
 
     /* 分组列表 */
     totalVisible
-      ? React.createElement('div', { key: 'groups' }, GROUPS.map((group) => React.createElement(Group, {
+      ? React.createElement('div', { key: 'groups' }, viewGroups.map((group) => React.createElement(Group, {
         key: group.key,
-        label: t(group.label),
-        items: groups[group.key],
+        label: group.label,
+        meta: group.meta,
+        items: group.items,
         closed: Boolean(closed[group.key]),
         t,
         today,

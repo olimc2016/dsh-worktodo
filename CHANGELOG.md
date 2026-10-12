@@ -2,6 +2,22 @@
 
 > 本文提到的 `tools/`、`docs/` 等路径都在**仓库**里，不在 npm 发布包内：<https://github.com/olimc2016/dsh-worktodo>
 
+## 0.1.2
+
+### 新增
+
+- **按项目管理待办**：面板顶部新增「**按截止 / 按项目**」视图切换。
+  「按项目」视图里每个项目是一个可折叠分组，标题显示「未完成/总数 · 逾期 N」；
+  没写项目的记录归入「未归类」并**永远排在最后**。
+  排序规则：未完成多的项目在前 → 未完成里最早截止日期更早的在前 → 名字字典序。
+  宿主侧 `/worktodo/list` 新增 `projectGroups` 字段（`groupByProject`），且**不受 `project` 参数收窄**——
+  这样面板一次就能拿到全部项目用于切换。
+
+### 测试
+
+- `verify-records` 新增 4 例覆盖 `groupByProject`（未归类最后、未完成多者在前、桶内 total/open/overdue、空输入）；
+- `smoke-host` 新增 1 例断言 `/list` 载荷确实带 `projectGroups` 且形状正确。
+
 ## 0.1.1
 
 ### 修复（重要）
@@ -64,7 +80,7 @@
 - 新增可观测性：`/worktodo/health` 现在报告运行中的实际 `version` 与
   `tools: { status, registered, names, error }`——工具静默没注册这类问题不用再翻日志猜。
 
-### 测试（161 例，均不需要启动 DSH）
+### 测试（166 例，均不需要启动 DSH）
 
 - `tools/verify-records.mjs`（22）：日期归一化与相对日期、状态/优先级同义词、完成时间维护、
   引用解析（id / 标题 / 前缀 / 歧义）、分组边界（本周日 vs 下周一）、统计口径、筛选、坏记录修复。
