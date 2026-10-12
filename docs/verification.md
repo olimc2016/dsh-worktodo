@@ -31,7 +31,7 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 | 记录往返是否保真 | ✅ `status/priority/due/project/source/createdAt` 全部原样落盘并读回 |
 | HTTP 路由是否活着 | ✅ `/worktodo/health` 有响应 |
 | 路由准入围栏是否生效 | ✅ 未认证的 `curl` 得到 **401 Unauthorized**（`connection.requestRejection` 按设计拒绝），面板自身在已认证页面上下文里访问 |
-| 单元/接线测试 | ✅ 172 例全通过（28 数据 + 11 存储 + 18 服务 + 31 宿主 + 12 客户端↔宿主契约 + 14 客户端 bundle + 11 CI 契约 + 30 发布面审计 + 17 收录门禁），均不需启动 DSH |
+| 单元/接线测试 | ✅ 173 例全通过（28 数据 + 12 存储 + 18 服务 + 31 宿主 + 12 客户端↔宿主契约 + 14 客户端 bundle + 11 CI 契约 + 30 发布面审计 + 17 收录门禁），均不需启动 DSH |
 | 发布包内容 | ✅ `pnpm pack` 产物 75 KB，含 `lib/client.js`、`lib/index.js`、`cordis.patch.yml`、`locales`、`icon.svg`、README、docs、src |
 
 ## 平台包（`@deepseek-ai/dsh-tools` 等）在发布形态下怎么解析
@@ -83,7 +83,7 @@ DSH 要求工具返回值必须能被 JSON 无损往返，`undefined` 过不了�
 `value is not lossless JSON` 时用的那一个函数（其 `lib/index.js` 的 `snapshotToolValue()`：
 `const detached = snapshotJsonValue(candidate); if (detached === void 0) throw new ToolOutputError(...)`）。
 另有一条断言专门证明这条守卫有牙齿：`snapshotJsonValue({ due: undefined })` 必须返回 `undefined`
-（即旧写法必被拒），而 `{ due: null }` 合法。测试数演进：85 → 90 → 103 → 116 → 140 → 143 → 144 → 155 → 161 → 166 → 168 → **172（当前，9 个测试文件）**。
+（即旧写法必被拒），而 `{ due: null }` 合法。测试数演进：85 → 90 → 103 → 116 → 140 → 143 → 144 → 155 → 161 → 166 → 168 → 172 → **173（当前，9 个测试文件）**。
 
 **教训（比 bug 本身重要）**：单元测试跑的是模块，真机跑的是**整条校验链**。
 这类"返回值形状被上层校验拒绝"的问题，只有真机调用才暴露得出来——这也是为什么
@@ -203,7 +203,7 @@ scriptsPrependNodePath: true
 ```
 
 它把 node 可执行文件所在目录前置到脚本子进程的 PATH。实测（不带任何命令行参数、即配置生效后的形态）：
-`pnpm run build` ✅、`pnpm test` ✅（9/9、172 例）、`pnpm run prepublishOnly` ✅、`pnpm install --frozen-lockfile` ✅。
+`pnpm run build` ✅、`pnpm test` ✅（9/9、173 例）、`pnpm run prepublishOnly` ✅、`pnpm install --frozen-lockfile` ✅。
 
 **顺带修掉的两个「本地能跑、CI 红」的隐藏不一致**：
 
@@ -356,7 +356,7 @@ Cannot find package '@deepseek-ai/dsh-storage-domain' imported from tools/verify
 **恢复**：在仓库里重跑一次即可（本项目用 `--frozen-lockfile`，lockfile 与配置一致）：
 
 ```bash
-pnpm install --frozen-lockfile      # 之后 9/9、172 例恢复全绿
+pnpm install --frozen-lockfile      # 之后 9/9、173 例恢复全绿
 ```
 
 **给插件开发者的提醒**：开发期用 `link:` 装插件很方便，但**每次卸载/换装都要准备好重跑一次
@@ -414,7 +414,7 @@ npm / GitHub token 形状、`_authToken=` 赋值、云厂商密钥、私钥块�
 ### 永久门禁：`tools/verify-privacy.mjs`
 
 一次性清理不够——**这类泄露不会让测试变红、也不会让程序报错，只会静默公开**。所以加了一道门禁，
-已接入 `pnpm test`（现为 9 个测试文件、172 例），对两个公开面逐条扫描，共 **24 项检查**。
+已接入 `pnpm test`（现为 9 个测试文件、173 例），对两个公开面逐条扫描，共 **24 项检查**。
 
 并且**验证了这道门禁有牙齿**：临时把一个含 5 类违规的探针文件加入 git 索引，门禁立刻变红并精确指出
 每一处（家目录路径、npm token 形状、私人邮箱、会话 id 形状、真实 IP 各一条），退出码 1；
@@ -617,6 +617,39 @@ profile 里装的是 registry 版、而我此前删掉了包内的 `node_modules
 **教训（值得记住）**：官方文档说"平台包由运行时提供、不要声明为依赖"，但**这个 DSH 版本的实际行为不是那样**
 （profile 根的 `@deepseek-ai/` 是空的，实测启动失败）。**能工作的那个插件怎么声明，就怎么声明**——
 同机对照比文档更可靠。此外：**"零依赖"是个诱人但危险的卖点**，它把"装出来能不能跑"赌在了一个未验证的运行时行为上。
+
+## ❌→✅ 插件「时好时坏」地加载失败：cordis 守卫 + 兜底访问（0.1.4 修复）
+
+**现象**：面板打不开、工具全消失（`unknown tool "worktodo_list"`）、`/worktodo/*` 全 404，
+而且**重启也不一定好**——有时能用一阵子，之后突然又不行。
+
+**定位方法（值得记下来）**：本地静态检查全是绿的（模块能 `import`、组合树 `--dump-config` 也把它列进去了、
+无任何 warning），所以只能**真启动**：把官方 web profile 模板初始化到隔离的 `DSH_HOME`，
+把我的包 `link` 进去，加一个 `--patch` overlay 插入插件行，然后启动 —— 错误就自己打出来了：
+
+```
+worktodo (dsh-worktodo): Error: cannot get property "storageDomain" without inject
+    at openWorkTodoStore (src/store.mjs:212:86)
+    at Object.apply [as callback] (lib/index.js:140:23)
+```
+
+**根因**：探测官方存储服务时写成了 `ctx.get('storageDomain') ?? ctx.storageDomain`。
+服务**尚未注册**时 `ctx.get` 返回 undefined → 落到 `ctx.storageDomain` → 被 cordis 守卫抛错
+（直接访问未在 `inject` 里声明的服务是非法的）。异常冒到 `apply` → **插件根本不挂载**。
+因为「服务注册」与「插件初始化」之间存在竞态，所以表现为**时好时坏**。
+
+**修法**：只保留 `ctx.get('storageDomain')`（拿不到就回退 JSON 文件）。
+这条与 `dsh-token-meter-panel` 的做法一致——它注释里就写着「都用 `ctx.get` 或 `ctx.inject` 探测」。
+
+**验证**：
+1. 隔离启动复验 → 无错误、`/worktodo/health` 返回 **401**（=路由已挂载且准入围栏生效）；
+2. 新增回归用例（`verify-store`）：假 ctx 的 `storageDomain` **一访问就抛错**，断言此时回退到文件后端；
+   **把旧写法放回去，这条测试立刻变红** ✓。
+
+**教训**：
+- cordis 里**访问未声明的服务会抛错**，探测必须用 `ctx.get()`；任何「兜底直接访问」都可能把
+  一个可降级的失败升级成整个插件挂载失败；
+- 而且它只在**竞态的那一侧**发生 —— 这类 bug 靠读代码和静态检查很难发现，**必须真启动一次**。
 
 ## 回滚方式
 

@@ -245,7 +245,30 @@ if (!rejected) {
   console.log('  ✗ repairRecord 应拒绝非对象');
 }
 
-console.log(`\n${passed + 1} 通过，${failures.length} 失败`);
+await test('storageDomain 尚未注册时不抛错（cordis 守卫会抛，必须只用 ctx.get 探测）', async () => {
+  // 回归用例：曾经写成 `ctx.get('storageDomain') ?? ctx.storageDomain`——
+  // 服务尚未注册时那个兜底访问会被 cordis 守卫抛错，异常一路冒到 apply，导致**整个插件挂载失败**
+  // （实测表现：插件时好时坏，工具与路由全都不在）。
+  const dir = mkdtempSync(join(tmpdir(), 'wt-guard-'));
+  const previousHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = dir; // 让回退后端落在临时目录，不碰用户真实数据
+  try {
+    const ctx = {
+      get: () => undefined, // 服务还没注册
+      get storageDomain() {
+        throw new Error('cannot get property "storageDomain" without inject');
+      },
+    };
+    const store = await openWorkTodoStore({ ctx, config: {}, logger: null });
+    eq(store.kind, 'file', '应当回退到文件后端而不是抛错：');
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = previousHome;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+console.log(`
+${passed + 1} 通过，${failures.length} 失败`);
 if (failures.length) {
   for (const f of failures) console.error(`- ${f.label}: ${f.error?.stack ?? f.error}`);
   process.exit(1);

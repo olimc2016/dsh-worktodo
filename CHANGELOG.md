@@ -2,6 +2,24 @@
 
 > 本文提到的 `tools/`、`docs/` 等路径都在**仓库**里，不在 npm 发布包内：<https://github.com/olimc2016/dsh-worktodo>
 
+## 0.1.4
+
+### 修复（重要）
+
+- **插件时好时坏地加载失败**：`src/store.mjs` 里探测官方存储服务的写法是
+
+  ```js
+  ctx.get('storageDomain') ?? ctx.storageDomain   // ← 错
+  ```
+
+  当 `storageDomain` **尚未注册**时，`ctx.get()` 返回 `undefined`，于是落到 `ctx.storageDomain`——
+  而直接访问未在 `inject` 里声明的服务会被 cordis 守卫**抛错**（`cannot get property "storageDomain" without inject`）。
+  异常一路冒到 `apply`，**整个插件挂载失败**：工具消失、路由全 404。
+  因为服务注册与服务初始化存在竞态，表现就是「有时能起来、有时起不来」，重启也不一定好。
+
+  现在只保留安全的 `ctx.get('storageDomain')`（探测不到就回退 JSON 文件），并补了回归用例
+  ——它用一个「访问 `storageDomain` 就抛错」的假 ctx 模拟 cordis 守卫，**旧写法下这条测试必红**。
+
 ## 0.1.3
 
 ### 新增
@@ -108,7 +126,7 @@
 - 新增可观测性：`/worktodo/health` 现在报告运行中的实际 `version` 与
   `tools: { status, registered, names, error }`——工具静默没注册这类问题不用再翻日志猜。
 
-### 测试（172 例，均不需要启动 DSH）
+### 测试（173 例，均不需要启动 DSH）
 
 - `tools/verify-records.mjs`（22）：日期归一化与相对日期、状态/优先级同义词、完成时间维护、
   引用解析（id / 标题 / 前缀 / 歧义）、分组边界（本周日 vs 下周一）、统计口径、筛选、坏记录修复。

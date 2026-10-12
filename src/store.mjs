@@ -209,7 +209,10 @@ export async function openWorkTodoStore({ ctx, config = {}, logger } = {}) {
 
   // ctx.get 对未提供的服务返回 undefined，不抛错；storage 服务可能晚于本插件注册，
   // 但 dsh-base 的层序在 profile 组合之前，所以这里探测到不存在时才回退。
-  const storageDomain = explicitPath ? undefined : ctx?.get?.('storageDomain') ?? ctx?.storageDomain;
+  // ⚠️ 只用 ctx.get 探测，**绝不**退回 `ctx.storageDomain`：直接访问未在 inject 里声明的服务
+  // 会被 cordis 守卫抛错（"cannot get property … without inject"），而那个异常会让整个插件挂载失败——
+  // 实测插件「时好时坏」就是这里（服务尚未注册时 ctx.get 返回 undefined，兜底访问随即抛错）
+  const storageDomain = explicitPath ? undefined : ctx?.get?.('storageDomain');
 
   if (storageDomain && typeof storageDomain.open === 'function') {
     try {
