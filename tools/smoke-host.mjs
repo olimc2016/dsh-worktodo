@@ -1,3 +1,5 @@
+// 单元测试不打网络：关掉插件的更新检查（它默认会查一次 npm registry）
+process.env.WORKTODO_NO_UPDATE_CHECK = '1';
 /**
  * 宿主半侧烟测：在**不启动 DSH** 的情况下走通「apply → 路由 → 服务 → 存储」与
  * 「apply → 工具注册 → 工具执行 → 服务」两条链路。
@@ -558,6 +560,18 @@ await test('POST /reorder 落盘手动顺序，并在 manual 模式下生效', a
   const bad = await call(routes.get('/worktodo/reorder').handler, { method: 'POST', url: '/worktodo/reorder', body: { ids: ['不存在的-id'] } });
   eq(bad.json().ok, false);
   eq(bad.json().reason, 'not-found');
+});
+
+await test('GET /list 的载荷带 version 与 update（面板角落的版本信息）', async () => {
+  const response = await call(routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all' });
+  const payload = response.json()?.data;
+  const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+  eq(payload.version, pkgVersion, '载荷里的版本应等于 package.json：');
+  eq(typeof payload.update, 'object', 'update 应当是个对象：');
+  eq(payload.update.current, pkgVersion);
+  eq(typeof payload.update.page === 'string' && payload.update.page.includes('npmjs.com'), true, 'update.page 应指向 npm 页面：');
+  // 关了更新检查时不该声称有新版本
+  eq(payload.update.hasUpdate, false);
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);

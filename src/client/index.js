@@ -71,6 +71,10 @@ const zh = {
   'sortPriority': '优先级',
   'sortCreated': '创建时间',
   'dragHint': '拖动调整顺序（会自动切到手动排序）',
+  'versionLabel': '版本',
+  'versionHint': '当前安装的 dsh-worktodo 版本',
+  'updateAvailable': '有新版本',
+  'updateHint': '更新命令（重启 DSH 生效）',
   'expand': '展开',
   'collapse': '收起',
   'empty': '还没有待办',
@@ -138,6 +142,10 @@ const en = {
   'sortPriority': 'Priority',
   'sortCreated': 'Created',
   'dragHint': 'Drag to reorder (switches to manual sort)',
+  'versionLabel': 'Version',
+  'versionHint': 'Installed dsh-worktodo version',
+  'updateAvailable': 'Update available',
+  'updateHint': 'Update command (restart DSH to apply)',
   'expand': 'Expand',
   'collapse': 'Collapse',
   'empty': 'No to-dos yet',
@@ -993,6 +1001,8 @@ function WorkTodoPanel(props) {
   const stats = data?.stats ?? {};
   const today = typeof data?.today === 'string' && data.today ? data.today : localToday();
   const store = data?.store ?? null;
+  const version = typeof data?.version === 'string' ? data.version : '';
+  const update = data?.update ?? null;
   const num = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
   const overdueCount = num(stats.overdue);
   // 视图分桶：按截止（原有 GROUPS）或按项目（宿主给的 projectGroups，附 未完成/总数/逾期）
@@ -1157,13 +1167,34 @@ function WorkTodoPanel(props) {
     React.createElement('div', {
       key: 'foot',
       style: { marginTop: 14, paddingTop: 8, borderTop: `1px solid ${C.border1}`, fontSize: 10.5, color: C.label3, lineHeight: 1.7 },
-    }, store && store.location
-      ? React.createElement('div', {
-        key: 'store',
-        title: `${t('storeAt')}：${store.location}`,
-        style: { wordBreak: 'break-all' },
-      }, `${t('storeAt')} · ${store.kind === 'domain' ? t('storeDomain') : t('storeFile')} · ${store.location}`)
-      : null),
+    }, [
+      /* 角落信息：装了哪一版 + 有没有新版（一眼可见，不占主区） */
+      React.createElement('div', {
+        key: 'ver',
+        style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 2 },
+      }, [
+        React.createElement('span', {
+          key: 'v',
+          title: t('versionHint'),
+          style: { color: C.label3 },
+        }, `${t('versionLabel')} ${version ? `v${version}` : '—'}`),
+        update?.hasUpdate
+          ? React.createElement('span', {
+            key: 'u',
+            className: 'wt-chip',
+            style: { fontSize: 10, color: C.ok, borderColor: tint(C.ok, 50), background: tint(C.ok, 12) },
+            title: `${t('updateHint')}：dsh plugin --profile desktop add dsh-worktodo@${update.latest}`,
+          }, `${t('updateAvailable')} v${update.latest}`)
+          : null,
+      ]),
+      store && store.location
+        ? React.createElement('div', {
+          key: 'store',
+          title: `${t('storeAt')}：${store.location}`,
+          style: { wordBreak: 'break-all' },
+        }, `${t('storeAt')} · ${store.kind === 'domain' ? t('storeDomain') : t('storeFile')} · ${store.location}`)
+        : null,
+    ]),
   ]);
 }
 

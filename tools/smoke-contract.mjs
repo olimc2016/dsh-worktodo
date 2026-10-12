@@ -1,3 +1,5 @@
+// 单元测试不打网络：关掉插件的更新检查（它默认会查一次 npm registry）
+process.env.WORKTODO_NO_UPDATE_CHECK = '1';
 /**
  * 客户端 ↔ 宿主契约测试。
  *

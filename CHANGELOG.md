@@ -2,6 +2,22 @@
 
 > 本文提到的 `tools/`、`docs/` 等路径都在**仓库**里，不在 npm 发布包内：<https://github.com/olimc2016/dsh-worktodo>
 
+## 0.1.5
+
+### 新增
+
+- **面板角落的版本信息**：页脚显示当前安装的版本（`版本 v0.1.5`）；若有新版，旁边同时出现
+  「有新版本 vX.Y.Z」，鼠标悬停给出更新命令。版本由宿主提供（`/worktodo/list` 载荷的 `version` 字段），
+  客户端不自己猜。
+- **更新检查**（自动更新的可见部分）：宿主在启动后、以及缓存过期时（默认 6 小时）后台查询 npm registry 的
+  `dist-tags.latest`；结果**只用于提示**，不下载也不安装，失败静默、绝不阻塞任何请求。
+  单元测试用 `WORKTODO_NO_UPDATE_CHECK=1` 完全关掉它（测试不该打网络）。
+  自动执行升级（发现新版后后台跑 `dsh plugin add`，重启生效）是下一步。
+
+### 测试
+
+- `smoke-host` 新增 1 例：`/list` 载荷的 `version`/`update` 字段齐全且 `hasUpdate` 在关闭检查时为 false。
+
 ## 0.1.4
 
 ### 修复（重要）
@@ -126,7 +142,7 @@
 - 新增可观测性：`/worktodo/health` 现在报告运行中的实际 `version` 与
   `tools: { status, registered, names, error }`——工具静默没注册这类问题不用再翻日志猜。
 
-### 测试（173 例，均不需要启动 DSH）
+### 测试（174 例，均不需要启动 DSH）
 
 - `tools/verify-records.mjs`（22）：日期归一化与相对日期、状态/优先级同义词、完成时间维护、
   引用解析（id / 标题 / 前缀 / 歧义）、分组边界（本周日 vs 下周一）、统计口径、筛选、坏记录修复。
