@@ -200,6 +200,13 @@ const en = {
  * 不写任何颜色字面量兜底——兜底值等于写死某一种主题下的颜色，另一套主题就花了。
  * 需要「淡淡的底色」时用 color-mix 把语义色混进 transparent，仍然是变量驱动。
  * ------------------------------------------------------------------ */
+/** 本地时区的 YYYY-MM-DD（面板里判断"今天 / 逾期"用；与宿主 records.mjs 的 dayKey 同语义）。 */
+function dayKey(stamp) {
+  const d = new Date(stamp);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 const C = {
   label: 'var(--dsw-alias-label-primary)',
   label2: 'var(--dsw-alias-label-secondary)',
