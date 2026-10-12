@@ -871,7 +871,16 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
       style: drag.dragging ? { opacity: 0.45 } : undefined,
     }
     : {};
-  return React.createElement('div', { className: 'wt-row', ...dragAttrs }, [
+  return React.createElement('div', { className: 'wt-row', ...dragAttrs, style: row.priority === 'high' ? { borderLeft: `2px solid ${C.error}`, paddingLeft: 8 } : undefined }, [
+    /* 优先级呈现（设计稿 v5）：高＝红色左缘 + 实心红旗；中＝琥珀；低＝灰；无＝什么都不显示 */
+    row.priority && row.priority !== 'none' ? React.createElement('span', {
+      key: 'prio-flag',
+      title: row.priority === 'high' ? t('prioHigh') : row.priority === 'normal' ? t('prioNormal') : t('prioLow'),
+      style: {
+        display: 'inline-flex', flex: '0 0 auto',
+        color: row.priority === 'high' ? C.error : row.priority === 'normal' ? C.warn : C.label3,
+      },
+    }, React.createElement(IconFlag, { filled: row.priority === 'high' })) : null,
     React.createElement('button', {
       key: 'check',
       type: 'button',

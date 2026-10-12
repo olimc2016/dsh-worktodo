@@ -95,7 +95,7 @@ Pin your own path in `cordis.patch.yml`:
 ```bash
 pnpm install            # esbuild ships a prebuilt binary; no approve-builds needed
 pnpm run build          # build lib/client.js (browser half)
-pnpm test               # 174 cases: data model / storage / service / host wiring and tools / client contract / client bundle / CI contract / privacy gate / catalog gate
+pnpm test               # 175 cases: data model / storage / service / host wiring and tools / client contract / client bundle / CI contract / privacy gate / catalog gate
 pnpm run watch          # incremental client build
 ```
 
