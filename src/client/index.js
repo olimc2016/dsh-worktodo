@@ -663,7 +663,7 @@ function QuickAdd({ t, onAdd, busy }) {
         React.createElement(IconClock, { key: 'i' }),
         React.createElement('span', { key: 'v' }, `${timeLabel}${parsed && parsed.dueTime ? ` · ${t('fromParsed')}` : ''}`),
         React.createElement('input', {
-          key: 'in', ref: timeRef, type: 'time', value: dueTime, 'aria-label': t('dueTimeLabel'),
+          key: 'in', ref: timeRef, type: 'time', value: dueTime, lang: 'zh-CN', 'aria-label': t('dueTimeLabel'),
           style: { position: 'absolute', inset: 0, opacity: 0, border: 0, padding: 0, width: '100%', height: '100%', cursor: 'pointer' },
           onChange: (event) => setTime(event.target.value),
         }),
