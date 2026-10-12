@@ -44,7 +44,7 @@ dsh plugin --profile desktop add dsh-worktodo                    # npm 包发布
 7. **一份逻辑两个调用方**：面板按钮与 agent 工具共用同一套服务方法，行为与失败原因完全一致
 8. **数据你能直接看**：优先官方 storage；回退时是缩进过的 JSON，坏文件不静默清空、单条坏记录跳过
 9. **降级而非崩溃**：缺 `tools` / `webServer` / storage 的组合里照常工作，日志写明原因
-10. **可被验证**：166 个用例不用启动 DSH 就能跑（含官方 `defineDomain` 契约与官方 `defineTool` 的工具 schema 校验）
+10. **可被验证**：168 个用例不用启动 DSH 就能跑（含官方 `defineDomain` 契约与官方 `defineTool` 的工具 schema 校验）
 
 **关键词**：待办、工作待办、todo、task、优先级、截止日期、逾期、项目、面板、DSH 0.2、跨会话、agent 工具
 
@@ -73,7 +73,7 @@ It installs: DSH 0.2.x, empty `dependencies`, all platform packages optional pee
 7. One implementation, two callers: the panel and the agent tools share the same service methods
 8. Your data is inspectable; a corrupted file is never silently wiped
 9. Degrades instead of crashing when a service is missing
-10. 166 test cases run without launching DSH, including a genuine `defineDomain` contract check, tool schemas validated by the official `defineTool`, and a local gate for the catalog submission
+10. 168 test cases run without launching DSH, including a genuine `defineDomain` contract check, tool schemas validated by the official `defineTool`, and a local gate for the catalog submission
 
 **Keywords**: todo, todo list, task, work todo, priority, due date, deadline, overdue, project, panel, DSH 0.2, cross-session, agent tools
 

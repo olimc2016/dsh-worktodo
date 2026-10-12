@@ -31,7 +31,7 @@ ELECTRON_RUN_AS_NODE=1 "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 | 记录往返是否保真 | ✅ `status/priority/due/project/source/createdAt` 全部原样落盘并读回 |
 | HTTP 路由是否活着 | ✅ `/worktodo/health` 有响应 |
 | 路由准入围栏是否生效 | ✅ 未认证的 `curl` 得到 **401 Unauthorized**（`connection.requestRejection` 按设计拒绝），面板自身在已认证页面上下文里访问 |
-| 单元/接线测试 | ✅ 166 例全通过（26 数据 + 11 存储 + 18 服务 + 27 宿主 + 12 客户端↔宿主契约 + 14 客户端 bundle + 11 CI 契约 + 30 发布面审计 + 17 收录门禁），均不需启动 DSH |
+| 单元/接线测试 | ✅ 168 例全通过（26 数据 + 11 存储 + 18 服务 + 29 宿主 + 12 客户端↔宿主契约 + 14 客户端 bundle + 11 CI 契约 + 30 发布面审计 + 17 收录门禁），均不需启动 DSH |
 | 发布包内容 | ✅ `pnpm pack` 产物 75 KB，含 `lib/client.js`、`lib/index.js`、`cordis.patch.yml`、`locales`、`icon.svg`、README、docs、src |
 
 ## 平台包（`@deepseek-ai/dsh-tools` 等）在发布形态下怎么解析
@@ -83,7 +83,7 @@ DSH 要求工具返回值必须能被 JSON 无损往返，`undefined` 过不了�
 `value is not lossless JSON` 时用的那一个函数（其 `lib/index.js` 的 `snapshotToolValue()`：
 `const detached = snapshotJsonValue(candidate); if (detached === void 0) throw new ToolOutputError(...)`）。
 另有一条断言专门证明这条守卫有牙齿：`snapshotJsonValue({ due: undefined })` 必须返回 `undefined`
-（即旧写法必被拒），而 `{ due: null }` 合法。测试数演进：85 → 90 → 103 → 116 → 140 → 143 → 144 → 155 → 161 → **166（当前，9 个测试文件）**。
+（即旧写法必被拒），而 `{ due: null }` 合法。测试数演进：85 → 90 → 103 → 116 → 140 → 143 → 144 → 155 → 161 → 166 → **168（当前，9 个测试文件）**。
 
 **教训（比 bug 本身重要）**：单元测试跑的是模块，真机跑的是**整条校验链**。
 这类"返回值形状被上层校验拒绝"的问题，只有真机调用才暴露得出来——这也是为什么
@@ -203,7 +203,7 @@ scriptsPrependNodePath: true
 ```
 
 它把 node 可执行文件所在目录前置到脚本子进程的 PATH。实测（不带任何命令行参数、即配置生效后的形态）：
-`pnpm run build` ✅、`pnpm test` ✅（9/9、166 例）、`pnpm run prepublishOnly` ✅、`pnpm install --frozen-lockfile` ✅。
+`pnpm run build` ✅、`pnpm test` ✅（9/9、168 例）、`pnpm run prepublishOnly` ✅、`pnpm install --frozen-lockfile` ✅。
 
 **顺带修掉的两个「本地能跑、CI 红」的隐藏不一致**：
 
@@ -356,7 +356,7 @@ Cannot find package '@deepseek-ai/dsh-storage-domain' imported from tools/verify
 **恢复**：在仓库里重跑一次即可（本项目用 `--frozen-lockfile`，lockfile 与配置一致）：
 
 ```bash
-pnpm install --frozen-lockfile      # 之后 9/9、166 例恢复全绿
+pnpm install --frozen-lockfile      # 之后 9/9、168 例恢复全绿
 ```
 
 **给插件开发者的提醒**：开发期用 `link:` 装插件很方便，但**每次卸载/换装都要准备好重跑一次
@@ -414,7 +414,7 @@ npm / GitHub token 形状、`_authToken=` 赋值、云厂商密钥、私钥块�
 ### 永久门禁：`tools/verify-privacy.mjs`
 
 一次性清理不够——**这类泄露不会让测试变红、也不会让程序报错，只会静默公开**。所以加了一道门禁，
-已接入 `pnpm test`（现为 9 个测试文件、166 例），对两个公开面逐条扫描，共 **24 项检查**。
+已接入 `pnpm test`（现为 9 个测试文件、168 例），对两个公开面逐条扫描，共 **24 项检查**。
 
 并且**验证了这道门禁有牙齿**：临时把一个含 5 类违规的探针文件加入 git 索引，门禁立刻变红并精确指出
 每一处（家目录路径、npm token 形状、私人邮箱、会话 id 形状、真实 IP 各一条），退出码 1；

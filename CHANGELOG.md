@@ -13,6 +13,16 @@
   宿主侧 `/worktodo/list` 新增 `projectGroups` 字段（`groupByProject`），且**不受 `project` 参数收窄**——
   这样面板一次就能拿到全部项目用于切换。
 
+### AI 友好
+
+- **给模型的用法指引**：通过官方 `ctx.systemPrompt.section()` 贡献一段提示（段名 `worktodo:guidance`，
+  `order` 取 3050——官方内置工具段是 1000–3000、`MCP_SERVERS` 是 3100，插在两者之间）。
+  内容讲清三件事：什么时候该用（用户说出承诺/截止日期，或发现超出本会话、仍需人跟进的待办）、
+  什么时候**不该**用（当前任务的步骤拆解属于会话内的 `todo_write`，两者互补）、
+  以及「加之前先查重」「做完用 `worktodo_done`」「标题写成祈使句」等约定。
+- **批量登记**：新增 `worktodo_add_many`，一次调用登记多条；某条不合法只跳过那一条并把原因回传，
+  不影响其余条目（用户一口气说好几件事时省调用）。
+
 ### 测试
 
 - `verify-records` 新增 4 例覆盖 `groupByProject`（未归类最后、未完成多者在前、桶内 total/open/overdue、空输入）；
@@ -80,7 +90,7 @@
 - 新增可观测性：`/worktodo/health` 现在报告运行中的实际 `version` 与
   `tools: { status, registered, names, error }`——工具静默没注册这类问题不用再翻日志猜。
 
-### 测试（166 例，均不需要启动 DSH）
+### 测试（168 例，均不需要启动 DSH）
 
 - `tools/verify-records.mjs`（22）：日期归一化与相对日期、状态/优先级同义词、完成时间维护、
   引用解析（id / 标题 / 前缀 / 歧义）、分组边界（本周日 vs 下周一）、统计口径、筛选、坏记录修复。
@@ -91,7 +101,7 @@
   统计不随筛选变化、提升去重、变更通知。
 - `tools/smoke-host.mjs`（26）：假 ctx 里跑通 `apply` → 7 条路由 → 服务 → 存储的完整增删改查，
   方法围栏与 `connection` 准入，失败路径（空标题、坏 JSON、未知 filter），health 自检字段，
-  6 个工具经**官方 `defineTool`** 校验注册并真实执行，以及 5 条「工具返回值必须无损」的断言——
+  7 个工具经**官方 `defineTool`** 校验注册并真实执行，以及 5 条「工具返回值必须无损」的断言——
   判定用的是 **DSH 自己的校验器** `snapshotJsonValue`（来自 `@deepseek-ai/dsh-util-values`，
   就是 `@deepseek-ai/dsh-tools` 报 "value is not lossless JSON" 时用的那一个函数），
   并有一条专门断言「旧写法 `due: undefined` 必须被它拒绝」，用来证明这条守卫确实有牙齿。

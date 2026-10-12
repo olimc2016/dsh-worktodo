@@ -45,6 +45,9 @@ async function test(label, run) {
  * @param {unknown} expected
  * @param {string} [hint]
  */
+// 记录插件注册给模型的提示段落（供下方断言）
+const systemPromptSections = [];
+
 function eq(actual, expected, hint = '') {
   const a = JSON.stringify(actual);
   const b = JSON.stringify(expected);
@@ -107,6 +110,12 @@ function makeCtx({ rejection } = {}) {
       effects.push({ label, dispose });
       return { dispose() {} };
     },
+    systemPrompt: {
+      section: (section) => {
+        systemPromptSections.push(section);
+        return () => {};
+      },
+    },
     webServer: {
       register: ({ kind, path, handler }) => {
         routes.set(path, { kind, handler });
@@ -120,7 +129,7 @@ function makeCtx({ rejection } = {}) {
       },
     },
   };
-  return { ctx, routes, tools, effects, logs };
+  return { ctx, routes, tools, effects, logs, systemPromptSections };
 }
 
 const root = mkdtempSync(join(tmpdir(), 'worktodo-smoke-'));
@@ -150,9 +159,10 @@ await test('注册出 7 条路由', () => {
   ]);
 });
 
-await test('注册出 6 个 worktodo_* 工具（schema 过官方 defineTool 校验）', () => {
+await test('注册出 7 个 worktodo_* 工具（schema 过官方 defineTool 校验）', () => {
   eq(tools.map((t) => t.name).sort(), [
     'worktodo_add',
+    'worktodo_add_many',
     'worktodo_adopt',
     'worktodo_done',
     'worktodo_list',
@@ -185,7 +195,7 @@ await test('health 自检报告存储位置、版本与工具注册结果', asyn
   // 版本与工具注册结果：排查「源码改动生效了没 / 工具静默没注册」就看这两个字段
   eq(body.version, pkgVersion);
   eq(body.tools.status, 'registered');
-  eq(body.tools.registered, 6);
+  eq(body.tools.registered, 7);
   eq(body.tools.names.includes('worktodo_add'), true);
 });
 
@@ -485,6 +495,36 @@ await test('GET /list 的载荷带 projectGroups（面板「按项目」视图�
     eq(Array.isArray(bucket.todos), true);
   }
   eq(buckets[buckets.length - 1].project, null, '未归类必须在最后一个桶：');
+});
+
+// ---- AI 友好：批量登记 + 给模型的用法指引 ----
+
+await test('worktodo_add_many 一次登记多条，坏的那条只跳过它自己', async () => {
+  const many = tools.find((t) => t.name === 'worktodo_add_many');
+  const value = await many.execute({
+    items: [
+      { title: '批量 A', project: 'alpha', priority: 'high' },
+      { title: '批量 B', due: 'tomorrow' },
+      { title: '   ' }, // 空标题：应当被跳过并给出原因
+    ],
+  }, {});
+  eq(value.count, 2);
+  eq(value.created.length, 2);
+  eq(value.skipped.length, 1);
+  eq(value.skipped[0].index, 2);
+  eq(typeof value.skipped[0].reason === 'string' && value.skipped[0].reason.length > 0, true, '跳过要带原因：');
+  eq(value.created[0].title, '批量 A');
+  eq(value.created[0].priority, 'high');
+});
+
+await test('注册了给模型的用法指引（systemPrompt.section，order 在工具段之后）', () => {
+  const section = systemPromptSections.find((item) => item?.name === 'worktodo:guidance');
+  eq(Boolean(section), true, '没有注册 worktodo:guidance 段落：');
+  eq(Number.isFinite(section.order), true, 'order 必须是有限数：');
+  eq(section.order > 3000, true, 'order 应排在官方内置工具段（1000–3000）之后：');
+  for (const needle of ['worktodo_add', 'worktodo_list', 'todo_write']) {
+    eq(section.text.includes(needle), true, `指引里应当提到 ${needle}：`);
+  }
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);

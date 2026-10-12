@@ -1,6 +1,6 @@
 # 测试与构建（每次 push / PR 都跑）。
 #
-# 为什么值得有：这个插件的卖点之一是「可被验证」——166 个用例不需要启动 DSH。
+# 为什么值得有：这个插件的卖点之一是「可被验证」——168 个用例不需要启动 DSH。
 # CI 把这句话变成可核对的事实，也让目录源与下载者一眼看到它是绿的。
 #
 # 为什么用 pnpm 而不是 npm：**pnpm 是本地唯一被验证过的路径**。本地没装 npm，而
@@ -51,7 +51,7 @@ jobs:
       - name: Build client bundle
         run: pnpm run build
 
-      - name: Test (166 cases, no DSH instance needed)
+      - name: Test (168 cases, no DSH instance needed)
         run: pnpm test
 
       - name: Check the published tarball contains the browser half

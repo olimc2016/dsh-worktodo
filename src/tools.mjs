@@ -22,6 +22,7 @@
  */
 export const TOOL_NAMES = Object.freeze([
   'worktodo_add',
+  'worktodo_add_many',
   'worktodo_list',
   'worktodo_update',
   'worktodo_done',
@@ -125,6 +126,109 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
       })));
     },
     presentCall: (args) => ({ card: 'generic', title: '登记工作待办', kind: 'other', rawInput: args.title }),
+  })));
+
+  // ---- 批量新增（AI 友好：一口气登记多条）----
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'worktodo_add_many',
+    description:
+      '一次登记多条工作待办（用户一口气说了好几件事、或你整理出一串要跟进的活时用它；分开一条条调 worktodo_add 也行，但这样更省调用）。'
+      + '某条不合法只跳过那一条并把原因回传，不影响其余条目。',
+    parameters: {
+      items: {
+        type: 'array',
+        required: true,
+        description: '要登记的事；每项至少给 title。',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            title: { type: 'string', required: true, description: '待办内容（一句简短的祈使句）。' },
+            due: { type: 'string', description: '截止日期：YYYY-MM-DD / today / tomorrow / +3d。' },
+            priority: { type: 'string', enum: ['high', 'normal', 'low'], description: '默认 normal。' },
+            project: { type: 'string', description: '项目或领域标签。' },
+            notes: { type: 'string', description: '背景、链接、验收标准。' },
+            status: { type: 'string', enum: ['pending', 'in_progress', 'completed'], description: '默认 pending。' },
+          },
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          count: { type: 'number', required: true },
+          created: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true },
+                title: { type: 'string', required: true },
+                due: { type: 'string' },
+                priority: { type: 'string', required: true },
+                project: { type: 'string' },
+                status: { type: 'string', required: true },
+              },
+            },
+          },
+          skipped: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                index: { type: 'number', required: true },
+                title: { type: 'string', required: true },
+                reason: { type: 'string', required: true },
+              },
+            },
+          },
+          stats: { type: 'object', additionalProperties: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `已记入工作待办 ${value.count} 条`
+          + (value.skipped.length ? `，跳过 ${value.skipped.length} 条（${value.skipped.map((entry) => `#${entry.index} ${entry.reason}`).join('；')}）` : '')
+          + (value.stats ? `｜当前未完成 ${value.stats.open} 条，逾期 ${value.stats.overdue} 条` : ''),
+      }],
+    },
+    async execute(args) {
+      const created = [];
+      const skipped = [];
+      const items = Array.isArray(args.items) ? args.items : [];
+      for (const [index, item] of items.entries()) {
+        try {
+          const result = unwrap(await service.create(item ?? {}, { source: 'agent' }));
+          created.push(compact({
+            id: result.todo.id,
+            title: result.todo.title,
+            due: result.todo.due ?? undefined,
+            priority: result.todo.priority,
+            project: result.todo.project ?? undefined,
+            status: result.todo.status,
+          }));
+        } catch (error) {
+          skipped.push({
+            index,
+            title: typeof item?.title === 'string' ? item.title : '',
+            reason: String(error?.message ?? error),
+          });
+        }
+      }
+      return withStats(compact({ count: created.length, created, skipped }));
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: `登记 ${Array.isArray(args.items) ? args.items.length : 0} 条工作待办`,
+      kind: 'other',
+      rawInput: '',
+    }),
   })));
 
   // ---- 查询 ----
