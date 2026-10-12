@@ -84,6 +84,7 @@ const zh = {
   'timeUnset': '时间 · 未设',
   'todayWord': '今天',
   'fromParsed': '识别',
+  'timeClear': '清除',
   'dueTimeLabel': '时间',
   'expand': '展开',
   'collapse': '收起',
@@ -163,6 +164,7 @@ const en = {
   'timeUnset': 'Time · unset',
   'todayWord': 'Today',
   'fromParsed': 'parsed',
+  'timeClear': 'Clear',
   'dueTimeLabel': 'Time',
   'expand': 'Expand',
   'collapse': 'Collapse',
@@ -528,6 +530,7 @@ function QuickAdd({ t, onAdd, busy }) {
   const [parsed, setParsed] = React.useState(null);
   const [manual, setManual] = React.useState(false); // 用户手动改过日期/时间
   const [flagOpen, setFlagOpen] = React.useState(false);
+  const [timeOpen, setTimeOpen] = React.useState(false);
   // 点"整块胶囊"都要弹出选择器：Safari 里带值的 date/time 输入光靠点击只会聚焦，
   // 所以统一主动调 showPicker()（不可用时退回 focus+click）
   const dateRef = React.useRef(null);
@@ -657,7 +660,7 @@ function QuickAdd({ t, onAdd, busy }) {
         key: 'time',
         className: `wt-chip${parsed && parsed.dueTime ? ' is-parsed' : ''}`,
         title: t('dueTimeLabel'),
-        onClick: (event) => { event.preventDefault(); openPicker(timeRef); },
+        onClick: (event) => { event.preventDefault(); setTimeOpen((open) => !open); setFlagOpen(false); },
         style: { position: 'relative', cursor: 'pointer', color: dueTime ? C.label : C.label3, borderColor: parsed && parsed.dueTime ? C.brand : undefined },
       }, [
         React.createElement(IconClock, { key: 'i' }),
@@ -667,6 +670,39 @@ function QuickAdd({ t, onAdd, busy }) {
           style: { position: 'absolute', inset: 0, opacity: 0, border: 0, padding: 0, width: '100%', height: '100%', cursor: 'pointer' },
           onChange: (event) => setTime(event.target.value),
         }),
+        /* 自己的 24 小时选择器：不依赖系统/浏览器的时间格式（原生控件在 12 小时制系统上会显示 AM/PM） */
+        timeOpen ? React.createElement('div', {
+          key: 'timepop',
+          onClick: (event) => { event.preventDefault(); event.stopPropagation(); },
+          style: {
+            position: 'absolute', top: '100%', left: 0, zIndex: 6, marginTop: 4, padding: 8, width: 208,
+            background: C.layer1, border: `1px solid ${C.border}`, borderRadius: 10, boxShadow: '0 8px 24px rgba(0,0,0,.12)',
+            display: 'flex', flexDirection: 'column', gap: 6, fontSize: 11.5, cursor: 'default',
+          },
+        }, [
+          React.createElement('div', { key: 'quick', style: { display: 'flex', gap: 4, flexWrap: 'wrap' } },
+            ['09:00', '12:00', '14:00', '18:00', '20:00'].map((value) => React.createElement('button', {
+              key: value, type: 'button', className: 'wt-chip',
+              style: { font: 'inherit', fontSize: 11.5, cursor: 'pointer', borderColor: dueTime === value ? C.brand : undefined },
+              onClick: () => { setTime(value); setTimeOpen(false); },
+            }, value))),
+          React.createElement('div', { key: 'hours', style: { display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: 2 } },
+            Array.from({ length: 24 }, (_, h) => String(h).padStart(2, '0')).map((hh) => React.createElement('button', {
+              key: hh, type: 'button', className: 'wt-chip',
+              style: { font: 'inherit', fontSize: 11, cursor: 'pointer', justifyContent: 'center', padding: '3px 0', borderColor: (dueTime || '').slice(0, 2) === hh ? C.brand : undefined },
+              onClick: () => { setTime(`${hh}:${(dueTime || '00:00').slice(3, 5)}`); },
+            }, hh))),
+          React.createElement('div', { key: 'mins', style: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 2 } },
+            ['00', '15', '30', '45'].map((mm) => React.createElement('button', {
+              key: mm, type: 'button', className: 'wt-chip',
+              style: { font: 'inherit', fontSize: 11, cursor: 'pointer', justifyContent: 'center', padding: '3px 0', borderColor: (dueTime || '').slice(3, 5) === mm ? C.brand : undefined },
+              onClick: () => { setTime(`${(dueTime || '09:00').slice(0, 2)}:${mm}`); setTimeOpen(false); },
+            }, mm))),
+          React.createElement('div', { key: 'foot', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } }, [
+            React.createElement('span', { key: 'now', className: 'wt-chip', style: { cursor: 'pointer', fontSize: 11 }, onClick: () => { setTime(dueTime); setTimeOpen(false); } }, dueTime || 'HH:MM'),
+            React.createElement('button', { key: 'clear', type: 'button', className: 'wt-chip', style: { font: 'inherit', fontSize: 11, cursor: 'pointer' }, onClick: () => { setManual(true); setDueTime(''); setTimeOpen(false); } }, t('timeClear')),
+          ]),
+        ]) : null,
       ]),
       // 优先级：点开四个小旗
       React.createElement('span', { key: 'prio', style: { position: 'relative' } }, [
