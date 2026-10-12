@@ -1,4 +1,6 @@
 import React from 'react';
+// 与宿主共用同一份解析器：人机一致，且零依赖（会被 esbuild 内联进 bundle）
+import { parseNaturalDue } from '../parse-due.mjs';
 
 /**
  * worktodo 浏览器半侧：DSH 侧栏入口 + 中栏「工作待办」面板。
@@ -77,6 +79,11 @@ const zh = {
   'updateHint': '更新命令（重启 DSH 生效）',
   'addOpen': '新增待办',
   'addCancel': '取消',
+  'prioNone': '无',
+  'dateUnset': '日期 · 未设',
+  'timeUnset': '时间 · 未设',
+  'todayWord': '今天',
+  'fromParsed': '识别',
   'dueTimeLabel': '时间',
   'expand': '展开',
   'collapse': '收起',
@@ -151,6 +158,11 @@ const en = {
   'updateHint': 'Update command (restart DSH to apply)',
   'addOpen': 'New todo',
   'addCancel': 'Cancel',
+  'prioNone': 'None',
+  'dateUnset': 'Date · unset',
+  'timeUnset': 'Time · unset',
+  'todayWord': 'Today',
+  'fromParsed': 'parsed',
   'dueTimeLabel': 'Time',
   'expand': 'Expand',
   'collapse': 'Collapse',
@@ -463,132 +475,198 @@ function useList(sort) {
  * 快速添加
  * ------------------------------------------------------------------ */
 /** 小红旗图标：填充与描边都用 currentColor，颜色由按钮的 color 决定。 */
-function IconFlag({ filled }) {
-  return React.createElement('svg', { width: 13, height: 13, viewBox: '0 0 16 16', 'aria-hidden': 'true' }, [
-    React.createElement('path', {
-      key: 'pole',
-      d: 'M3.6 1.6v13',
-      stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', fill: 'none',
-    }),
-    React.createElement('path', {
-      key: 'cloth',
-      d: 'M5.2 2.4h7.4L11 5.2l1.6 2.8H5.2z',
-      fill: filled ? 'currentColor' : 'none',
-      stroke: 'currentColor', strokeWidth: 1.3, strokeLinejoin: 'round',
-    }),
-  ]);
-}
 
 /**
  * 新增待办：平时只是一个**大加号**，点开才展开表单。
  * 日期用原生日历（`type=date`）、时间用原生时钟（`type=time`），
  * 优先级用三个不同颜色的**小红旗**表示（高=红、普通=琥珀、低=灰）。
  */
+
+/** 小红旗图标：颜色由父级 color 决定；filled=选中档位。 */
+function IconFlag({ filled, dashed }) {
+  return React.createElement('svg', { width: 13, height: 13, viewBox: '0 0 16 16', 'aria-hidden': 'true' }, [
+    React.createElement('path', {
+      key: 'pole', d: 'M3.6 1.6v13', stroke: 'currentColor', strokeWidth: 1.6,
+      strokeLinecap: 'round', fill: 'none', strokeDasharray: dashed ? '1.5 1.5' : undefined,
+    }),
+    React.createElement('path', {
+      key: 'cloth', d: 'M5.2 2.4h7.4L11 5.2l1.6 2.8H5.2z',
+      fill: filled ? 'currentColor' : 'none', stroke: 'currentColor', strokeWidth: 1.3,
+      strokeLinejoin: 'round', strokeDasharray: dashed ? '1.5 1.5' : undefined,
+    }),
+  ]);
+}
+
+const IconCal = () => React.createElement('svg', { width: 13, height: 13, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, 'aria-hidden': 'true' }, [
+  React.createElement('rect', { key: 'r', x: 2.2, y: 3.4, width: 11.6, height: 10.4, rx: 2 }),
+  React.createElement('path', { key: 'p', d: 'M2.2 6.6h11.6M5.4 2.2v2.4M10.6 2.2v2.4' }),
+]);
+const IconClock = () => React.createElement('svg', { width: 13, height: 13, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, 'aria-hidden': 'true' }, [
+  React.createElement('circle', { key: 'c', cx: 8, cy: 8, r: 5.8 }),
+  React.createElement('path', { key: 'p', d: 'M8 4.9V8l2.2 1.4' }),
+]);
+
+/**
+ * 快速添加：两行布局（设计稿 v5）。
+ *   第一行：待办内容 + 添加；
+ *   第二行（更小）：日期 / 时间 / 优先级——显示**当前值**，点开才选。
+ * 标题里写了「明天下午3点」这类说法会被实时解析：第二行自动点亮并标"· 识别"，
+ * 且日期词会从标题里摘掉。**手动改过就不再被自动覆盖**（手动优先）。
+ */
 function QuickAdd({ t, onAdd, busy }) {
-  const [open, setOpen] = React.useState(false);
   const [title, setTitle] = React.useState('');
   const [due, setDue] = React.useState('');
   const [dueTime, setDueTime] = React.useState('');
-  const [priority, setPriority] = React.useState('normal');
+  const [priority, setPriority] = React.useState('none');
+  const [parsed, setParsed] = React.useState(null);
+  const [manual, setManual] = React.useState(false); // 用户手动改过日期/时间
+  const [flagOpen, setFlagOpen] = React.useState(false);
+
+  // 输入防抖 300ms 再解析（每按一键就解析会闪烁）
+  React.useEffect(() => {
+    if (manual) return undefined;
+    const text = title;
+    if (!text || !text.trim()) { setParsed(null); return undefined; }
+    const timer = setTimeout(() => {
+      const result = parseNaturalDue(text, Date.now());
+      if (result.matched.length) {
+        setParsed(result);
+        setDue(result.due ?? '');
+        setDueTime(result.dueTime ?? '');
+      } else {
+        setParsed(null);
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [title, manual]);
 
   const submit = () => {
     if (busy) return;
-    // 日期/时间/优先级是「这一批」的选择，加完保留：同一天连着加几件事不用反复填
-    Promise.resolve(onAdd({ title, due, dueTime, priority })).then((ok) => {
-      if (ok !== false) setTitle('');
-    }).catch(() => { /* onAdd 内部已经吞掉错误并显示在错误条上 */ });
+    let payloadTitle = title;
+    if (!manual) {
+      const result = parseNaturalDue(title, Date.now());
+      if (result.matched.length) payloadTitle = result.title; // 日期词摘掉
+    }
+    Promise.resolve(onAdd({
+      title: payloadTitle,
+      due: due || null,
+      dueTime: dueTime || null,
+      priority,
+    })).then((ok) => {
+      if (ok !== false) {
+        setTitle('');
+        setParsed(null);
+        setManual(false);
+        setFlagOpen(false);
+        // 日期/时间/优先级保留：连着录同一天的几件事不用重设
+      }
+    }).catch(() => { /* onAdd 内部已显示错误 */ });
   };
 
-  if (!open) {
-    return React.createElement('button', {
-      key: 'plus',
-      type: 'button',
-      className: 'wt-plus',
-      title: t('addOpen'),
-      'aria-label': t('addOpen'),
-      onClick: () => setOpen(true),
-    }, [
-      React.createElement('span', { key: 'm', className: 'wt-plus-mark' }, '+'),
-      React.createElement('span', { key: 'l' }, t('addOpen')),
-    ]);
-  }
+  const today = dayKey(Date.now());
+  const dateLabel = due
+    ? (due === today ? t('todayWord') : `${due.slice(5).replace('-', '-')}`)
+    : t('dateUnset');
+  const timeLabel = dueTime || t('timeUnset');
+  const prioLabel = priority === 'high' ? t('prioHigh') : priority === 'normal' ? t('prioNormal') : priority === 'low' ? t('prioLow') : t('prioNone');
+  const prioColor = priority === 'high' ? C.error : priority === 'normal' ? C.warn : C.label3;
 
   const flags = [
+    { value: 'none', label: t('prioNone'), color: C.label3, dashed: true },
     { value: 'high', label: t('prioHigh'), color: C.error },
     { value: 'normal', label: t('prioNormal'), color: C.warn },
     { value: 'low', label: t('prioLow'), color: C.label3 },
   ];
-  const close = () => { setOpen(false); setTitle(''); };
 
-  return React.createElement('div', {
-    key: 'form',
-    style: {
-      display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 12,
-      padding: 12, borderRadius: 12, border: `1px solid ${C.border1}`, background: C.layer1,
-    },
-  }, [
-    React.createElement('input', {
-      key: 'ti',
-      className: 'wt-input',
-      autoFocus: true,
-      style: { fontSize: 13, padding: '7px 10px' },
-      value: title,
-      placeholder: t('addPlaceholder'),
-      'aria-label': t('addPlaceholder'),
-      onChange: (event) => setTitle(event.target.value),
-      onKeyDown: (event) => {
-        if (event.key === 'Enter') submit();
-        if (event.key === 'Escape') close();
-      },
-    }),
-    React.createElement('div', { key: 'when', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
-      React.createElement('label', { key: 'd', style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: C.label3 } }, [
-        t('dueLabel'),
-        React.createElement('input', {
-          key: 'i', className: 'wt-input', type: 'date', value: due,
-          'aria-label': t('dueLabel'),
-          onChange: (event) => {
-            setDue(event.target.value);
-            if (!event.target.value) setDueTime(''); // 没有日期就没有时间
-          },
-        }),
-      ]),
-      React.createElement('label', {
-        key: 'tm',
-        title: due ? t('dueTimeLabel') : t('dueLabel'),
-        style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: C.label3, opacity: due ? 1 : 0.5 },
-      }, [
-        t('dueTimeLabel'),
-        React.createElement('input', {
-          key: 'i', className: 'wt-input', type: 'time', value: dueTime, disabled: !due,
-          'aria-label': t('dueTimeLabel'),
-          onChange: (event) => setDueTime(event.target.value),
-        }),
-      ]),
-    ]),
-    React.createElement('div', { key: 'prio', style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } }, [
-      React.createElement('span', { key: 'l', style: { fontSize: 11, color: C.label3 } }, `${t('priorityLabel')}：`),
-      ...flags.map((flag) => React.createElement('button', {
-        key: flag.value,
-        type: 'button',
-        className: `wt-flag-btn${priority === flag.value ? ' is-on' : ''}`,
-        style: { color: flag.color },
-        title: flag.label,
-        'aria-pressed': priority === flag.value,
-        onClick: () => setPriority(flag.value),
-      }, [
-        React.createElement(IconFlag, { key: 'f', filled: priority === flag.value }),
-        React.createElement('span', { key: 't' }, flag.label),
-      ])),
-    ]),
-    React.createElement('div', { key: 'actions', style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
+  const setDate = (value) => {
+    setManual(true);
+    setDue(value);
+    if (!value) setDueTime(''); // 没日期就没时间
+    setFlagOpen(false);
+  };
+  const setTime = (value) => {
+    setManual(true);
+    if (value && !due) setDue(dayKey(Date.now())); // 只选时间＝今天
+    setDueTime(value);
+  };
+
+  return React.createElement('div', { key: 'qa', style: { marginBottom: 12 } }, [
+    // ---- 第一行：内容 + 添加 ----
+    React.createElement('div', { key: 'l1', style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
+      React.createElement('input', {
+        key: 'ti',
+        className: 'wt-input',
+        style: { flex: '1 1 auto', fontSize: 13, padding: '7px 10px' },
+        value: title,
+        placeholder: t('addPlaceholder'),
+        'aria-label': t('addPlaceholder'),
+        onChange: (event) => setTitle(event.target.value),
+        onKeyDown: (event) => { if (event.key === 'Enter') submit(); },
+      }),
       React.createElement('button', {
         key: 'add', type: 'button', className: 'wt-btn wt-btn-primary',
         disabled: Boolean(busy), onClick: submit,
       }, t('add')),
-      React.createElement('button', {
-        key: 'cancel', type: 'button', className: 'wt-btn', onClick: close,
-      }, t('addCancel')),
+    ]),
+
+    // ---- 第二行（更小）：日期 / 时间 / 优先级 ----
+    React.createElement('div', { key: 'l2', style: { display: 'flex', alignItems: 'center', gap: 10, marginTop: 8, fontSize: 11.5, flexWrap: 'wrap' } }, [
+      // 日期：label 里套一个透明的原生 date 输入，点它即弹系统日历
+      React.createElement('label', {
+        key: 'due',
+        className: `wt-chip${parsed && parsed.due ? ' is-parsed' : ''}`,
+        title: t('dueLabel'),
+        style: { position: 'relative', cursor: 'pointer', color: due ? C.label : C.label3, borderColor: parsed && parsed.due ? C.brand : undefined },
+      }, [
+        React.createElement(IconCal, { key: 'i' }),
+        React.createElement('span', { key: 'v' }, due ? `${today === due ? t('todayWord') : due}${parsed && parsed.due ? ` · ${t('fromParsed')}` : ''}` : t('dateUnset')),
+        React.createElement('input', {
+          key: 'in', type: 'date', value: due, 'aria-label': t('dueLabel'),
+          style: { position: 'absolute', inset: 0, opacity: 0, border: 0, padding: 0, width: '100%', height: '100%', cursor: 'pointer' },
+          onChange: (event) => setDate(event.target.value),
+        }),
+      ]),
+      // 时间：同样用原生 time 输入；只选时间时自动补今天
+      React.createElement('label', {
+        key: 'time',
+        className: `wt-chip${parsed && parsed.dueTime ? ' is-parsed' : ''}`,
+        title: t('dueTimeLabel'),
+        style: { position: 'relative', cursor: 'pointer', color: dueTime ? C.label : C.label3, borderColor: parsed && parsed.dueTime ? C.brand : undefined },
+      }, [
+        React.createElement(IconClock, { key: 'i' }),
+        React.createElement('span', { key: 'v' }, `${timeLabel}${parsed && parsed.dueTime ? ` · ${t('fromParsed')}` : ''}`),
+        React.createElement('input', {
+          key: 'in', type: 'time', value: dueTime, 'aria-label': t('dueTimeLabel'),
+          style: { position: 'absolute', inset: 0, opacity: 0, border: 0, padding: 0, width: '100%', height: '100%', cursor: 'pointer' },
+          onChange: (event) => setTime(event.target.value),
+        }),
+      ]),
+      // 优先级：点开四个小旗
+      React.createElement('span', { key: 'prio', style: { position: 'relative' } }, [
+        React.createElement('button', {
+          key: 'btn', type: 'button', className: 'wt-chip', style: { color: prioColor, cursor: 'pointer', font: 'inherit', fontSize: 11.5 },
+          title: t('priorityLabel'), 'aria-expanded': flagOpen,
+          onClick: () => setFlagOpen((open) => !open),
+        }, [
+          React.createElement(IconFlag, { key: 'f', dashed: priority === 'none', filled: priority !== 'none' }),
+          React.createElement('span', { key: 'v' }, `${t('priorityLabel')} · ${prioLabel}`),
+        ]),
+        flagOpen ? React.createElement('div', {
+          key: 'pop',
+          style: {
+            position: 'absolute', top: '100%', left: 0, zIndex: 5, marginTop: 4, padding: 6, display: 'flex', gap: 4,
+            background: C.layer1, border: `1px solid ${C.border}`, borderRadius: 10, boxShadow: '0 8px 24px rgba(0,0,0,.12)',
+          },
+        }, flags.map((flag) => React.createElement('button', {
+          key: flag.value, type: 'button', className: 'wt-chip',
+          style: { color: flag.color, font: 'inherit', fontSize: 11.5, cursor: 'pointer', borderColor: priority === flag.value ? flag.color : undefined },
+          title: flag.label,
+          onClick: () => { setPriority(flag.value); setFlagOpen(false); },
+        }, [
+          React.createElement(IconFlag, { key: 'f', filled: priority === flag.value, dashed: flag.value === 'none' }),
+          React.createElement('span', { key: 'v' }, flag.label),
+        ]))) : null,
+      ]),
     ]),
   ]);
 }

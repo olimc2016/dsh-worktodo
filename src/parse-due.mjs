@@ -7,11 +7,26 @@
  *   3. 结果的每一处都能追溯到原文片段（matched），人类侧据此显示"从标题识别"并可撤销；
  *   4. 与 `normalizeDue` 的既有说法保持兼容（今天/明天/昨天/+3d/本周）。
  *
- * 人类面板与 worktodo_* 工具共用这一份实现，避免两边理解不一致。
+ * 人类面板与 worktodo_* 工具共用这一份实现（本文件零依赖，可直接被打进客户端 bundle），
+ * 避免两边理解不一致。
  */
-import { dayKey, weekStartKey } from './records.mjs';
-
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** 本地时区的 YYYY-MM-DD（与 records.mjs 的 dayKey 同语义）。 */
+function dayKey(stamp) {
+  const d = new Date(stamp);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** 所在周的周一（本地时区，与 records.mjs 的 weekStartKey 同语义）。 */
+function weekStartKey(stamp) {
+  const d = new Date(stamp);
+  const day = (d.getDay() + 6) % 7; // 周一=0
+  const monday = new Date(d.getFullYear(), d.getMonth(), d.getDate() - day);
+  return dayKey(monday.getTime());
+}
+
 
 const CN_NUM = { 零: 0, 一: 1, 两: 2, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
 const WEEKDAY = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 日: 7, 天: 7 };
