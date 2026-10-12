@@ -1,3 +1,5 @@
+import { parseNaturalDue } from './parse-due.mjs';
+
 /**
  * 面向模型的 worktodo_* 工具。
  *
@@ -118,7 +120,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
       }],
     },
     execute(args) {
-      return service.create(args, { source: 'agent' }).then(unwrap).then((result) => withStats(compact({
+      return service.create(withParsedDue(args), { source: 'agent' }).then(unwrap).then((result) => withStats(compact({
         id: result.todo.id,
         title: result.todo.title,
         due: result.todo.due ?? undefined,
@@ -209,7 +211,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
       const items = Array.isArray(args.items) ? args.items : [];
       for (const [index, item] of items.entries()) {
         try {
-          const result = unwrap(await service.create(item ?? {}, { source: 'agent' }));
+          const result = unwrap(await service.create(withParsedDue(item ?? {}), { source: 'agent' }));
           created.push(compact({
             id: result.todo.id,
             title: result.todo.title,
@@ -454,4 +456,23 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
       }
     },
   };
+}/**
+ * 让工具也能"说人话"：标题里写了「明天下午三点」这类说法时，交给与面板**同一份**解析器
+ * （`src/parse-due.mjs`）。显式传了 `due` 就以显式为准，绝不被标题覆盖。
+ * @param {object} input
+ * @returns {object} 落库用的参数（标题里的日期词会被摘掉）
+ */
+export function withParsedDue(input = {}) {
+  const explicit = input.due !== undefined && input.due !== null && input.due !== '';
+  if (explicit) return input;
+  const parsed = parseNaturalDue(String(input.title ?? ''), Date.now());
+  if (!parsed.matched.length) return input;
+  return {
+    ...input,
+    title: parsed.title,
+    due: parsed.due ?? undefined,
+    dueTime: input.dueTime ?? parsed.dueTime ?? undefined,
+  };
 }
+
+
