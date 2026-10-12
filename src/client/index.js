@@ -75,6 +75,9 @@ const zh = {
   'versionHint': '当前安装的 dsh-worktodo 版本',
   'updateAvailable': '有新版本',
   'updateHint': '更新命令（重启 DSH 生效）',
+  'addOpen': '新增待办',
+  'addCancel': '取消',
+  'dueTimeLabel': '时间',
   'expand': '展开',
   'collapse': '收起',
   'empty': '还没有待办',
@@ -146,6 +149,9 @@ const en = {
   'versionHint': 'Installed dsh-worktodo version',
   'updateAvailable': 'Update available',
   'updateHint': 'Update command (restart DSH to apply)',
+  'addOpen': 'New todo',
+  'addCancel': 'Cancel',
+  'dueTimeLabel': 'Time',
   'expand': 'Expand',
   'collapse': 'Collapse',
   'empty': 'No to-dos yet',
@@ -264,6 +270,20 @@ const STYLE_TEXT = `
 .wt-seg-btn:hover { color: ${C.label}; }
 .wt-row[draggable="true"] { cursor: grab; }
 .wt-row[draggable="true"]:active { cursor: grabbing; }
+.wt-plus {
+  width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 12px 14px; margin-bottom: 10px; cursor: pointer; font: inherit; font-size: 13.5px; font-weight: 600;
+  color: ${C.label2}; background: ${C.layer1};
+  border: 1px dashed ${C.border}; border-radius: 12px;
+}
+.wt-plus:hover { color: ${C.label}; border-color: ${C.brand}; background: ${tint(C.brand, 8)}; }
+.wt-plus-mark { font-size: 24px; line-height: 1; font-weight: 400; color: ${C.brand}; }
+.wt-flag-btn {
+  appearance: none; display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  font: inherit; font-size: 11.5px; padding: 5px 9px; border-radius: 9px;
+  background: transparent; border: 1px solid ${C.border}; color: ${C.label2};
+}
+.wt-flag-btn.is-on { border-color: currentColor; background: color-mix(in srgb, currentColor 12%, transparent); color: inherit; }
 .wt-group-head {
   display: flex; align-items: center; gap: 7px; padding: 3px 8px; border-radius: 8px;
   cursor: pointer; user-select: none; color: ${C.label2};
@@ -442,72 +462,134 @@ function useList(sort) {
 /* ------------------------------------------------------------------ *
  * 快速添加
  * ------------------------------------------------------------------ */
+/** 小红旗图标：填充与描边都用 currentColor，颜色由按钮的 color 决定。 */
+function IconFlag({ filled }) {
+  return React.createElement('svg', { width: 13, height: 13, viewBox: '0 0 16 16', 'aria-hidden': 'true' }, [
+    React.createElement('path', {
+      key: 'pole',
+      d: 'M3.6 1.6v13',
+      stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', fill: 'none',
+    }),
+    React.createElement('path', {
+      key: 'cloth',
+      d: 'M5.2 2.4h7.4L11 5.2l1.6 2.8H5.2z',
+      fill: filled ? 'currentColor' : 'none',
+      stroke: 'currentColor', strokeWidth: 1.3, strokeLinejoin: 'round',
+    }),
+  ]);
+}
+
+/**
+ * 新增待办：平时只是一个**大加号**，点开才展开表单。
+ * 日期用原生日历（`type=date`）、时间用原生时钟（`type=time`），
+ * 优先级用三个不同颜色的**小红旗**表示（高=红、普通=琥珀、低=灰）。
+ */
 function QuickAdd({ t, onAdd, busy }) {
+  const [open, setOpen] = React.useState(false);
   const [title, setTitle] = React.useState('');
   const [due, setDue] = React.useState('');
+  const [dueTime, setDueTime] = React.useState('');
   const [priority, setPriority] = React.useState('normal');
 
   const submit = () => {
     if (busy) return;
-    // 截止日期与优先级是「这一批」的选择，加完保留：同一天连着加几件事时不用反复填
-    Promise.resolve(onAdd({ title, due, priority })).then((ok) => {
+    // 日期/时间/优先级是「这一批」的选择，加完保留：同一天连着加几件事不用反复填
+    Promise.resolve(onAdd({ title, due, dueTime, priority })).then((ok) => {
       if (ok !== false) setTitle('');
     }).catch(() => { /* onAdd 内部已经吞掉错误并显示在错误条上 */ });
   };
 
+  if (!open) {
+    return React.createElement('button', {
+      key: 'plus',
+      type: 'button',
+      className: 'wt-plus',
+      title: t('addOpen'),
+      'aria-label': t('addOpen'),
+      onClick: () => setOpen(true),
+    }, [
+      React.createElement('span', { key: 'm', className: 'wt-plus-mark' }, '+'),
+      React.createElement('span', { key: 'l' }, t('addOpen')),
+    ]);
+  }
+
+  const flags = [
+    { value: 'high', label: t('prioHigh'), color: C.error },
+    { value: 'normal', label: t('prioNormal'), color: C.warn },
+    { value: 'low', label: t('prioLow'), color: C.label3 },
+  ];
+  const close = () => { setOpen(false); setTitle(''); };
+
   return React.createElement('div', {
-    style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 10 },
+    key: 'form',
+    style: {
+      display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 12,
+      padding: 12, borderRadius: 12, border: `1px solid ${C.border1}`, background: C.layer1,
+    },
   }, [
     React.createElement('input', {
       key: 'ti',
       className: 'wt-input',
-      style: { flex: '1 1 200px', fontSize: 12.5, padding: '5px 9px' },
+      autoFocus: true,
+      style: { fontSize: 13, padding: '7px 10px' },
       value: title,
       placeholder: t('addPlaceholder'),
       'aria-label': t('addPlaceholder'),
       onChange: (event) => setTitle(event.target.value),
-      onKeyDown: (event) => { if (event.key === 'Enter') submit(); },
+      onKeyDown: (event) => {
+        if (event.key === 'Enter') submit();
+        if (event.key === 'Escape') close();
+      },
     }),
-    React.createElement('label', {
-      key: 'due',
-      title: t('dueLabel'),
-      style: { display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, color: C.label3 },
-    }, [
-      t('dueLabel'),
-      React.createElement('input', {
-        key: 'i',
-        className: 'wt-input',
-        type: 'date',
-        value: due,
-        'aria-label': t('dueLabel'),
-        onChange: (event) => setDue(event.target.value),
-      }),
-    ]),
-    React.createElement('label', {
-      key: 'prio',
-      title: t('priorityLabel'),
-      style: { display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11, color: C.label3 },
-    }, [
-      t('priorityLabel'),
-      React.createElement('select', {
-        key: 's',
-        className: 'wt-input',
-        value: priority,
-        'aria-label': t('priorityLabel'),
-        onChange: (event) => setPriority(event.target.value),
+    React.createElement('div', { key: 'when', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
+      React.createElement('label', { key: 'd', style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: C.label3 } }, [
+        t('dueLabel'),
+        React.createElement('input', {
+          key: 'i', className: 'wt-input', type: 'date', value: due,
+          'aria-label': t('dueLabel'),
+          onChange: (event) => {
+            setDue(event.target.value);
+            if (!event.target.value) setDueTime(''); // 没有日期就没有时间
+          },
+        }),
+      ]),
+      React.createElement('label', {
+        key: 'tm',
+        title: due ? t('dueTimeLabel') : t('dueLabel'),
+        style: { display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11, color: C.label3, opacity: due ? 1 : 0.5 },
       }, [
-        React.createElement('option', { key: 'high', value: 'high' }, t('prioHigh')),
-        React.createElement('option', { key: 'normal', value: 'normal' }, t('prioNormal')),
-        React.createElement('option', { key: 'low', value: 'low' }, t('prioLow')),
+        t('dueTimeLabel'),
+        React.createElement('input', {
+          key: 'i', className: 'wt-input', type: 'time', value: dueTime, disabled: !due,
+          'aria-label': t('dueTimeLabel'),
+          onChange: (event) => setDueTime(event.target.value),
+        }),
       ]),
     ]),
-    React.createElement('button', {
-      key: 'add',
-      type: 'button',
-      className: 'wt-btn wt-btn-primary',
-      disabled: Boolean(busy),
-      onClick: submit,
-    }, t('add')),
+    React.createElement('div', { key: 'prio', style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } }, [
+      React.createElement('span', { key: 'l', style: { fontSize: 11, color: C.label3 } }, `${t('priorityLabel')}：`),
+      ...flags.map((flag) => React.createElement('button', {
+        key: flag.value,
+        type: 'button',
+        className: `wt-flag-btn${priority === flag.value ? ' is-on' : ''}`,
+        style: { color: flag.color },
+        title: flag.label,
+        'aria-pressed': priority === flag.value,
+        onClick: () => setPriority(flag.value),
+      }, [
+        React.createElement(IconFlag, { key: 'f', filled: priority === flag.value }),
+        React.createElement('span', { key: 't' }, flag.label),
+      ])),
+    ]),
+    React.createElement('div', { key: 'actions', style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
+      React.createElement('button', {
+        key: 'add', type: 'button', className: 'wt-btn wt-btn-primary',
+        disabled: Boolean(busy), onClick: submit,
+      }, t('add')),
+      React.createElement('button', {
+        key: 'cancel', type: 'button', className: 'wt-btn', onClick: close,
+      }, t('addCancel')),
+    ]),
   ]);
 }
 
@@ -539,6 +621,7 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
       due,
       priority: row.priority === 'high' || row.priority === 'low' ? row.priority : 'normal',
       project: typeof row.project === 'string' ? row.project : '',
+      dueTime: typeof row.dueTime === 'string' ? row.dueTime : '',
       notes: typeof row.notes === 'string' ? row.notes : '',
     });
     setNotesOpen(Boolean(row.notes));
@@ -557,7 +640,12 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
     const title = String(draft.title ?? '').trim();
     if (title !== (row.title ?? '')) patch.title = title;
     const nextDue = draft.due || '';
-    if (nextDue !== due) patch.due = nextDue; // 空串 = 清空截止日期
+    if (nextDue !== due) {
+      patch.due = nextDue; // 空串 = 清空截止日期
+      if (!nextDue) patch.dueTime = 'none'; // 没有日期就没有时间
+    }
+    const nextDueTime = String(draft.dueTime ?? '').trim();
+    if (nextDue && nextDueTime !== (row.dueTime ?? '')) patch.dueTime = nextDueTime === '' ? 'none' : nextDueTime;
     const priority = draft.priority || 'normal';
     if (priority !== (row.priority ?? 'normal')) patch.priority = priority;
     const project = String(draft.project ?? '').trim();
@@ -608,6 +696,11 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
           className: 'wt-input', style: inputStyle, type: 'date', value: draft.due,
           'aria-label': t('dueLabel'),
           onChange: (event) => setDraft((prev) => ({ ...prev, due: event.target.value })),
+        })),
+        field('tm', t('dueTimeLabel'), React.createElement('input', {
+          className: 'wt-input', style: inputStyle, type: 'time', value: draft.dueTime, disabled: !draft.due,
+          'aria-label': t('dueTimeLabel'),
+          onChange: (event) => setDraft((prev) => ({ ...prev, dueTime: event.target.value })),
         })),
         field('prio', t('priorityLabel'), React.createElement('select', {
           className: 'wt-input', style: inputStyle, value: draft.priority,

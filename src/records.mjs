@@ -202,6 +202,25 @@ export function normalizeDue(value, now = Date.now()) {
  * @param {number} now
  * @returns {string}
  */
+/**
+ * 截止时间（可选，只有配了截止日期才有意义）：接受 "14:30" / "9:05" / "1430" / "14"。
+ * 空值（undefined/null/''/none）返回 null；写坏了抛错，别悄悄丢掉用户填的时间。
+ * @param {unknown} value
+ * @returns {string|null} HH:MM
+ */
+export function normalizeDueTime(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string') throw new WorkTodoError('bad-due-time', '截止时间必须是文本');
+  const raw = value.trim().toLowerCase();
+  if (!raw || raw === 'none' || raw === 'null' || raw === 'clear') return null;
+  const m = /^(\d{1,2})(?::?(\d{2}))?$/.exec(raw);
+  if (!m) throw new WorkTodoError('bad-due-time', '截止时间要写成 HH:MM（例如 14:30）');
+  const hour = Number(m[1]);
+  const minute = m[2] === undefined ? 0 : Number(m[2]);
+  if (hour > 23 || minute > 59) throw new WorkTodoError('bad-due-time', '截止时间超出范围（00:00–23:59）');
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
 export function newId(now = Date.now(), rand = Math.random) {
   const t = Math.floor(now).toString(36);
   const r = Math.floor(rand() * 36 ** 4).toString(36).padStart(4, '0');
@@ -220,13 +239,16 @@ export function newId(now = Date.now(), rand = Math.random) {
 export function createRecord(input = {}, { now = Date.now(), source = 'human', id } = {}) {
   if (!SOURCES.includes(source)) throw new WorkTodoError('bad-source', `来源只能是 ${SOURCES.join(' / ')}`);
   const status = normalizeStatus(input.status) ?? 'pending';
+  const due = normalizeDue(input.due, now);
   const record = {
     id: id ?? newId(now),
     title: normalizeTitle(input.title),
     notes: normalizeNotes(input.notes),
     status,
     priority: normalizePriority(input.priority) ?? 'normal',
-    due: normalizeDue(input.due, now),
+    due,
+    // 没有截止日期就没有截止时间（避免出现「有时间没日期」的怪状态）
+    dueTime: due ? normalizeDueTime(input.dueTime) : null,
     project: normalizeProject(input.project),
     order: null,
     source,
@@ -254,7 +276,16 @@ export function patchRecord(record, patch = {}, now = Date.now()) {
   if (take('notes')) { next.notes = normalizeNotes(patch.notes); touched = true; }
   if (take('project')) { next.project = normalizeProject(patch.project); touched = true; }
   if (take('priority')) { next.priority = normalizePriority(patch.priority) ?? next.priority; touched = true; }
-  if (take('due')) { next.due = normalizeDue(patch.due, now); touched = true; }
+  if (take('due')) {
+    next.due = normalizeDue(patch.due, now);
+    if (!next.due) next.dueTime = null; // 清掉日期时时间一并清掉
+    touched = true;
+  }
+  if (take('dueTime')) {
+    // 只给时间不给日期是无效的：没有日期就存 null
+    next.dueTime = next.due ? normalizeDueTime(patch.dueTime) : null;
+    touched = true;
+  }
 
   const status = normalizeStatus(patch.status);
   if (status && status !== next.status) {
@@ -330,6 +361,11 @@ export function sortForView(records, mode = 'priority') {
     const pb = PRIORITY_WEIGHT[b.priority] ?? 1;
     if (pa !== pb) return pa - pb;
     if (a.due && b.due && a.due !== b.due) return a.due < b.due ? -1 : 1;
+    if (a.due === b.due) {
+      const ta = a.dueTime ?? '99:99'; // 同一天：有时间的在前，没时间的垫后
+      const tb = b.dueTime ?? '99:99';
+      if (ta !== tb) return ta < tb ? -1 : 1;
+    }
     if (a.due && !b.due) return -1;
     if (!a.due && b.due) return 1;
     return a.createdAt - b.createdAt;
@@ -506,7 +542,7 @@ export function formatLine(record, now = Date.now()) {
   else if (record.priority === 'low') bits.push('低');
   if (record.due) {
     const overdue = record.status !== 'completed' && record.due < today;
-    bits.push(`${overdue ? '已逾期 ' : '截止 '}${record.due}`);
+    bits.push(`${overdue ? '已逾期 ' : '截止 '}${record.due}${record.dueTime ? ` ${record.dueTime}` : ''}`);
   }
   if (record.project) bits.push(`#${record.project}`);
   const suffix = bits.length ? `  (${bits.join(', ')})` : '';

@@ -19,6 +19,7 @@ import {
   dayKey,
   newId,
   normalizeDue,
+  normalizeDueTime,
   normalizePriority,
   normalizeStatus,
 } from './records.mjs';
@@ -81,6 +82,10 @@ export function repairRecord(raw) {
     priority,
     // 相对日期（today/+3d）按「读到的这一刻」折算：手改文件的人想的当然是今天
     due: typeof raw.due === 'string' ? coerce(() => normalizeDue(raw.due, Date.now()), null) : null,
+    // 时间只在有日期时保留（同 createRecord/patchRecord 的约定）
+    dueTime: typeof raw.dueTime === 'string' && typeof raw.due === 'string'
+      ? coerce(() => normalizeDueTime(raw.dueTime), null)
+      : null,
     project: typeof raw.project === 'string' && raw.project.trim() ? raw.project.trim() : null,
     order,
     source,

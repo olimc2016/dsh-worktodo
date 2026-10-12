@@ -144,7 +144,7 @@ await test('能抽出列表 GET 路径与行内编辑字段', () => {
   // 断言整串会让每次调整 URL 都假红，前缀断言仍能抓住「不再拉 /list」这种真问题
   eq(clientGetPaths.length, 1, '应当只有一个列表 GET：');
   eq(clientGetPaths[0].startsWith('/list?filter=all'), true, `列表路径前缀不对：${clientGetPaths[0]}`);
-  eq(patchFields, ['due', 'notes', 'priority', 'project', 'title']);
+  eq(patchFields, ['due', 'dueTime', 'notes', 'priority', 'project', 'title']);
 });
 
 /* ------------------------------------------------------------------ *
@@ -215,8 +215,8 @@ console.log('契约：客户端发的字段必须被宿主真正消费');
 
 /** 各路由接受的字段（镜像 lib/index.js 的 handler 与 service 的输入）。 */
 const ACCEPTED = {
-  '/create': ['title', 'notes', 'priority', 'due', 'project', 'status'],
-  '/update': ['ref', 'id', 'title', 'notes', 'priority', 'due', 'project', 'status', '...patch'],
+  '/create': ['title', 'notes', 'priority', 'due', 'dueTime', 'project', 'status'],
+  '/update': ['ref', 'id', 'title', 'notes', 'priority', 'due', 'dueTime', 'project', 'status', '...patch'],
   '/status': ['ref', 'id', 'status', 'toggle'],
   '/remove': ['ref', 'id'],
   '/adopt': ['todos'],

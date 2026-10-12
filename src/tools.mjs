@@ -90,6 +90,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
     parameters: {
       title: { type: 'string', required: true, description: '待办内容，一句简短的祈使句，例如「把 v0.1.0 发到 npm」。' },
       due: { type: 'string', description: '截止日期：YYYY-MM-DD / today / tomorrow / +3d。省略表示没有截止日期。' },
+      dueTime: { type: 'string', description: '截止时间 HH:MM（可选，只有给了 due 才有意义；例如 14:30）。' },
       priority: { type: 'string', enum: ['high', 'normal', 'low'], description: '优先级，默认 normal。真正卡住别人的事才给 high。' },
       project: { type: 'string', description: '项目或领域标签，例如 dsh-worktodo。省略表示不归类。' },
       notes: { type: 'string', description: '补充说明：背景、链接、验收标准。默认空。' },
@@ -103,6 +104,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
           id: { type: 'string', required: true },
           title: { type: 'string', required: true },
           due: { type: 'string' },
+          dueTime: { type: 'string' },
           priority: { type: 'string', required: true },
           project: { type: 'string' },
           status: { type: 'string', required: true },
@@ -111,7 +113,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
       },
       render: (_args, value) => [{
         type: 'text',
-        text: `已记入工作待办：${value.title}（${value.id}${value.due ? `，截止 ${value.due}` : ''}）`
+        text: `已记入工作待办：${value.title}（${value.id}${value.due ? `，截止 ${value.due}${value.dueTime ? ` ${value.dueTime}` : ''}` : ''}）`
           + (value.stats ? `｜当前未完成 ${value.stats.open} 条，逾期 ${value.stats.overdue} 条` : ''),
       }],
     },
@@ -120,6 +122,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
         id: result.todo.id,
         title: result.todo.title,
         due: result.todo.due ?? undefined,
+        dueTime: result.todo.dueTime ?? undefined,
         priority: result.todo.priority,
         project: result.todo.project ?? undefined,
         status: result.todo.status,
@@ -145,6 +148,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
           properties: {
             title: { type: 'string', required: true, description: '待办内容（一句简短的祈使句）。' },
             due: { type: 'string', description: '截止日期：YYYY-MM-DD / today / tomorrow / +3d。' },
+            dueTime: { type: 'string', description: '截止时间 HH:MM（可选）。' },
             priority: { type: 'string', enum: ['high', 'normal', 'low'], description: '默认 normal。' },
             project: { type: 'string', description: '项目或领域标签。' },
             notes: { type: 'string', description: '背景、链接、验收标准。' },
@@ -169,6 +173,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
                 id: { type: 'string', required: true },
                 title: { type: 'string', required: true },
                 due: { type: 'string' },
+                dueTime: { type: 'string' },
                 priority: { type: 'string', required: true },
                 project: { type: 'string' },
                 status: { type: 'string', required: true },
@@ -209,6 +214,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
             id: result.todo.id,
             title: result.todo.title,
             due: result.todo.due ?? undefined,
+            dueTime: result.todo.dueTime ?? undefined,
             priority: result.todo.priority,
             project: result.todo.project ?? undefined,
             status: result.todo.status,
@@ -261,7 +267,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
         lines: result.todos.length
           ? result.todos.map((t) => {
             const box = t.status === 'completed' ? '[x]' : t.status === 'in_progress' ? '[~]' : '[ ]';
-            const bits = [t.priority === 'high' ? '高' : t.priority === 'low' ? '低' : null, t.due ? `${t.due}${t.due < result.today && t.status !== 'completed' ? '(逾期)' : ''}` : null, t.project ? `#${t.project}` : null].filter(Boolean);
+            const bits = [t.priority === 'high' ? '高' : t.priority === 'low' ? '低' : null, t.due ? `${t.due}${t.dueTime ? ` ${t.dueTime}` : ''}${t.due < result.today && t.status !== 'completed' ? '(逾期)' : ''}` : null, t.project ? `#${t.project}` : null].filter(Boolean);
             return `${box} ${t.id}  ${t.title}${bits.length ? `  (${bits.join(', ')})` : ''}`;
           }).join('\n')
           : '（没有符合条件的待办）',
@@ -282,7 +288,8 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
     parameters: {
       ref: { type: 'string', required: true, description: '待办的 id（推荐）或标题。' },
       title: { type: 'string', description: '新标题。' },
-      due: { type: 'string', description: '新截止日期；传 none 清空。' },
+      due: { type: 'string', description: '新截止日期；传 none 清空（清空日期会一并清掉时间）。' },
+      dueTime: { type: 'string', description: '新截止时间 HH:MM；传 none 清空。' },
       priority: { type: 'string', enum: ['high', 'normal', 'low'] },
       project: { type: 'string', description: '新项目标签；传 none 清空。' },
       notes: { type: 'string', description: '新备注。' },
