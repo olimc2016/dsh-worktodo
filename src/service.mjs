@@ -16,6 +16,8 @@ import {
   adoptSessionTodos,
   createRecord,
   dayKey,
+  SORT_MODES,
+  applyManualOrder,
   filterRecords,
   groupByProject,
   groupRecords,
@@ -80,7 +82,9 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
    * @param {string} [options.query] 标题/备注里的关键词
    * @returns {Promise<object>} 显式状态
    */
-  async function list({ filter = 'open', project, query } = {}) {
+  async function list({ filter = 'open', project, query, sort } = {}) {
+    // 默认 manual：拖过的顺序优先，没拖过的自动退回优先级/截止/创建时间（所以初看依然合理）
+    const mode = SORT_MODES.includes(sort) ? sort : 'manual';
     const now = clock();
     let records;
     try {
@@ -115,12 +119,15 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
 
     return {
       ok: true,
-      todos: picked.value,
-      groups: groupRecords(picked.value, now),
+      // filterRecords 内部按优先级排过序；这里按当前模式再排一次，
+      // 否则「平铺列表」会和「分组」用两套顺序（sort=created/manual 时最明显）
+      todos: sortForView(picked.value, mode),
+      groups: groupRecords(picked.value, now, mode),
       // 「按项目」视图：每个项目一个桶，附 total/open/overdue
-      projectGroups: groupByProject(forProjects.value, now),
+      projectGroups: groupByProject(forProjects.value, now, mode),
       // 统计基于**全部**记录，而不是当前筛选结果：面板顶部的「逾期 3 条」不该因为
       // 用户切到「已完成」标签就变成 0
+      sort: mode,
       stats: statsOf(records, now),
       today: dayKey(now),
       store: { kind: store.kind, location: store.location },
@@ -146,6 +153,39 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
     }
     emit({ operation: 'create', todo: built.value });
     return { ok: true, todo: built.value };
+  }
+
+  /**
+   * 手动排序：ids 是「新的完整顺序」，ids[i] 的记录得到 order=i。
+   * 只写真正变了的记录；不在 ids 里的记录保持原样（order 仍为 null，继续按自动规则排）。
+   * @param {{ids?: string[]}} [input]
+   */
+  async function reorder({ ids } = {}) {
+    const order = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && id.trim()) : [];
+    if (!order.length) return { ok: false, reason: 'empty-order', message: '需要给出待办 id 的顺序数组' };
+    let records;
+    try {
+      records = await all();
+    } catch (error) {
+      return { ok: false, reason: 'store-unreadable', message: `读取待办失败：${error?.message ?? error}` };
+    }
+    const known = new Set(records.map((record) => record.id));
+    const unknownIds = order.filter((id) => !known.has(id));
+    if (unknownIds.length) return { ok: false, reason: 'not-found', message: `这些 id 不存在：${unknownIds.join('、')}` };
+
+    const next = applyManualOrder(records, order);
+    let updated = 0;
+    for (let index = 0; index < next.length; index += 1) {
+      if (next[index] === records[index]) continue; // 顺序没变的记录不写盘
+      try {
+        await store.put(next[index]);
+        updated += 1;
+      } catch (error) {
+        return { ok: false, reason: 'store-write-failed', message: `保存顺序失败：${error?.message ?? error}` };
+      }
+    }
+    emit({ operation: 'reorder', updated });
+    return { ok: true, updated, order };
   }
 
   /**
@@ -257,6 +297,7 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
 
   return {
     list,
+    reorder,
     create,
     update,
     setStatus,

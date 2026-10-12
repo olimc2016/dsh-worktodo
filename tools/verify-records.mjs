@@ -12,6 +12,7 @@ import {
   adoptSessionTodos,
   createRecord,
   groupByProject,
+  applyManualOrder,
   dayKey,
   dayStart,
   filterRecords,
@@ -336,6 +337,34 @@ test('groupByProject：桶内统计 total/open/overdue，且已完成不计入 o
 
 test('groupByProject：空输入得到空数组，不凭空造桶', () => {
   eq(groupByProject([], Date.now()), []);
+});
+
+// ---- 排序模式与手动顺序 ----
+
+test('sortForView 支持三种模式：priority / created / manual', () => {
+  const now = Date.parse('2026-10-12T10:00:00+08:00');
+  const a = createRecord({ title: '旧-低', priority: 'low' }, { now, id: 'a' });
+  const b = createRecord({ title: '新-高', priority: 'high' }, { now: now + 5000, id: 'b' });
+  const c = createRecord({ title: '中-普通', priority: 'normal' }, { now: now + 2000, id: 'c' });
+  const records = [a, b, c];
+  eq(sortForView(records, 'priority').map((r) => r.title), ['新-高', '中-普通', '旧-低']);
+  eq(sortForView(records, 'created').map((r) => r.title), ['新-高', '中-普通', '旧-低']);
+  // 默认仍是 priority（老调用点不受影响）
+  eq(sortForView(records).map((r) => r.title), ['新-高', '中-普通', '旧-低']);
+});
+
+test('applyManualOrder 与 manual 排序：拖过的在前且按 order 升序，没拖过的按自动规则垫后', () => {
+  const now = Date.parse('2026-10-12T10:00:00+08:00');
+  const a = createRecord({ title: 'A', priority: 'low' }, { now, id: 'a' });
+  const b = createRecord({ title: 'B', priority: 'high' }, { now: now + 1000, id: 'b' });
+  const c = createRecord({ title: 'C', priority: 'normal' }, { now: now + 2000, id: 'c' });
+  const placed = applyManualOrder([a, b, c], ['c', 'a']); // C 第一、A 第二；B 没拖过
+  const order = sortForView(placed, 'manual').map((r) => r.title);
+  eq(order[0], 'C');
+  eq(order[1], 'A');
+  eq(order[2], 'B', '没拖过的按自动规则垫后：');
+  // 纯函数：不改入参
+  eq(a.order, null, 'applyManualOrder 不应修改入参：');
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);

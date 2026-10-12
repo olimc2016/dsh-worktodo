@@ -134,11 +134,14 @@ console.log('静态提取');
 
 await test('能从客户端源码里抽出全部写请求', () => {
   const paths = clientPosts.map((p) => p.path).sort();
-  eq(paths, ['/adopt', '/create', '/remove', '/status', '/update']);
+  eq(paths, ['/adopt', '/create', '/remove', '/reorder', '/status', '/update']);
 });
 
 await test('能抽出列表 GET 路径与行内编辑字段', () => {
-  eq(clientGetPaths, ['/list?filter=all']);
+  // 客户端现在会带上排序参数（sort=manual|priority|created），所以断言前缀而不是整串——
+  // 断言整串会让每次调整 URL 都假红，前缀断言仍能抓住「不再拉 /list」这种真问题
+  eq(clientGetPaths.length, 1, '应当只有一个列表 GET：');
+  eq(clientGetPaths[0].startsWith('/list?filter=all'), true, `列表路径前缀不对：${clientGetPaths[0]}`);
   eq(patchFields, ['due', 'notes', 'priority', 'project', 'title']);
 });
 

@@ -242,6 +242,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
       filter: { type: 'string', enum: ['open', 'today', 'overdue', 'week', 'doing', 'completed', 'all'], description: '默认 open（未完成）。' },
       project: { type: 'string', description: '只看某个项目标签。' },
       query: { type: 'string', description: '按标题或备注里的关键词过滤。' },
+      sort: { type: 'string', enum: ['manual', 'priority', 'created'], description: '排序：manual=尊重用户拖动过的顺序（默认，用户看到的顺序）；priority=高优先级在前；created=最近添加的在前。' },
     },
     output: {
       schema: {

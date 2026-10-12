@@ -67,6 +67,8 @@ export function repairRecord(raw) {
   const source = SOURCES.includes(raw.source) ? raw.source : 'human';
   const createdAt = Number.isFinite(raw.createdAt) ? Number(raw.createdAt) : Date.now();
   const updatedAt = Number.isFinite(raw.updatedAt) ? Number(raw.updatedAt) : createdAt;
+  // 手动排序位置：只有拖过的记录才有；null 表示「按优先级/截止/创建时间自动排」
+  const order = Number.isFinite(raw.order) ? Number(raw.order) : null;
   const completedAt = status === 'completed'
     ? (Number.isFinite(raw.completedAt) ? Number(raw.completedAt) : updatedAt)
     : null;
@@ -80,6 +82,7 @@ export function repairRecord(raw) {
     // 相对日期（today/+3d）按「读到的这一刻」折算：手改文件的人想的当然是今天
     due: typeof raw.due === 'string' ? coerce(() => normalizeDue(raw.due, Date.now()), null) : null,
     project: typeof raw.project === 'string' && raw.project.trim() ? raw.project.trim() : null,
+    order,
     source,
     createdAt,
     updatedAt,

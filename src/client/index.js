@@ -66,6 +66,11 @@ const zh = {
   'viewDue': '按截止',
   'viewProject': '按项目',
   'noProject': '未归类',
+  'sortLabel': '排序',
+  'sortManual': '手动',
+  'sortPriority': '优先级',
+  'sortCreated': '创建时间',
+  'dragHint': '拖动调整顺序（会自动切到手动排序）',
   'expand': '展开',
   'collapse': '收起',
   'empty': '还没有待办',
@@ -128,6 +133,11 @@ const en = {
   'viewDue': 'By due',
   'viewProject': 'By project',
   'noProject': 'Uncategorized',
+  'sortLabel': 'Sort',
+  'sortManual': 'Manual',
+  'sortPriority': 'Priority',
+  'sortCreated': 'Created',
+  'dragHint': 'Drag to reorder (switches to manual sort)',
   'expand': 'Expand',
   'collapse': 'Collapse',
   'empty': 'No to-dos yet',
@@ -244,6 +254,8 @@ const STYLE_TEXT = `
 }
 .wt-seg-btn.is-on { background: ${C.hover}; color: ${C.label}; font-weight: 600; }
 .wt-seg-btn:hover { color: ${C.label}; }
+.wt-row[draggable="true"] { cursor: grab; }
+.wt-row[draggable="true"]:active { cursor: grabbing; }
 .wt-group-head {
   display: flex; align-items: center; gap: 7px; padding: 3px 8px; border-radius: 8px;
   cursor: pointer; user-select: none; color: ${C.label2};
@@ -378,8 +390,10 @@ async function postJson(path, body) {
  * （stale-while-revalidate）。侧栏来回点的时候不该每次都转圈。
  */
 let lastList = null;
+// 排序模式跨「切走再切回」保持；manual = 尊重拖动顺序
+let lastSort = 'manual';
 
-function useList() {
+function useList(sort) {
   const [state, setState] = React.useState(() => (lastList
     ? { status: 'ready', data: lastList, error: null }
     : { status: 'loading', data: null, error: null }));
@@ -392,7 +406,7 @@ function useList() {
      * 用 open 时 groups.completed 恒为空，「已完成」那一组就永远出不来（也就没法折叠/展开）。
      * 统计 stats 不受 filter 影响（宿主按全量算），所以顶部数字仍然是全局口径。
      */
-    fetch(`${ROUTE_LIST}?filter=all`, { cache: 'no-store', credentials: 'same-origin' })
+    fetch(`${ROUTE_LIST}?filter=all&sort=${encodeURIComponent(sort || 'manual')}`, { cache: 'no-store', credentials: 'same-origin' })
       .then(async (response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const body = await response.json().catch(() => null);
@@ -411,7 +425,7 @@ function useList() {
         }
       });
     return () => { alive = false; };
-  }, [tick]);
+  }, [tick, sort]);
 
   const refresh = React.useCallback(() => setTick((n) => n + 1), []);
   return { ...state, refresh };
@@ -493,7 +507,7 @@ function QuickAdd({ t, onAdd, busy }) {
  * 单行：查看 / 行内编辑 / 二次确认删除
  * 状态都留在这一行内部，所以在别的行上敲字、或者列表刷新，都不会把正在编辑的内容冲掉。
  * ------------------------------------------------------------------ */
-function TodoRow({ todo, today, t, onToggle, onRemove, onSave }) {
+function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(null);
   const [notesOpen, setNotesOpen] = React.useState(false);
@@ -660,7 +674,25 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave }) {
     }, row.source === 'agent' ? t('sourceAgent') : t('sourceSession')));
   }
 
-  return React.createElement('div', { className: 'wt-row' }, [
+  // 拖动属性：只有父级给了 drag 才可拖（未启用时行为与以前完全一致）
+  const dragAttrs = drag
+    ? {
+      draggable: true,
+      onDragStart: (event) => {
+        try {
+          event.dataTransfer?.setData('text/plain', row.id ?? '');
+          if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+        } catch { /* 少数环境不允许写 dataTransfer，忽略即可 */ }
+        drag.onStart?.(row.id);
+      },
+      onDragOver: (event) => { event.preventDefault(); drag.onOver?.(row.id); },
+      onDrop: (event) => { event.preventDefault(); drag.onDrop?.(row.id); },
+      onDragEnd: () => drag.onEnd?.(),
+      title: drag.hint,
+      style: drag.dragging ? { opacity: 0.45 } : undefined,
+    }
+    : {};
+  return React.createElement('div', { className: 'wt-row', ...dragAttrs }, [
     React.createElement('button', {
       key: 'check',
       type: 'button',
@@ -706,7 +738,7 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave }) {
 /* ------------------------------------------------------------------ *
  * 分组：空组整块不渲染，避免五个空标题堆在面板上
  * ------------------------------------------------------------------ */
-function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTodo, onRemove, onSave }) {
+function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTodo, onRemove, onSave, drag }) {
   const list = asArray(items);
   if (!list.length) return null;
   return React.createElement('div', { style: { marginTop: 6 } }, [
@@ -732,6 +764,14 @@ function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTod
       onToggle: onToggleTodo,
       onRemove,
       onSave,
+        drag: drag ? {
+          dragging: drag.dragId === todo?.id,
+          hint: drag.hint,
+          onStart: drag.onStart,
+          onOver: drag.onOver,
+          onDrop: drag.onDrop,
+          onEnd: drag.onEnd,
+        } : undefined,
     }))),
   ]);
 }
@@ -795,7 +835,11 @@ const GROUPS = [
 function WorkTodoPanel(props) {
   // t 由 locale 服务通过 slot props 注入；拿不到时退回中文，至少不显示裸 key
   const t = typeof props?.t === 'function' ? props.t : (key) => zh[key] ?? key;
-  const { status, data, error, refresh } = useList();
+  // 排序：manual（默认，尊重拖动）/ priority / created；必须在 useList(sort) 之前声明
+  const [sort, setSortState] = React.useState(lastSort);
+  const setSort = React.useCallback((next) => { lastSort = next; setSortState(next); }, []);
+  const [dragId, setDragId] = React.useState(null);
+  const { status, data, error, refresh } = useList(sort);
 
   // 写操作的错误条；readError 是拉取错误（用户关掉之后，只有换成新错误才再弹）
   const [barError, setBarError] = React.useState(null);
@@ -847,6 +891,60 @@ function WorkTodoPanel(props) {
   const handleToggle = React.useCallback((ref) => runWrite(() => postJson('/status', { ref, toggle: true })), [runWrite]);
   const handleRemove = React.useCallback((ref) => runWrite(() => postJson('/remove', { ref })), [runWrite]);
   const handleSave = React.useCallback((ref, patch) => runWrite(() => postJson('/update', { ref, ...patch })), [runWrite]);
+
+  /** 把 dragId 挪到目标之前，得到新的完整顺序并落盘（manual 模式生效） */
+
+  const handleDropOn = React.useCallback((targetId) => {
+
+    const dragging = dragId;
+
+    setDragId(null);
+
+    if (!dragging || !targetId || dragging === targetId) return Promise.resolve(false);
+
+    const ids = asArray(data?.todos).map((todo) => todo?.id).filter(Boolean);
+
+    const from = ids.indexOf(dragging);
+
+    if (from === -1) return Promise.resolve(false);
+
+    ids.splice(from, 1);
+
+    const to = ids.indexOf(targetId);
+
+    ids.splice(to === -1 ? ids.length : to, 0, dragging);
+
+    return runWrite(() => postJson('/reorder', { ids })).then((result) => result.ok);
+
+  }, [dragId, data, runWrite]);
+
+  
+
+  const dragHandlers = React.useMemo(() => ({
+
+    dragId,
+
+    hint: t('dragHint'),
+
+    onStart: (id) => {
+
+      setDragId(id);
+
+      // 拖了就说明想自己定顺序：自动切到手动，否则松手后看起来「没生效」
+
+      if (sort !== 'manual') setSort('manual');
+
+    },
+
+    onOver: () => {},
+
+    onDrop: (id) => handleDropOn(id),
+
+    onEnd: () => setDragId(null),
+
+  }), [dragId, sort, t, setSort, handleDropOn]);
+
+  
 
   const handleAdopt = React.useCallback((sessionTodos) => runWrite(() => postJson('/adopt', { todos: sessionTodos }))
     .then((result) => {
@@ -936,6 +1034,15 @@ function WorkTodoPanel(props) {
         React.createElement('span', { key: 'l', style: { color: C.label3 } }, chip.label),
         React.createElement('b', { key: 'v', style: { fontWeight: 650 } }, String(chip.value)),
       ])),
+      React.createElement('span', { key: 'sort', className: 'wt-seg', title: t('sortLabel') }, [
+        ...['manual', 'priority', 'created'].map((mode) => React.createElement('button', {
+          key: mode,
+          type: 'button',
+          className: `wt-seg-btn${sort === mode ? ' is-on' : ''}`,
+          title: mode === 'manual' ? t('dragHint') : `${t('sortLabel')}：${t(`sort${mode === 'manual' ? 'Manual' : mode === 'priority' ? 'Priority' : 'Created'}`)}`,
+          onClick: () => setSort(mode),
+        }, t(`sort${mode === 'manual' ? 'Manual' : mode === 'priority' ? 'Priority' : 'Created'}`))),
+      ]),
       React.createElement('span', { key: 'view', className: 'wt-seg' }, [
         React.createElement('button', {
           key: 'due',
@@ -1036,6 +1143,7 @@ function WorkTodoPanel(props) {
         onToggleTodo: handleToggle,
         onRemove: handleRemove,
         onSave: handleSave,
+        drag: dragHandlers,
       })))
       : React.createElement('div', {
         key: 'empty',

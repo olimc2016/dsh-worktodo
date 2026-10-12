@@ -147,13 +147,14 @@ await test('apply 完成且不抛（假 ctx 里没有 storage/tools 也不该崩
   eq(logs.some((line) => line.startsWith('info') && line.includes('待办数据')), true, '应有存储位置日志：');
 });
 
-await test('注册出 7 条路由', () => {
+await test('注册出 8 条路由', () => {
   eq([...routes.keys()].sort(), [
     '/worktodo/adopt',
     '/worktodo/create',
     '/worktodo/health',
     '/worktodo/list',
     '/worktodo/remove',
+    '/worktodo/reorder',
     '/worktodo/status',
     '/worktodo/update',
   ]);
@@ -525,6 +526,38 @@ await test('注册了给模型的用法指引（systemPrompt.section，order 在
   for (const needle of ['worktodo_add', 'worktodo_list', 'todo_write']) {
     eq(section.text.includes(needle), true, `指引里应当提到 ${needle}：`);
   }
+});
+
+// ---- 排序与手动拖动 ----
+
+await test('GET /list?sort=created 按创建时间倒序（新加的在前）', async () => {
+  await call(routes.get('/worktodo/create').handler, { method: 'POST', url: '/worktodo/create', body: { title: '排序·较旧', project: 'sortcase' } });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await call(routes.get('/worktodo/create').handler, { method: 'POST', url: '/worktodo/create', body: { title: '排序·较新', project: 'sortcase' } });
+  const response = await call(routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all&sort=created&project=sortcase' });
+  eq(response.statusCode, 200);
+  const payload = response.json()?.data;
+  eq(payload.sort, 'created');
+  eq(payload.todos.map((t) => t.title), ['排序·较新', '排序·较旧']);
+});
+
+await test('POST /reorder 落盘手动顺序，并在 manual 模式下生效', async () => {
+  const created = [];
+  for (const title of ['拖动 A', '拖动 B', '拖动 C']) {
+    const res = await call(routes.get('/worktodo/create').handler, { method: 'POST', url: '/worktodo/create', body: { title, project: 'dragcase' } });
+    created.push(res.json().data.todo.id);
+  }
+  // 反转顺序：C, B, A
+  const reversed = [...created].reverse();
+  const reorder = await call(routes.get('/worktodo/reorder').handler, { method: 'POST', url: '/worktodo/reorder', body: { ids: reversed } });
+  eq(reorder.statusCode, 200);
+  eq(reorder.json().data.updated >= 1, true, '至少应更新一条：');
+  const listed = await call(routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all&sort=manual&project=dragcase' });
+  eq(listed.json().data.todos.map((t) => t.title), ['拖动 C', '拖动 B', '拖动 A']);
+  // 坏输入：不存在的 id 必须显式失败，而不是静默改一半
+  const bad = await call(routes.get('/worktodo/reorder').handler, { method: 'POST', url: '/worktodo/reorder', body: { ids: ['不存在的-id'] } });
+  eq(bad.json().ok, false);
+  eq(bad.json().reason, 'not-found');
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);

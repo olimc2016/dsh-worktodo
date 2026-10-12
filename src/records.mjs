@@ -228,6 +228,7 @@ export function createRecord(input = {}, { now = Date.now(), source = 'human', i
     priority: normalizePriority(input.priority) ?? 'normal',
     due: normalizeDue(input.due, now),
     project: normalizeProject(input.project),
+    order: null,
     source,
     createdAt: now,
     updatedAt: now,
@@ -312,14 +313,19 @@ const PRIORITY_WEIGHT = { high: 0, normal: 1, low: 2 };
  * @param {object[]} records
  * @returns {object[]} 新数组
  */
-export function sortForView(records) {
+export const SORT_MODES = ['manual', 'priority', 'created'];
+
+/**
+ * 视图排序。三种模式共用同一套「已完成永远沉底」的规则：
+ *   - `priority`（默认）：优先级 → 截止日期 → 创建时间（早的在前）
+ *   - `created`：创建时间**倒序**（刚加的在前）
+ *   - `manual`：拖过顺序的（`order` 是有限数）按 order 升序在前；没拖过的按 priority 规则排在后面
+ * @param {object[]} records
+ * @param {'manual'|'priority'|'created'} [mode]
+ */
+export function sortForView(records, mode = 'priority') {
   const rank = (r) => (r.status === 'completed' ? 1 : 0);
-  return [...records].sort((a, b) => {
-    if (rank(a) !== rank(b)) return rank(a) - rank(b);
-    if (a.status === 'completed' && b.status === 'completed') {
-      // 已完成按完成时间倒序：最近做完的先看到
-      return (b.completedAt ?? b.updatedAt) - (a.completedAt ?? a.updatedAt);
-    }
+  const byFallback = (a, b) => {
     const pa = PRIORITY_WEIGHT[a.priority] ?? 1;
     const pb = PRIORITY_WEIGHT[b.priority] ?? 1;
     if (pa !== pb) return pa - pb;
@@ -327,7 +333,34 @@ export function sortForView(records) {
     if (a.due && !b.due) return -1;
     if (!a.due && b.due) return 1;
     return a.createdAt - b.createdAt;
+  };
+  const manualRank = (r) => (Number.isFinite(r.order) ? 0 : 1);
+  return [...records].sort((a, b) => {
+    if (rank(a) !== rank(b)) return rank(a) - rank(b);
+    if (a.status === 'completed' && b.status === 'completed') {
+      // 已完成按完成时间倒序：最近做完的先看到
+      return (b.completedAt ?? b.updatedAt) - (a.completedAt ?? a.updatedAt);
+    }
+    if (mode === 'created') return b.createdAt - a.createdAt;
+    if (mode === 'manual') {
+      if (manualRank(a) !== manualRank(b)) return manualRank(a) - manualRank(b);
+      if (manualRank(a) === 0 && a.order !== b.order) return a.order - b.order;
+      return byFallback(a, b);
+    }
+    return byFallback(a, b);
   });
+}
+
+/**
+ * 把「新的完整顺序」落到记录上：ids[i] 的记录得到 order=i。
+ * 不在 ids 里的记录保持原样（order 为 null 的继续按自动规则排）。
+ * 纯函数：返回新数组，不改入参。
+ * @param {object[]} records
+ * @param {string[]} ids
+ */
+export function applyManualOrder(records, ids) {
+  const position = new Map(ids.map((id, index) => [id, index]));
+  return records.map((record) => (position.has(record.id) ? { ...record, order: position.get(record.id) } : record));
 }
 
 /**
@@ -337,7 +370,7 @@ export function sortForView(records) {
  * @param {number} [now]
  * @returns {{overdue: object[], today: object[], week: object[], later: object[], completed: object[]}}
  */
-export function groupRecords(records, now = Date.now()) {
+export function groupRecords(records, now = Date.now(), mode = 'priority') {
   const today = dayKey(now);
   const weekEnd = dayKey(dayStart(weekStartKey(now)) + 6 * DAY_MS);
   const groups = { overdue: [], today: [], week: [], later: [], completed: [] };
@@ -350,7 +383,7 @@ export function groupRecords(records, now = Date.now()) {
     if (due <= weekEnd) { groups.week.push(record); continue; }
     groups.later.push(record);
   }
-  for (const key of Object.keys(groups)) groups[key] = sortForView(groups[key]);
+  for (const key of Object.keys(groups)) groups[key] = sortForView(groups[key], mode);
   return groups;
 }
 
@@ -373,7 +406,7 @@ export function groupRecords(records, now = Date.now()) {
  * @param {number} [now]
  * @returns {{project: string|null, key: string, todos: object[], total: number, open: number, overdue: number}[]}
  */
-export function groupByProject(records, now = Date.now()) {
+export function groupByProject(records, now = Date.now(), mode = 'priority') {
   const today = dayKey(now);
   const buckets = new Map();
   for (const record of records) {
@@ -389,7 +422,7 @@ export function groupByProject(records, now = Date.now()) {
     }
   }
   const list = [...buckets.values()];
-  for (const bucket of list) bucket.todos = sortForView(bucket.todos);
+  for (const bucket of list) bucket.todos = sortForView(bucket.todos, mode);
   const earliestOpenDue = (bucket) =>
     bucket.todos.filter((t) => t.status !== 'completed' && t.due).map((t) => t.due).sort()[0] ?? '9999-99-99';
   return list.sort((a, b) => {
