@@ -88,7 +88,7 @@ await test('记录 schema 的 parse 与官方读取路径一致', async () => {
   const stored = { id: 'x', title: '手改过的记录', status: 'done' };
   const parsed = todoRecordSchema.parse(stored);
   eq(parsed.status, 'completed', '同义词要被归一化');
-  eq(parsed.priority, 'normal', '缺字段要补默认值');
+  eq(parsed.priority, 'none', '缺字段要补默认值（无优先级）：');
   eq(parsed.due, null);
 });
 

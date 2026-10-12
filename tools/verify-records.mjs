@@ -116,11 +116,14 @@ test('状态接受同义词并落回三态', () => {
   throwsWith(() => normalizeStatus('finished-ish'), 'bad-status');
 });
 
-test('优先级接受高中低与 p0/p1/p2', () => {
+test('优先级接受高中低无与 p0/p1/p2（无＝不设优先级，也是新建默认）', () => {
   eq(normalizePriority('高'), 'high');
   eq(normalizePriority('P0'), 'high');
   eq(normalizePriority('medium'), 'normal');
-  eq(PRIORITIES.length, 3);
+  eq(PRIORITIES.length, 4); // 高/中/低/无
+  eq(normalizePriority('无'), 'none');
+  eq(normalizePriority('none'), 'none');
+  eq(normalizePriority('不设'), 'none');
   throwsWith(() => normalizePriority('urgent-ish'), 'bad-priority');
 });
 
@@ -139,7 +142,7 @@ test('相对日期按注入的基准算', () => {
 test('创建时完成态会写入 completedAt', () => {
   const open = createRecord({ title: 'a' }, { now: NOW });
   eq(open.completedAt, null);
-  eq(open.priority, 'normal');
+  eq(open.priority, 'none', '新建默认「无」：');
   eq(open.status, 'pending');
   const done = createRecord({ title: 'b', status: 'completed' }, { now: NOW });
   eq(done.completedAt, NOW);
@@ -255,7 +258,7 @@ test('坏记录被跳过而不是让整个列表读不出来', () => {
   });
   eq(doc.todos.map((t) => t.id), ['ok', 'partial']);
   eq(doc.todos[1].status, 'pending', '未知状态回退到 pending ');
-  eq(doc.todos[1].priority, 'normal');
+  eq(doc.todos[1].priority, 'none', '缺字段补「无」：');
   eq(doc.todos[1].due, null);
 });
 

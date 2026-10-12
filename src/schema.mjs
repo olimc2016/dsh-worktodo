@@ -64,7 +64,7 @@ export function repairRecord(raw) {
   const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : newId();
   // 状态/优先级/日期都过一遍同义词归一：手改成 done / 高 / 2026/10/20 也要能懂
   const status = STATUSES.includes(raw.status) ? raw.status : coerce(() => normalizeStatus(raw.status), 'pending');
-  const priority = PRIORITIES.includes(raw.priority) ? raw.priority : coerce(() => normalizePriority(raw.priority), 'normal');
+  const priority = PRIORITIES.includes(raw.priority) ? raw.priority : coerce(() => normalizePriority(raw.priority), 'none');
   const source = SOURCES.includes(raw.source) ? raw.source : 'human';
   const createdAt = Number.isFinite(raw.createdAt) ? Number(raw.createdAt) : Date.now();
   const updatedAt = Number.isFinite(raw.updatedAt) ? Number(raw.updatedAt) : createdAt;

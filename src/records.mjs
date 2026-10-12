@@ -16,7 +16,7 @@
 /** 状态：与官方 todo_write 同名同义，便于互相提升。 */
 export const STATUSES = ['pending', 'in_progress', 'completed'];
 /** 优先级：只留三档，避免用户在选择上犹豫。 */
-export const PRIORITIES = ['high', 'normal', 'low'];
+export const PRIORITIES = ['high', 'normal', 'low', 'none'];
 /** 来源：人加的 / agent 加的 / 从会话 todos 提升的。 */
 export const SOURCES = ['human', 'agent', 'session'];
 
@@ -147,6 +147,7 @@ export function normalizePriority(value) {
     p0: 'high', urgent: 'high', high: 'high', 高: 'high', 紧急: 'high', 重要: 'high',
     p1: 'normal', normal: 'normal', medium: 'normal', mid: 'normal', 中: 'normal', 普通: 'normal',
     p2: 'low', low: 'low', 低: 'low', 次要: 'low',
+    none: 'none', no: 'none', 无: 'none', 不设: 'none', 无优先级: 'none',
   };
   const resolved = alias[raw];
   if (!resolved) throw new WorkTodoError('bad-priority', `优先级只能是 ${PRIORITIES.join(' / ')}，收到 ${JSON.stringify(value)}`);
@@ -245,7 +246,7 @@ export function createRecord(input = {}, { now = Date.now(), source = 'human', i
     title: normalizeTitle(input.title),
     notes: normalizeNotes(input.notes),
     status,
-    priority: normalizePriority(input.priority) ?? 'normal',
+    priority: normalizePriority(input.priority) ?? 'none',
     due,
     // 没有截止日期就没有截止时间（避免出现「有时间没日期」的怪状态）
     dueTime: due ? normalizeDueTime(input.dueTime) : null,
@@ -337,7 +338,8 @@ export function resolveRef(records, ref) {
  * ------------------------------------------------------------------ */
 
 /** 优先级权重，用于排序（高的在前）。 */
-const PRIORITY_WEIGHT = { high: 0, normal: 1, low: 2 };
+// 「无」排在最后（未定优先级的不该挡在已定优先级的前面），但仍排在「已完成」之前
+const PRIORITY_WEIGHT = { high: 0, normal: 1, low: 2, none: 3 };
 
 /**
  * 视图排序：未完成在前；同组内 优先级 → 截止日期（无日期排最后）→ 创建时间。
@@ -525,7 +527,7 @@ export function filterRecords(records, filter = 'open', now = Date.now()) {
  * ------------------------------------------------------------------ */
 
 /** 优先级在文本里的记号：让模型一眼看出轻重，且不占多少 token。 */
-const PRIORITY_MARK = { high: '!', normal: '', low: '·' };
+const PRIORITY_MARK = { high: '!', normal: '', low: '·', none: '' };
 
 /**
  * 把一条记录渲染成单行文本，例如：
@@ -539,6 +541,7 @@ export function formatLine(record, now = Date.now()) {
   const box = record.status === 'completed' ? '[x]' : record.status === 'in_progress' ? '[~]' : '[ ]';
   const bits = [];
   if (record.priority === 'high') bits.push('高');
+  else if (record.priority === 'normal') bits.push('中');
   else if (record.priority === 'low') bits.push('低');
   if (record.due) {
     const overdue = record.status !== 'completed' && record.due < today;
