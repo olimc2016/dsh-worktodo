@@ -620,7 +620,12 @@ function QuickAdd({ t, onAdd, busy }) {
         value: title,
         placeholder: t('addPlaceholder'),
         'aria-label': t('addPlaceholder'),
-        onChange: (event) => setTitle(event.target.value),
+        onChange: (event) => {
+          const next = event.target.value;
+          setTitle(next);
+          // 手动优先，但把标题清空＝重新开始：交回给自动识别
+          if (!next.trim()) { setManual(false); setParsed(null); }
+        },
         onKeyDown: (event) => { if (event.key === 'Enter') submit(); },
       }),
       React.createElement('button', {

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh-worktodo 0.2.0 · 面板实时预览（不用重启 DSH）</title>
+<style>
+  :root{
+    --l1:#1b1c1f;--l2:#55575d;--l3:#8a8d94;--bd1:#e6e7ea;--bd2:#d5d7dc;--bg1:#f6f7f9;
+    --brand:#2f6fed;--warn:#d98a00;--error:#d93b3b;--ok:#1a9e63;
+    --f:-apple-system,"SF Pro Text","PingFang SC",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:24px 26px 60px;background:#fff;color:var(--l1);font-family:var(--f);font-size:13px;line-height:1.6}
+  h1{font-size:19px;margin:0 0 4px}
+  h2{font-size:14px;margin:26px 0 8px;padding-top:14px;border-top:1px solid var(--bd1)}
+  .lead{color:var(--l2);max-width:880px}
+  .note{color:var(--l3);font-size:12px}
+  .grid{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
+  .panel{width:372px;padding:14px;border:1px solid var(--bd1);border-radius:14px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .panel-title{font-weight:700;font-size:14px;margin-bottom:10px}
+  .input{font:inherit;font-size:13px;padding:7px 10px;border:1px solid var(--bd2);border-radius:8px;background:#fff;color:inherit;flex:1 1 auto;min-width:0}
+  .btn{font:inherit;font-size:12px;padding:7px 12px;border-radius:8px;cursor:pointer;border:1px solid var(--bd2);background:#fff;color:var(--l2)}
+  .btn-primary{background:var(--brand);border-color:transparent;color:#fff;font-weight:600}
+  .row1{display:flex;align-items:center;gap:8px}
+  .row2{display:flex;align-items:center;gap:10px;margin-top:9px;font-size:11.5px;flex-wrap:wrap}
+  .chip{display:inline-flex;align-items:center;gap:5px;font:inherit;font-size:11.5px;padding:4px 7px;border-radius:8px;
+        border:1px solid var(--bd2);color:var(--l3);background:var(--bg1);cursor:pointer;position:relative}
+  .chip.has{color:var(--l1)}
+  .chip.parsed{border-color:var(--brand)}
+  .chip .dot{width:12px;height:12px;display:block}
+  .pop{position:absolute;top:100%;left:0;margin-top:4px;z-index:9;padding:6px;display:none;gap:4px;
+       background:var(--bg1);border:1px solid var(--bd2);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.12)}
+  .pop.open{display:flex}
+  .prio-high{color:var(--error)}.prio-normal{color:var(--warn)}.prio-low,.prio-none{color:var(--l3)}
+  .result{margin-top:10px;padding:8px 10px;border-radius:10px;background:var(--bg1);border:1px solid var(--bd1);font-size:11.5px;color:var(--l2)}
+  pre{margin:8px 0 0;padding:10px;background:var(--bg1);border:1px solid var(--bd1);border-radius:10px;font-size:12px;overflow:auto}
+  .badge{display:inline-block;font-size:11px;padding:1px 6px;border-radius:6px;background:color-mix(in srgb,var(--ok) 12%,transparent);color:var(--ok)}
+  .warnbox{border-color:var(--warn);background:color-mix(in srgb,var(--warn) 8%,transparent)}
+</style>
+</head>
+<body>
+
+<h1>dsh-worktodo 0.2.0 · 面板实时预览 <span class="badge">不用重启 DSH</span></h1>
+<p class="lead">
+  这个页面的 <b>界面样式与面板一致</b>、<b>解析器就是插件里那一个真实文件</b>
+  （<code>src/parse-due.mjs</code>，浏览器直接 import）。所以下面这些你可以**直接点、直接打字**来验：
+  打字实时识别、日历/时钟弹出、优先级四旗。
+</p>
+
+<h2>1 · 两行快速添加（打字即时识别）</h2>
+<div class="grid">
+  <div class="panel">
+    <div class="panel-title">工作待办</div>
+    <!-- 第一行：内容 + 添加 -->
+    <div class="row1">
+      <input class="input" id="q" value="交周报 明天下午3点" placeholder="记一件事…" aria-label="记一件事">
+      <button class="btn btn-primary" id="addBtn">添加</button>
+    </div>
+    <!-- 第二行：日期 / 时间 / 优先级 -->
+    <div class="row2">
+      <label class="chip" id="dateChip" title="选日期">
+        <svg class="dot" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.2" y="3.4" width="11.6" height="10.4" rx="2"/><path d="M2.2 6.6h11.6M5.4 2.2v2.4M10.6 2.2v2.4"/></svg>
+        <span id="dateTxt">日期 · 未设</span>
+        <input id="dateIn" type="date" aria-label="选日期" style="position:absolute;inset:0;width:100%;height:100%;opacity:0;border:0;padding:0;cursor:pointer">
+      </label>
+      <label class="chip" id="timeChip" title="选时间">
+        <svg class="dot" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.9V8l2.2 1.4"/></svg>
+        <span id="timeTxt">时间 · 未设</span>
+        <input id="timeIn" type="time" aria-label="选时间" style="position:absolute;inset:0;width:100%;height:100%;opacity:0;border:0;padding:0;cursor:pointer">
+      </label>
+      <span style="position:relative">
+        <button class="chip prio-none" id="prioBtn" type="button" aria-expanded="false">
+          <svg class="dot" viewBox="0 0 16 16"><path d="M3.6 1.6v13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none" stroke-dasharray="1.5 1.5"/><path d="M5.2 2.4h7.4L11 5.2l1.6 2.8H5.2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-dasharray="1.5 1.5"/></svg>
+          <span id="prioTxt">优先级 · 无</span>
+        </button>
+        <span class="pop" id="prioPop">
+          <button class="chip prio-none" data-p="none" type="button">无</button>
+          <button class="chip prio-high" data-p="high" type="button">高</button>
+          <button class="chip prio-normal" data-p="normal" type="button">中</button>
+          <button class="chip prio-low" data-p="low" type="button">低</button>
+        </span>
+      </span>
+    </div>
+    <div class="result" id="result">在上面的输入框里改字试试：识别结果会即时出现在这里。</div>
+  </div>
+
+  <div style="max-width:430px">
+    <p><b>在这一页可以验的</b>（都是真实行为）：</p>
+    <p>① 在输入框打字 → 第二行的日期/时间**立刻**变成识别结果，并标「· 识别」且边框变蓝；<br>
+       ② 点<b>日期胶囊</b>（图标或文字、有没有值都行）→ 弹出系统日历；<br>
+       ③ 点<b>时间胶囊</b> → 弹出系统时间；<br>
+       ④ 点<b>优先级胶囊</b> → 弹出 <code>无/高/中/低</code> 四个小旗，选一个会变色；<br>
+       ⑤ 点「添加」→ 下方结果里给出**实际会落库的内容**（标题已被摘掉日期词）。</p>
+    <p class="note">真实解析器：<code>src/parse-due.mjs</code>（与插件、与 AI 工具是同一份文件）。这里只是把 React 组件用原生 DOM 复刻了同样的结构与样式，方便不重启就能验。</p>
+  </div>
+</div>
+
+<h2>2 · 解析器试炼场（想看细节就用这个）</h2>
+<div class="grid">
+  <div style="flex:1 1 420px;max-width:560px">
+    <input class="input" id="q2" style="width:100%" value="周一例会改到周三">
+    <pre id="out">…</pre>
+  </div>
+  <div style="max-width:400px">
+    <p class="note">随便试这些：<br>
+      <code>明天下午3点</code> · <code>后天</code> · <code>周1</code> · <code>下周一上午10点</code> ·
+      <code>3天后</code> · <code>+3d</code> · <code>10月20日</code> · <code>2026-11-01</code> ·
+      <code>今晚</code> · <code>3点半</code> · <code>15:00</code> · <code>买3个苹果</code>（不该识别）</p>
+  </div>
+</div>
+
+<script type="module">
+import { parseNaturalDue } from '../../src/parse-due.mjs';
+
+const $ = (id) => document.getElementById(id);
+const todayKey = (stamp) => {
+  const d = new Date(stamp); const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+let due = ''; let dueTime = ''; let priority = 'none'; let manual = false;
+
+// 点整块胶囊都要弹出选择器：Safari 里带值的 date/time 输入光靠点击只会聚焦
+function openPicker(input) {
+  if (typeof input.showPicker === 'function') { try { input.showPicker(); return; } catch {} }
+  input.focus(); try { input.click(); } catch {}
+}
+for (const id of ['dateChip', 'timeChip']) {
+  const chip = $(id);
+  chip.addEventListener('click', (event) => {
+    event.preventDefault();
+    openPicker(id === 'dateChip' ? $('dateIn') : $('timeIn'));
+  });
+}
+const PRIO = { none: '无', high: '高', normal: '中', low: '低' };
+
+function renderChips(parsed) {
+  const today = todayKey(Date.now());
+  const dateTxt = due ? (due === today ? '今天' : due) + (parsed && parsed.due && !manual ? ' · 识别' : '') : '日期 · 未设';
+  const timeTxt = dueTime ? dueTime + (parsed && parsed.dueTime && !manual ? ' · 识别' : '') : '时间 · 未设';
+  $('dateTxt').textContent = dateTxt;
+  $('timeTxt').textContent = timeTxt;
+  $('dateChip').classList.toggle('has', Boolean(due));
+  $('dateChip').classList.toggle('parsed', Boolean(parsed && parsed.due && !manual));
+  $('timeChip').classList.toggle('has', Boolean(dueTime));
+  $('timeChip').classList.toggle('parsed', Boolean(parsed && parsed.dueTime && !manual));
+  $('prioTxt').textContent = `优先级 · ${PRIO[priority]}`;
+  $('prioBtn').className = `chip prio-${priority}`;
+  $('dateIn').value = due;
+  $('timeIn').value = dueTime;
+}
+
+function refresh(showResult) {
+  const text = $('q').value;
+  let parsed = null;
+  if (!manual) {
+    const r = parseNaturalDue(text, Date.now());
+    if (r.matched.length) { parsed = r; due = r.due || ''; dueTime = r.dueTime || ''; }
+  }
+  renderChips(parsed);
+  if (showResult) {
+    const payloadTitle = parsed ? parsed.title : text;
+    $('result').innerHTML = `<b>会落库：</b>标题「${payloadTitle || ''}」· due=${due || 'null'} · dueTime=${dueTime || 'null'} · priority=${priority}`
+      + (parsed ? `<br><span class="note">识别到的词：${parsed.matched.join(' / ')}</span>` : '');
+  }
+}
+
+let timer = null;
+$('q').addEventListener('input', () => {
+  // 手动优先，但把标题清空＝重新开始：交回给自动识别
+  if (!$('q').value.trim()) { manual = false; }
+  clearTimeout(timer);
+  timer = setTimeout(() => refresh(true), 300); // 与面板一致的 300ms 防抖
+});
+$('dateIn').addEventListener('change', (e) => { manual = true; due = e.target.value; if (!due) dueTime = ''; refresh(true); });
+$('timeIn').addEventListener('change', (e) => { manual = true; if (e.target.value && !due) due = todayKey(Date.now()); dueTime = e.target.value; refresh(true); });
+$('prioBtn').addEventListener('click', () => { $('prioPop').classList.toggle('open'); });
+document.querySelectorAll('#prioPop [data-p]').forEach((b) => b.addEventListener('click', () => {
+  priority = b.dataset.p; $('prioPop').classList.remove('open'); refresh(true);
+}));
+$('addBtn').addEventListener('click', () => { refresh(true); $('q').value = ''; manual = false; refresh(true); });
+
+// 试炼场
+const q2 = $('q2'), out = $('out');
+const run2 = () => {
+  const r = parseNaturalDue(q2.value, Date.now());
+  out.textContent = `标题  : ${JSON.stringify(r.title)}\ndue   : ${r.due}\ntime  : ${r.dueTime}\n摘出的词: ${JSON.stringify(r.matched)}`;
+};
+q2.addEventListener('input', run2);
+run2();
+refresh(false);
+</script>
+</body>
+</html>
