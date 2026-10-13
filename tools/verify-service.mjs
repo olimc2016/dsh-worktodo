@@ -244,6 +244,161 @@ await test('没有可提升的条目时明确返回空', async () => {
   eq(result.skipped, 1);
 });
 
+console.log('列表载荷形状（S3-3：只回所需，不再三份）');
+
+await test('shapes=todos 时只回一份 todos，不再带 groups/projectGroups', async () => {
+  const s = makeService();
+  await s.create({ title: 'a', project: 'p' });
+  await s.create({ title: 'b' });
+  const only = await s.list({ filter: 'all', shapes: 'todos' });
+  eq(only.ok, true);
+  eq('todos' in only, true);
+  eq('groups' in only, false, '只要 todos 时不该再带 groups（那正是 3 倍载荷的来源）：');
+  eq('projectGroups' in only, false, '也不该带 projectGroups：');
+  eq(only.shapes, ['todos']);
+  eq(only.todos.length, 2);
+  // 面板仍需的小字段必须还在（换成 shapes 不能把统计/诊断/项目清单也省掉）
+  eq(typeof only.stats.total, 'number');
+  eq(typeof only.store.kind, 'string');
+  eq(only.projects, ['p']);
+  eq(only.today, '2026-10-14');
+});
+
+await test('shapes 可取 groups / projectGroups / 组合；缺省与非法值都保持三份（旧面板合同不变）', async () => {
+  const s = makeService();
+  await s.create({ title: 'a', project: 'p' });
+  const groups = await s.list({ filter: 'all', shapes: 'groups' });
+  eq('groups' in groups, true);
+  eq('todos' in groups, false);
+  eq('projectGroups' in groups, false);
+
+  const buckets = await s.list({ filter: 'all', shapes: 'projectGroups' });
+  eq('projectGroups' in buckets, true);
+  eq('todos' in buckets, false);
+  eq('groups' in buckets, false);
+
+  const combo = await s.list({ filter: 'all', shapes: 'todos,groups' });
+  eq(combo.shapes, ['todos', 'groups']);
+  eq('projectGroups' in combo, false);
+
+  const both = await s.list({ filter: 'all' });
+  eq([['todos' in both, 'groups' in both, 'projectGroups' in both]], [[true, true, true]], '缺省必须保持旧面板读得到的三个字段：');
+  eq(both.shapes, ['todos', 'groups', 'projectGroups']);
+  eq((await s.list({ filter: 'all', shapes: 'both' })).shapes, ['todos', 'groups', 'projectGroups']);
+  // 非法值回落到三份：宁可多给，不可少给（少给会让面板出现空白区）
+  eq((await s.list({ filter: 'all', shapes: '乱写' })).shapes, ['todos', 'groups', 'projectGroups']);
+});
+
+await test('S3-3：记录多且未指定 shapes 时给出体量提示；指定 shapes 后不再提示', async () => {
+  const s = makeService();
+  await Promise.all(Array.from({ length: 2001 }, (_, i) => s.create({ title: `条目 ${i}` })));
+  const full = await s.list({ filter: 'all' });
+  eq(typeof full.payloadWarning, 'string', '超过阈值（2000 条）要给「可以只要一种形状」的提示：');
+  eq(full.payloadWarning.includes('shapes'), true, `提示要给出可执行的参数：${full.payloadWarning}`);
+  const picked = await s.list({ filter: 'all', shapes: 'todos' });
+  eq('payloadWarning' in picked, false, '显式挑了形状就不该再提示：');
+  eq(picked.todos.length, 2001);
+});
+
+console.log('拖动排序（S3-1 / S3-2 / S4-1）');
+
+/**
+ * 带计数的假存储：复刻「批量写只 patch order，且基于最新记录」的真实契约，
+ * 并在批量写落地前模拟另一窗口的并发写（S4-1 的丢失更新场景）。
+ */
+function instrumentedStore() {
+  const map = new Map();
+  const calls = { put: 0, updateOrder: 0 };
+  const store = {
+    map,
+    calls,
+    /** 批量写落地前被「另一窗口」改名的记录 id。 */
+    concurrentId: null,
+    kind: 'file',
+    location: '/tmp/verify-service.json',
+    async load() { return [...map.values()].map((record) => ({ ...record })); },
+    async put(record) { calls.put += 1; map.set(record.id, { ...record }); },
+    async remove(id) { return map.delete(id); },
+    async updateOrder(ids) {
+      calls.updateOrder += 1;
+      // 并发写先落地（真实场景：拖拽开始后、整批写之前）
+      const other = map.get(store.concurrentId);
+      if (other) map.set(store.concurrentId, { ...other, title: '并发改的', priority: 'high', updatedAt: NOW + 5000 });
+      const position = new Map(ids.map((id, index) => [id, index]));
+      let updated = 0;
+      for (const [id, record] of map) {
+        if (!position.has(id)) continue;
+        const order = position.get(id);
+        if (record.order === order) continue;
+        map.set(id, { ...record, order }); // 只 patch order，绝不整条覆盖
+        updated += 1;
+      }
+      return { updated };
+    },
+  };
+  return store;
+}
+
+await test('S3-1/S4-1：reorder 只调一次 updateOrder（不再逐条 put 整条旧记录）且保留并发改动', async () => {
+  const store = instrumentedStore();
+  const s = createWorkTodoService({ store, clock: () => NOW, logger: { warn() {}, info() {} } });
+  const a = await s.create({ title: '一' });
+  const b = await s.create({ title: '二' });
+  const c = await s.create({ title: '三' });
+  eq(store.calls.put, 3, '前三条是 create 写进去的：');
+
+  store.concurrentId = b.todo.id;
+  const result = await s.reorder({ ids: [c.todo.id, b.todo.id, a.todo.id] });
+  eq(result.ok, true);
+  eq(result.updated, 3);
+  eq(store.calls.put, 3, 'reorder 绝不能再逐条 put（改前每条都 put 一次，用的是拖拽开始时的快照）：');
+  eq(store.calls.updateOrder, 1, '整次拖拽只允许一次批量写：');
+
+  const listed = (await s.list({ filter: 'all' })).todos;
+  const two = listed.find((record) => record.id === b.todo.id);
+  eq(two.title, '并发改的', '并发改的 title 不能被排序写覆盖：');
+  eq(two.priority, 'high');
+  eq(listed.filter((record) => Number.isFinite(record.order)).length, 3, '三条都应拿到 order：');
+  eq(listed.find((record) => record.id === c.todo.id).order, 0);
+  eq(listed.find((record) => record.id === a.todo.id).order, 2);
+});
+
+await test('S3-1：空的/未知的 ids 仍然显式失败，且不会调用批量写', async () => {
+  const store = instrumentedStore();
+  const s = createWorkTodoService({ store, clock: () => NOW, logger: { warn() {}, info() {} } });
+  await s.create({ title: '一' });
+  eq((await s.reorder({})).reason, 'empty-order');
+  eq((await s.reorder({ ids: ['wt-不存在'] })).reason, 'not-found');
+  eq(store.calls.updateOrder, 0, '校验失败时不该动存储：');
+});
+
+await test('存储不支持批量写时 reorder 退回「只 patch order」的逐条写（兼容路径）', async () => {
+  const map = new Map();
+  const puts = [];
+  const legacy = {
+    kind: 'file',
+    location: '/tmp/legacy.json',
+    async load() { return [...map.values()]; },
+    async put(record) { puts.push(record); map.set(record.id, record); },
+    async remove(id) { return map.delete(id); },
+  };
+  const s = createWorkTodoService({ store: legacy, clock: () => NOW, logger: { warn() {}, info() {} } });
+  const a = await s.create({ title: '一' });
+  const b = await s.create({ title: '二' });
+  const snapshot = await legacy.load();
+  const putsBefore = puts.length;
+  const result = await s.reorder({ ids: [b.todo.id, a.todo.id] });
+  eq(result.ok, true, '没有 updateOrder 的第三方存储仍要能用：');
+  const written = puts.slice(putsBefore);
+  eq(written.length, 2, '兼容路径逐条写：');
+  for (const record of written) {
+    const before = snapshot.find((item) => item.id === record.id);
+    const changed = Object.keys(record).filter((key) => JSON.stringify(record[key]) !== JSON.stringify(before[key]));
+    eq(changed, ['order'], '兼容路径也只能改 order，不能拿旧快照整条覆盖：');
+  }
+  eq((await s.list({ filter: 'all' })).todos.every((record) => Number.isFinite(record.order)), true);
+});
+
 console.log('变更通知');
 
 await test('写操作会通知监听者（面板/日志将来接这里）', async () => {

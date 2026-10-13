@@ -12,6 +12,14 @@ import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * 所有子进程都显式用仓库根做 cwd（复审 0.2.2 F5）。
+ *
+ * `build-client.mjs` 的入口/产物是相对 cwd 的（`src/client/index.js` → `lib/client.js`），
+ * 不指定 cwd 时从仓库外调用会得到 `Could not resolve "src/client/index.js"` 的假失败。
+ */
+const repoRoot = join(here, '..');
+
 /** 顺序很重要：后面的烟测依赖前面模块的行为。 */
 const SUITES = [
   ['verify-records.mjs', '数据模型'],
@@ -36,7 +44,7 @@ let failed = false;
  * （浏览器里跑的其实是旧 bundle）在测试里是**绿的**。构建失败或产物过期必须让整体变红。
  */
 process.stdout.write(`${'='.repeat(60)}\n构建客户端 bundle（build-client.mjs）\n${'='.repeat(60)}\n`);
-const build = spawnSync(process.execPath, [join(here, 'build-client.mjs')], { stdio: 'inherit' });
+const build = spawnSync(process.execPath, [join(here, 'build-client.mjs')], { stdio: 'inherit', cwd: repoRoot });
 if (build.status !== 0) {
   failed = true;
   process.stdout.write('\n✗ 客户端 bundle 构建失败 —— 后面的测试与浏览器里跑的代码都不可信，直接判失败\n');
@@ -45,7 +53,7 @@ results.push({ label: '客户端 bundle 构建', file: 'build-client.mjs', ok: b
 
 for (const [file, label] of SUITES) {
   process.stdout.write(`\n${'='.repeat(60)}\n${label}（${file}）\n${'='.repeat(60)}\n`);
-  const run = spawnSync(process.execPath, [join(here, file)], { stdio: 'inherit' });
+  const run = spawnSync(process.execPath, [join(here, file)], { stdio: 'inherit', cwd: repoRoot });
   const ok = run.status === 0;
   if (!ok) failed = true;
   results.push({ label, file, ok, status: run.status });

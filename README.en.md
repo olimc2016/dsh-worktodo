@@ -84,6 +84,12 @@ Pin your own path in `cordis.patch.yml`:
     storePath: /Users/me/notes/worktodo.json
 ```
 
+**The legacy file is retired after a successful upgrade**: once the data has been merged into official storage,
+`$DSH_HOME/worktodo/todos.json` is renamed to `todos.json.migrated-<time>` (a full archive you can inspect or
+restore), and a `todos.json.retired` marker is left next to it. After that official storage is the single source
+of truth: if a composition has no `storageDomain`, the panel reports an explicit error instead of showing an
+empty list, and the footer spells out "official storage unavailable · legacy file retired".
+
 ## Compatibility
 
 - **DSH 0.2.x** (tested against 0.2.0-rc.2 APIs; DSH's version gate rejects plugins pinned to older lines)

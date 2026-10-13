@@ -42,6 +42,36 @@ function attempt(job) {
 }
 
 /**
+ * `/list` 允许选择只回哪几份形状（S3-3，第四轮审计）。
+ *
+ * 为什么需要：`/list` 原来一次把 `todos` + `groups` + `projectGroups` 三份同样大小的数据
+ * 塞进同一个响应（5000 条 = 4.28 MiB/次，三份各 1249 KiB）。面板只需要其中一部分时，
+ * 让调用方用 `shapes=todos`（或 `groups` / `projectGroups` / 逗号组合 / `both`）明确说，
+ * 就能把载荷降到约 1/3。默认 `both` 保持旧面板（它读 groups/projectGroups）不变。
+ */
+const LIST_SHAPES = ['todos', 'groups', 'projectGroups'];
+
+/** 没显式指定 shapes 且记录数超过这个量时，在载荷里给一句「可以只取一种形状」的提示。 */
+const LIST_PAYLOAD_WARN_ROWS = 2000;
+
+/**
+ * 解析 `shapes`：`todos|groups|projectGroups` 的逗号组合，`both`/`all`/缺省 = 三份都回。
+ * 非法值一律回落到「三份都回」——宁可多给，不可少给（少给会让面板出现空白区）。
+ * @param {string|string[]} [value]
+ * @returns {Set<string>}
+ */
+function parseShapes(value) {
+  const text = (Array.isArray(value) ? value.join(',') : String(value ?? '')).trim();
+  if (!text || text === 'both' || text === 'all') return new Set(LIST_SHAPES);
+  const picked = new Set();
+  for (const part of text.split(',').map((piece) => piece.trim()).filter(Boolean)) {
+    if (part === 'both' || part === 'all') return new Set(LIST_SHAPES);
+    if (LIST_SHAPES.includes(part)) picked.add(part);
+  }
+  return picked.size ? picked : new Set(LIST_SHAPES);
+}
+
+/**
  * 建服务。
  * @param {object} options
  * @param {object} options.store openWorkTodoStore 返回的存储句柄
@@ -90,9 +120,15 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
    * @param {string} [options.filter] all / open / today / overdue / week / doing / completed
    * @param {string} [options.project] 只看某个项目
    * @param {string} [options.query] 标题/备注里的关键词
+   * @param {string} [options.shapes] 只回所需形状（S3-3）：todos / groups / projectGroups 的任意组合，
+   *   `both`（默认）= 三份都回（保持旧面板兼容）。只要 `shapes=todos` 时响应里不再出现
+   *   groups/projectGroups —— 5000 条时这一项就把 4.28 MiB/次的轮询载荷降到约 1/3。
    * @returns {Promise<object>} 显式状态
    */
-  async function list({ filter = 'open', project, query, sort } = {}) {
+  async function list({ filter = 'open', project, query, sort, shapes } = {}) {
+    // 默认 both：老面板（另一个 agent 在改，本分支不动客户端）读的是 groups/projectGroups
+    const shapeSet = parseShapes(shapes);
+    const explicitShapes = shapes !== undefined && shapes !== null && String(shapes).trim() !== '';
     // 默认 manual：拖过的顺序优先，没拖过的自动退回优先级/截止/创建时间（所以初看依然合理）
     const mode = SORT_MODES.includes(sort) ? sort : 'manual';
     const now = clock();
@@ -116,25 +152,26 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
     });
     if (!picked.ok) return picked;
 
-    // 项目视图用的分组：**不套 project 收窄**，否则面板上只剩当前项目、没法切到别处
-    const forProjects = attempt(() => {
-      let subset = records;
-      if (query) {
-        const needle = String(query).trim().toLowerCase();
-        subset = subset.filter((r) => r.title.toLowerCase().includes(needle) || (r.notes ?? '').toLowerCase().includes(needle));
-      }
-      return filterRecords(subset, filter, now);
-    });
-    if (!forProjects.ok) return forProjects;
+    // 项目视图用的分组：**不套 project 收窄**，否则面板上只剩当前项目、没法切到别处。
+    // S3-3：只有真的要 projectGroups 时才做这次「全量再筛一遍 + 分桶」。
+    let forProjects = null;
+    if (shapeSet.has('projectGroups')) {
+      const computed = attempt(() => {
+        let subset = records;
+        if (query) {
+          const needle = String(query).trim().toLowerCase();
+          subset = subset.filter((r) => r.title.toLowerCase().includes(needle) || (r.notes ?? '').toLowerCase().includes(needle));
+        }
+        return filterRecords(subset, filter, now);
+      });
+      if (!computed.ok) return computed;
+      forProjects = computed.value;
+    }
 
-    return {
+    const payload = {
       ok: true,
-      // filterRecords 内部按优先级排过序；这里按当前模式再排一次，
-      // 否则「平铺列表」会和「分组」用两套顺序（sort=created/manual 时最明显）
-      todos: sortForView(picked.value, mode),
-      groups: groupRecords(picked.value, now, mode),
-      // 「按项目」视图：每个项目一个桶，附 total/open/overdue
-      projectGroups: groupByProject(forProjects.value, now, mode),
+      // 回显实际给出的形状，调用方/测试能一眼看出这次拿了几份
+      shapes: LIST_SHAPES.filter((shape) => shapeSet.has(shape)),
       // 统计基于**全部**记录，而不是当前筛选结果：面板顶部的「逾期 3 条」不该因为
       // 用户切到「已完成」标签就变成 0
       sort: mode,
@@ -146,6 +183,18 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
       store: describe(),
       projects: [...new Set(records.map((r) => r.project).filter(Boolean))].sort(),
     };
+    // filterRecords 内部按优先级排过序；这里按当前模式再排一次，
+    // 否则「平铺列表」会和「分组」用两套顺序（sort=created/manual 时最明显）
+    if (shapeSet.has('todos')) payload.todos = sortForView(picked.value, mode);
+    if (shapeSet.has('groups')) payload.groups = groupRecords(picked.value, now, mode);
+    // 「按项目」视图：每个项目一个桶，附 total/open/overdue
+    if (shapeSet.has('projectGroups')) payload.projectGroups = groupByProject(forProjects, now, mode);
+    // 载荷体量提示（S3-3）：没显式挑形状、记录又多时，告诉调用方可以只要所需的那一份
+    if (!explicitShapes && records.length > LIST_PAYLOAD_WARN_ROWS) {
+      payload.payloadWarning = `本次返回 ${payload.shapes.join('+')} 三份视图（${records.length} 条）；`
+        + '如需降低轮询载荷，请用 shapes=todos|groups|projectGroups 只取所需形状';
+    }
+    return payload;
   }
 
   /**
@@ -170,7 +219,9 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
 
   /**
    * 手动排序：ids 是「新的完整顺序」，ids[i] 的记录得到 order=i。
-   * 只写真正变了的记录；不在 ids 里的记录保持原样（order 仍为 null，继续按自动规则排）。
+   * 不在 ids 里的记录保持原样（order 仍为 null，继续按自动规则排）。
+   * 只把「新顺序」交给存储的批量接口（`store.updateOrder`）：那里在一次读-改-写里只 patch
+   * `order` 字段，既不做 N 次整文件重写（S3-1/S3-2），也不会用旧快照覆盖并发改动（S4-1）。
    * @param {{ids?: string[]}} [input]
    */
   async function reorder({ ids } = {}) {
@@ -186,15 +237,32 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
     const unknownIds = order.filter((id) => !known.has(id));
     if (unknownIds.length) return { ok: false, reason: 'not-found', message: `这些 id 不存在：${unknownIds.join('、')}` };
 
-    const next = applyManualOrder(records, order);
+    // S3-1/S3-2/S4-1：**不**再逐条 put(整条旧记录)。
+    //   - put 整条 = 文件后端每次整文件重写 → O(n²)（1000 条 3.9s/404 MiB），且事件循环被占满；
+    //   - 整条写的是「调用开始时的快照」→ 会静默覆盖拖拽期间另一窗口改的 title/priority。
+    // 改成把「新顺序」交给存储的只改 order 批量接口：一次读-改-写，只 patch order 字段。
     let updated = 0;
-    for (let index = 0; index < next.length; index += 1) {
-      if (next[index] === records[index]) continue; // 顺序没变的记录不写盘
+    if (typeof store.updateOrder === 'function') {
       try {
-        await store.put(next[index]);
-        updated += 1;
+        const result = await store.updateOrder(order);
+        updated = result?.updated ?? 0;
       } catch (error) {
         return { ok: false, reason: 'store-write-failed', message: `保存顺序失败：${error?.message ?? error}` };
+      }
+    } else {
+      // 兼容没有 updateOrder 的旧/第三方句柄：仍然只 patch order（相对本次读到的最新快照），
+      // 但拿不到「存储侧一次读-改-写」，所以并发窗口里改的其它字段仍有被快照覆盖的可能。
+      // 真实的两条后端（文件 / 官方 domain）与 lib/index.js 的不可用占位都实现了 updateOrder，
+      // 这条路径只是不把第三方句柄直接判死。
+      const next = applyManualOrder(records, order);
+      for (let index = 0; index < next.length; index += 1) {
+        if (next[index] === records[index]) continue;
+        try {
+          await store.put({ ...(records[index] ?? {}), order: next[index].order });
+          updated += 1;
+        } catch (error) {
+          return { ok: false, reason: 'store-write-failed', message: `保存顺序失败：${error?.message ?? error}` };
+        }
       }
     }
     emit({ operation: 'reorder', updated });

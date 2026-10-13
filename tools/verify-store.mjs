@@ -12,7 +12,9 @@
  * 这里用等价的假 facility 走通 store.mjs 的调用序列（open → table.put/delete/entries），
  * 完整运行时验证留给装进 profile 后的 health 路由。
  */
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openWorkTodoStore, unionById } from '../src/store.mjs';
@@ -103,14 +105,16 @@ function serviceHolder(initial = null) {
  */
 function makeFakeFacility(initial = []) {
   const records = new Map(initial.map((record) => [record.id, record]));
-  const calls = { open: 0, close: 0 };
+  const calls = { open: 0, close: 0, update: 0 };
   /** 测试开关：模拟「domain 突然读不出来」（复审 R1 第 3 条：不能静默换回退役文件）。 */
-  const control = { failLoad: false };
+  const control = { failLoad: false, failId: null, failIds: null, failCount: 0 };
   let open = false;
   return {
     records,
     calls,
     control,
+    /** 领域是否还开着（S2-1：open 成功后抛错必须 close，不能留下已开的句柄）。 */
+    isOpen: () => open,
     async open(spec) {
       calls.open += 1;
       if (open) throw new Error("domain 'worktodo' is already open");
@@ -127,7 +131,23 @@ function makeFakeFacility(initial = []) {
           },
           size: records.size,
           put: async (key, value) => {
+            // 复审 0.2.2 F2/F3 的注入点：让指定记录的写入失败（模拟半截合并）
+            control.failCount += 1;
+            if (control.failId === key || (Array.isArray(control.failIds) && control.failIds.includes(key))) {
+              throw new Error(`写入 ${key} 失败（注入）`);
+            }
             records.set(key, spec.tables[name].valueSchema.parse(value));
+          },
+          // 官方 KvTableImpl.update(key, fn)：在领域写链里「读当前值 → 变换 → 写回」。
+          // store.mjs 的 updateOrder 优先用它（S3-1/S4-1：只改 order、不覆盖并发字段）。
+          update: async (key, fn) => {
+            calls.update += 1;
+            if (!records.has(key)) {
+              throw new Error(`domain 'worktodo' table 'todos' has no record '${key}' to update`);
+            }
+            const next = spec.tables[name].valueSchema.parse(fn(records.get(key)));
+            records.set(key, next);
+            return next;
           },
           delete: async (key) => records.delete(key),
         }),
@@ -272,18 +292,22 @@ await test('合并同 id 冲突时以 updatedAt 较新的那条为准', async ()
     eq(merged.length, 1, '同 id 不该变成两条：');
     eq(merged[0].title, '官方里的新标题', '应当取 updatedAt 较新的那条：');
     eq(store.describe().merge.conflicts, 1);
-
-    // 反过来：回退文件里的更新，则保留文件里的
-    const holder2 = serviceHolder(null);
-    const store2 = await openWorkTodoStore({ ctx: holder2.ctx, config: {}, logger: silent });
-    await store2.put({ ...createRecord({ title: '文件里更新' }, { now: NOW, id: 'wt-same2' }), updatedAt: NOW + 9000 });
-    holder2.current = makeFakeFacility([
-      { ...createRecord({ title: '官方里更旧' }, { now: NOW, id: 'wt-same2' }), updatedAt: NOW },
-    ]);
-    const merged2 = await store2.load();
-    eq(merged2[0].title, '文件里更新');
     await store.close();
-    await store2.close();
+
+    // 反过来：回退文件里的更新，则保留文件里的。
+    // ⚠️ 必须换一个干净的 home：上面这次升级已经把这个 home 的回退文件退役了，
+    // 新句柄会正确地拒绝再读它（复审 0.2.2 F1/F3）。
+    await withTempHome(async () => {
+      const holder2 = serviceHolder(null);
+      const store2 = await openWorkTodoStore({ ctx: holder2.ctx, config: {}, logger: silent });
+      await store2.put({ ...createRecord({ title: '文件里更新' }, { now: NOW, id: 'wt-same2' }), updatedAt: NOW + 9000 });
+      holder2.current = makeFakeFacility([
+        { ...createRecord({ title: '官方里更旧' }, { now: NOW, id: 'wt-same2' }), updatedAt: NOW },
+      ]);
+      const merged2 = await store2.load();
+      eq(merged2[0].title, '文件里更新');
+      await store2.close();
+    });
   });
 });
 
@@ -358,6 +382,207 @@ await test('升级后 domain 读失败：显式报错并保持 domain 句柄，�
     // 退役文件本身没被读过、也没被改写：内容还在（只是不再当数据源）
     eq(JSON.parse(readFileSync(migrated, 'utf8')).todos.map((t) => t.id), ['wt-only-file']);
     eq(existsSync(join(home, 'worktodo', 'todos.json')), false, '不能把退役文件重新变回回退文件：');
+    await store.close();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 复审 0.2.2（第三轮）：F1 退役后 domain 不可用、F2 半截合并复活、F3 退役失败
+ * ------------------------------------------------------------------ */
+
+await test('F1：回退文件已退役 + 官方存储不可用 → 绝不静默返回空列表，且 describe()/日志明确报错', async () => {
+  await withTempHome(async (home) => {
+    const facility = makeFakeFacility();
+    const holder = serviceHolder(null);
+    const first = await openWorkTodoStore({ ctx: holder.ctx, config: {}, logger: silent });
+    await first.put(createRecord({ title: 'A' }, { now: NOW, id: 'wt-a' }));
+    // 服务就绪 → 合并 + 退役（真机上的真实状态：只剩下 .migrated-*）
+    holder.current = facility;
+    eq((await first.load()).map((r) => r.id), ['wt-a']);
+    await first.close();
+    eq(existsSync(join(home, 'worktodo', 'todos.json')), false, '前置：回退文件必须已退役：');
+    eq(existsSync(join(home, 'worktodo', 'todos.json.retired')), true, '退役必须留下哨兵（下次启动据此判断）：');
+
+    // 重开：storageDomain 不在组合里（插件文档写明「精简组合里可能没挂载」是设计内场景）
+    const logs = [];
+    const store = await openWorkTodoStore({ ctx: serviceHolder(null).ctx, config: {}, logger: logTo(logs) });
+    let loadError = null;
+    let loaded;
+    try {
+      loaded = await store.load();
+    } catch (error) {
+      loadError = error;
+    }
+    eq(loaded ?? null, null, '绝不能静默返回空列表（那就是「用户以为待办没了」）：');
+    eq(Boolean(loadError), true, '必须抛出显式错误，走既有失败路径：');
+    eq(String(loadError?.message).includes('退役'), true, `错误要说清「已退役」：${loadError?.message}`);
+    eq(loadError?.code, 'RETIRED_FALLBACK_UNAVAILABLE', '错误要带稳定 code，便于上层区分：');
+
+    const described = store.describe();
+    eq(described.preferred, 'domain', 'describe() 要写明首选后端：');
+    eq(described.domainUnavailable, true, 'describe() 要能让面板一眼判定「官方存储不可用」：');
+    eq(typeof described.backendError, 'string', 'describe() 必须有明确错误：');
+    eq(described.backendError.includes('退役'), true, `backendError 要说清退役事实：${described.backendError}`);
+    eq(described.retired?.alreadyRetired, true, '退役事实要持久化（重启后仍知道）：');
+    eq(typeof described.retired?.at, 'number', '退役时间要能报出来：');
+    eq(logs.some((line) => line.startsWith('warn') && line.includes('退役')), true, '必须有高优先级告警日志（不静默）：');
+    await store.close();
+  });
+});
+
+await test('F1：没有哨兵时（旧版本退役）也能从 .migrated-* 认出已退役，domain 不可用同样不静默', async () => {
+  await withTempHome(async (home) => {
+    const dir = join(home, 'worktodo');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'todos.json.migrated-20261013-220627'), JSON.stringify({
+      version: 1,
+      updatedAt: NOW,
+      todos: [{ id: 'wt-old', title: '旧数据', status: 'pending' }],
+    }), 'utf8');
+    // 官方 storage 落盘文件里也有数据（真机正是这种形态）
+    mkdirSync(join(home, 'storages'), { recursive: true });
+    writeFileSync(join(home, 'storages', 'worktodo.json'), JSON.stringify({
+      unit: { name: 'worktodo', version: 1 },
+      global: null,
+      tables: { todos: { 'wt-dom': { id: 'wt-dom', title: '官方里的' } } },
+    }), 'utf8');
+
+    const logs = [];
+    const store = await openWorkTodoStore({ ctx: serviceHolder(null).ctx, config: {}, logger: logTo(logs) });
+    let error = null;
+    try {
+      await store.load();
+    } catch (caught) {
+      error = caught;
+    }
+    eq(Boolean(error), true, '只有 .migrated-* 时同样不能静默给空列表：');
+    const described = store.describe();
+    eq(described.retired?.alreadyRetired, true, '要认出「此前已退役」：');
+    eq(String(described.retired?.movedTo).includes('.migrated-'), true, '要报出退役档案：');
+    // 不能因为本地列表为空就早退（空 ≠ 健康）：官方 storage 里有 1 条必须报出来
+    eq(typeof described.split, 'string', 'detectSplit 不能因为本地为空就闭嘴：');
+    eq(described.split.includes('官方独有 1'), true, `要报出「官方独有 1 条」：${described.split}`);
+    eq(logs.some((line) => line.startsWith('warn') && line.includes('退役')), true, '要有告警日志：');
+    await store.close();
+  });
+});
+
+await test('F2：合并中途失败必须回滚，不留下半截 domain（否则用户删掉的待办会复活）', async () => {
+  await withTempHome(async () => {
+    const facility = makeFakeFacility();
+    const holder = serviceHolder(null);
+    const store = await openWorkTodoStore({ ctx: holder.ctx, config: {}, logger: silent });
+    for (const [id, title] of [['wt-a', 'A'], ['wt-b', 'B'], ['wt-c', 'C']]) {
+      await store.put(createRecord({ title }, { now: NOW, id }));
+    }
+
+    // 注入：合并时 wt-b 写入失败（A 已写入 → 旧实现会在 domain 留下半截）
+    facility.control.failId = 'wt-b';
+    holder.current = facility;
+    const loaded = await store.load();
+    eq(store.kind, 'file', '合并失败必须留在文件后端：');
+    eq(facility.records.has('wt-a'), false, '已写入的 wt-a 必须被回滚掉（不留半截）：');
+    eq(facility.records.size, 0, '目标端必须回到合并前状态：');
+    const described = store.describe();
+    eq(described.merge?.aborted, true, '必须把「本次合并被中止」记进 describe()：');
+    eq(String(described.merge?.writeError).includes('wt-b'), true, `中止原因要指向失败的那条：${described.merge?.writeError}`);
+    eq(described.retired, null, '合并失败不能退役回退文件：');
+
+    // 用户在当前后端（文件）上删掉 A
+    await store.remove('wt-a');
+    eq(loaded.length, 3, '合并失败时读到的仍是文件里的三条：');
+
+    // domain 恢复 → 再合并：绝不能把已删除的 wt-a 复活
+    facility.control.failId = null;
+    await new Promise((resolve) => setTimeout(resolve, 5100)); // 跨过升级重试节流
+    await store.refreshBackend();
+    eq(store.kind, 'domain', '恢复后应当升级成功：');
+    const ids = (await store.load()).map((r) => r.id).sort();
+    eq(ids, ['wt-b', 'wt-c'], `已删除的 wt-a 不能复活：${JSON.stringify(ids)}`);
+    eq(facility.records.has('wt-a'), false, 'domain 里不该有 wt-a：');
+    await store.close();
+  });
+});
+
+await test('F3：退役 rename 失败 → 显示失败原因（不是「已迁移并退役」），且该文件不再当合并源（不复活）', async () => {
+  await withTempHome(async (home) => {
+    const facility = makeFakeFacility([createRecord({ title: 'D' }, { now: NOW, id: 'wt-dom-d' })]);
+    const holder = serviceHolder(null);
+    const logs = [];
+    const store = await openWorkTodoStore({ ctx: holder.ctx, config: {}, logger: logTo(logs) });
+    for (const [id, title] of [['wt-a', 'A'], ['wt-b', 'B']]) {
+      await store.put(createRecord({ title }, { now: NOW, id }));
+    }
+
+    // 注入：只让退役改名失败（备份与哨兵照常），模拟 EACCES/EPERM。
+    // ESM 的 fs 命名空间是冻结的，测试里无法替换 renameSync，所以源码留了一个
+    // 显式的测试故障注入点（`WORKTODO_TEST_FAULT=retire-rename`，只在设置时生效）。
+    const previousFault = process.env.WORKTODO_TEST_FAULT;
+    process.env.WORKTODO_TEST_FAULT = 'retire-rename';
+    try {
+      holder.current = facility;
+      await store.load();
+    } finally {
+      if (previousFault === undefined) delete process.env.WORKTODO_TEST_FAULT;
+      else process.env.WORKTODO_TEST_FAULT = previousFault;
+    }
+    eq(store.kind, 'domain', '改名失败不影响已经合并好的 domain：');
+    eq(existsSync(join(home, 'worktodo', 'todos.json')), true, '改名失败时文件仍在原地：');
+    eq(existsSync(join(home, 'worktodo', 'todos.json.retired')), true, '失败也要落哨兵（下次启动据此排除）：');
+    const described = store.describe();
+    eq(typeof described.retired?.error, 'string', 'describe() 必须带上原始错误：');
+    eq(described.retired.error.includes('EACCES') || described.retired.error.includes('EPERM'),
+      true, `原始错误不能丢：${described.retired.error}`);
+    eq(described.retired.movedTo, null, '失败时不能报「已迁移」：');
+    eq(String(described.retired.note).includes('仍然存在'), true, `文案要说清文件还在：${described.retired.note}`);
+    // 面板/日志必须是「失败 + 原因 + 建议」，绝不能是「已迁移并退役」（复审 0.2.2 F3）
+    eq(logs.some((line) => line.startsWith('warn')
+      && line.includes('退役失败')
+      && line.includes('已被排除在合并源之外')
+      && line.includes('手动改名或删除')), true, `必须报失败原因与建议：${JSON.stringify(logs)}`);
+    eq(logs.some((line) => line.startsWith('info') && line.includes('已把回退文件迁移并退役')), false,
+      '改名失败时绝不能打「已迁移并退役」的成功日志：');
+    // domain 侧删掉 A，然后重开：文件仍是旧的 [A,B]，但已不是合并源 → 不能复活
+    await store.remove('wt-a');
+    await store.close();
+    const reloaded = await openWorkTodoStore({ ctx: serviceHolder(facility).ctx, config: {}, logger: silent });
+    const ids = (await reloaded.load()).map((r) => r.id).sort();
+    eq(ids.includes('wt-a'), false, `已删除的 wt-a 不能复活（退役文件不得再当合并源）：${JSON.stringify(ids)}`);
+    eq(ids, ['wt-b', 'wt-dom-d']);
+    eq(reloaded.describe().retired?.alreadyRetired, true, '重开后仍要认得这个哨兵：');
+    await reloaded.close();
+  });
+});
+
+await test('F9：合并反复失败不会每次新增 .bak-（同一轮复用 + 轮转上限）', async () => {
+  await withTempHome(async (home) => {
+    const facility = makeFakeFacility();
+    const holder = serviceHolder(null);
+    const store = await openWorkTodoStore({ ctx: holder.ctx, config: {}, logger: silent });
+    for (const [id, title] of [['wt-a', 'A'], ['wt-b', 'B']]) {
+      await store.put(createRecord({ title }, { now: NOW, id }));
+    }
+    const path = join(home, 'worktodo', 'todos.json');
+    const backups = () => readdirSync(join(home, 'worktodo')).filter((name) => name.includes('.bak-'));
+    eq(backups().length, 0, '还没合并过，不该有备份：');
+
+    facility.control.failId = 'wt-a';
+    holder.current = facility;
+    await store.load();
+    eq(backups().length, 1, '第一次失败留一份备份：');
+    eq(facility.control.failCount > 0, true, '注入应当命中：');
+    // 再失败两次（同一轮、5 秒内）：不得每次都 +1
+    await store.refreshBackend();
+    await store.refreshBackend();
+    eq(backups().length, 1, `同一轮内必须复用，不能堆积：${JSON.stringify(backups())}`);
+    // S2-2：跨过升级重试节流（5s）再失败一次 —— 仍然是同一场故障，**不许**再复制一份整文件备份。
+    // 改前用的是 5 秒复用时间窗，而重试节流恰好也是 5 秒 → 每轮重试都复制一份（warn 与 IO 一起放大）。
+    await new Promise((resolve) => setTimeout(resolve, 5100));
+    await store.refreshBackend();
+    eq(facility.control.failCount > 0, true, '节流之后应当真的又重试了一次：');
+    eq(backups().length, 1, `同一次故障跨过节流也只允许一份备份：${JSON.stringify(backups())}`);
+    // 轮转上限依然在（备份永远不超过 MAX=2 份）
+    eq(backups().length <= 2, true, `备份要有上限（最多 2 份）：${JSON.stringify(backups())}`);
     await store.close();
   });
 });
@@ -555,6 +780,233 @@ await test('~ 开头的 storePath 会展开到家目录', async () => {
   eq(store.location.includes('/worktodo-verify-should-not-exist.json'), true);
   // 不实际写入，避免污染家目录
   await store.close();
+});
+
+/* ------------------------------------------------------------------ *
+ * 第四轮稳定性审计：S3-1 / S3-2 / S4-1（reorder 批量写）、S2-1（句柄泄漏）、
+ * S2-2（备份去重）、S1-2（打开超时）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 在窗口内统计真实文件 IO：patch `node:fs` 后调 `syncBuiltinESMExports()`，
+ * store.mjs 里 `import { readFileSync } from 'node:fs'` 的绑定会跟着换成计数版本
+ *（审计的 wt-d3-perf.mjs 用的就是这一招，否则 ESM 命名导入数不到字节）。
+ * @param {() => Promise<any>} run
+ * @returns {Promise<{stats: object, value: any}>}
+ */
+async function withFsCounter(run) {
+  const real = { read: fs.readFileSync, write: fs.writeFileSync, rename: fs.renameSync };
+  const stats = { read: 0, readBytes: 0, write: 0, writeBytes: 0, rename: 0 };
+  fs.readFileSync = (target, ...rest) => {
+    const out = real.read(target, ...rest);
+    stats.read += 1;
+    stats.readBytes += typeof out === 'string' ? Buffer.byteLength(out) : out.length;
+    return out;
+  };
+  fs.writeFileSync = (target, data, ...rest) => {
+    stats.write += 1;
+    stats.writeBytes += typeof data === 'string' ? Buffer.byteLength(data) : data.length;
+    return real.write(target, data, ...rest);
+  };
+  fs.renameSync = (...args) => {
+    stats.rename += 1;
+    return real.rename(...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    const value = await run();
+    return { stats, value };
+  } finally {
+    fs.readFileSync = real.read;
+    fs.writeFileSync = real.write;
+    fs.renameSync = real.rename;
+    syncBuiltinESMExports();
+  }
+}
+
+/** 造 n 条合法记录并直接把文件写成落盘格式（绕过 n 次 put 的 O(n²) 准备时间）。 */
+function seedFile(path, n) {
+  const records = Array.from({ length: n }, (_, i) => createRecord({ title: `条目 ${i}` }, { now: NOW + i, id: `wt-${i}` }));
+  writeFileSync(path, `${JSON.stringify({ version: 1, updatedAt: NOW + n, todos: records }, null, 2)}\n`, 'utf8');
+  return records;
+}
+
+console.log('S3-1 / S3-2 / S4-1：reorder 的批量原子写（第四轮审计）');
+
+await test('S3-1/S3-2：1000 条 reorder 只发生「读 2 次 / 写 1 次 / rename 1 次」，不再是 N 次整文件重写', async () => {
+  const dir = newRoot();
+  const path = join(dir, 'todos.json');
+  const n = 1000;
+  const records = seedFile(path, n);
+  const store = await openWorkTodoStore({ ctx: undefined, config: { storePath: path }, logger: silent });
+  const fileSize = statSync(path).size;
+  const ids = records.map((record) => record.id).reverse();
+
+  const { stats, value } = await withFsCounter(async () => {
+    const t0 = process.hrtime.bigint();
+    const result = await store.updateOrder(ids);
+    return { result, ms: Number(process.hrtime.bigint() - t0) / 1e6 };
+  });
+  const { result, ms } = value;
+  eq(result.updated, n);
+  eq(stats.write, 1, '整批只允许一次整文件写（改前是 1000 次）：');
+  eq(stats.rename, 1, '原子写只允许一次 rename（改前是 1000 次）：');
+  eq(stats.read <= 2, true, `最多读两次（调用前读一次 + 批量写内部 readDoc 一次），实际 ${stats.read} 次：`);
+  eq(stats.writeBytes <= fileSize * 2, true,
+    `写入字节量必须只在「一份文件」量级（改前 ${(fileSize * n / 1024).toFixed(0)} KiB）：实际 ${(stats.writeBytes / 1024).toFixed(0)} KiB`);
+  // 时间只做量级护栏（改前 3.9s，改后毫秒级），不是基准测试：真正与机器无关的断言是上面的写次数/字节量
+  eq(ms < 1500, true, `1000 条 reorder 应当是毫秒级（阈值 1500ms，实际 ${ms.toFixed(1)}ms）：`);
+  const doc = JSON.parse(readFileSync(path, 'utf8'));
+  eq(doc.todos.every((todo) => todo.order === ids.indexOf(todo.id)), true, 'order 要正确落盘：');
+  console.log(`      [perf] n=${n}（文件 ${(fileSize / 1024).toFixed(0)} KiB）reorder ${ms.toFixed(1)}ms`
+    + ` ｜ 读 ${stats.read} 次 ${(stats.readBytes / 1024).toFixed(0)} KiB、写 ${stats.write} 次 ${(stats.writeBytes / 1024).toFixed(0)} KiB、rename ${stats.rename}`);
+  await store.close();
+});
+
+await test('S3-1：只改 order —— 拖拽期间另一窗口改的 title/priority/updatedAt 全都不被覆盖', async () => {
+  const path = join(newRoot(), 'todos.json');
+  const store = await openWorkTodoStore({ ctx: undefined, config: { storePath: path }, logger: silent });
+  const a = createRecord({ title: 'A' }, { now: NOW, id: 'wt-a' });
+  const b = createRecord({ title: 'B', priority: 'low' }, { now: NOW, id: 'wt-b' });
+  const c = createRecord({ title: 'C' }, { now: NOW, id: 'wt-c' });
+  for (const record of [a, b, c]) await store.put(record);
+  // 「拖拽开始后、批量写落地前」另一窗口改了 wt-b（复审 S4-1 的丢失更新场景）
+  await store.put({ ...b, title: '并发改的标题', priority: 'high', updatedAt: NOW + 1000 });
+  const snapshot = (await store.load()).find((record) => record.id === 'wt-b');
+
+  const result = await store.updateOrder(['wt-c', 'wt-b', 'wt-a']);
+  eq(result.updated, 3);
+  const after = (await store.load()).find((record) => record.id === 'wt-b');
+  eq(after.title, '并发改的标题', '并发改的 title 不能被排序写覆盖：');
+  eq(after.priority, 'high', '并发改的 priority 不能被排序写覆盖：');
+  eq(after.updatedAt, NOW + 1000, '排序写不该改 updatedAt：');
+  eq(after.order, 1, 'order 要按新顺序落盘：');
+  const changed = Object.keys(after).filter((key) => JSON.stringify(after[key]) !== JSON.stringify(snapshot[key]));
+  eq(changed, ['order'], '一次排序只允许改 order 这一个字段：');
+  await store.close();
+});
+
+await test('S3-1：domain 后端 updateOrder 走官方 table.update（写链内读-改-写），并发字段保留', async () => {
+  await withTempHome(async () => {
+    const facility = makeFakeFacility();
+    const store = await openWorkTodoStore({ ctx: serviceHolder(facility).ctx, config: {}, logger: silent });
+    eq(store.kind, 'domain');
+    await store.put(createRecord({ title: 'A' }, { now: NOW, id: 'wt-a' }));
+    await store.put(createRecord({ title: 'B', priority: 'high' }, { now: NOW, id: 'wt-b' }));
+    // 拖拽期间另一窗口改了 wt-b
+    await store.put({ ...createRecord({ title: '并发改的', priority: 'high' }, { now: NOW, id: 'wt-b' }), updatedAt: NOW + 1000 });
+    const snapshot = (await store.load()).find((record) => record.id === 'wt-b');
+
+    const result = await store.updateOrder(['wt-b', 'wt-a']);
+    eq(result.updated, 2);
+    const after = (await store.load()).find((record) => record.id === 'wt-b');
+    eq(after.title, '并发改的', 'domain 后端的排序也不能覆盖并发改的 title：');
+    eq(after.priority, 'high');
+    eq(after.order, 0);
+    eq(after.updatedAt, NOW + 1000, 'order 之外的字段都不该动：');
+    const changed = Object.keys(after).filter((key) => JSON.stringify(after[key]) !== JSON.stringify(snapshot[key]));
+    eq(changed, ['order'], 'domain 后端同样只 patch order：');
+    eq((await store.load()).find((record) => record.id === 'wt-a').order, 1);
+    eq(facility.calls.update, 2, '优先用官方 table.update（在领域写链里完成读-改-写）：');
+    await store.close();
+  });
+});
+
+await test('S3-1：没有任何 order 需要改时完全不碰磁盘（写 0 次）', async () => {
+  const path = join(newRoot(), 'todos.json');
+  seedFile(path, 5);
+  const store = await openWorkTodoStore({ ctx: undefined, config: { storePath: path }, logger: silent });
+  await store.updateOrder(['wt-0', 'wt-1', 'wt-2', 'wt-3', 'wt-4']);
+  const { stats, value } = await withFsCounter(() => store.updateOrder(['wt-0', 'wt-1', 'wt-2', 'wt-3', 'wt-4']));
+  eq(value.updated, 0);
+  eq(stats.write, 0, '顺序没变时不该有任何写入：');
+  eq(stats.rename, 0);
+  await store.close();
+});
+
+console.log('S2-1：open() 成功后再抛错不许泄漏领域句柄');
+
+await test('S2-1：table() 抛错 → 刚打开的句柄被 close、注册表摘除，故障消失后仍能正常打开', async () => {
+  await withTempHome(async () => {
+    const facility = makeFakeFacility();
+    const originalOpen = facility.open;
+    let failTableOnce = true;
+    facility.open = async (spec) => {
+      const domain = await originalOpen(spec);
+      if (!failTableOnce) return domain;
+      failTableOnce = false;
+      return { ...domain, table() { throw new Error('table() 注入抛错'); } };
+    };
+
+    const first = await openWorkTodoStore({ ctx: serviceHolder(facility).ctx, config: {}, logger: silent });
+    eq(first.kind, 'file', '打不开官方存储要降级到回退文件，而不是让插件挂不上：');
+    eq(facility.calls.open, 1);
+    eq(facility.calls.close, 1, 'open 成功之后抛错必须把领域句柄 close（改前 close=0 → 永久泄漏）：');
+    eq(facility.isOpen(), false, '句柄不能还开着：');
+    eq(String(first.describe().mismatch).includes('table()'), true,
+      `describe() 要报出打开失败的原因：${first.describe().mismatch}`);
+    await first.close();
+
+    const second = await openWorkTodoStore({ ctx: serviceHolder(facility).ctx, config: {}, logger: silent });
+    eq(second.kind, 'domain', '故障消失后必须还能打开（改前会永远撞 already-open，只能重启进程）：');
+    await second.put(createRecord({ title: '修好之后' }, { now: NOW, id: 'wt-fixed' }));
+    eq((await second.load()).map((r) => r.id), ['wt-fixed']);
+    await second.close();
+  });
+});
+
+console.log('S1-2：挂载路径上的打开必须有超时');
+
+await test('S1-2：storageDomain.open 永不 resolve → 默认 3 秒超时降级并告警，绝不让 apply 无限等待', async () => {
+  await withTempHome(async () => {
+    const hanging = { open: () => new Promise(() => {}) };
+    const logs = [];
+    const t0 = process.hrtime.bigint();
+    const store = await openWorkTodoStore({ ctx: serviceHolder(hanging).ctx, config: {}, logger: logTo(logs) });
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    eq(store.kind, 'file', '超时后必须降级到回退文件：');
+    eq(String(store.describe().mismatch).includes('超时'), true, `要把「打开超时」报给 health/面板：${store.describe().mismatch}`);
+    eq(logs.some((line) => line.startsWith('warn') && line.includes('超时')), true, '超时必须告警（不静默）：');
+    // 默认超时 3s：证明真的加上了上限，而不是碰巧没挂住
+    eq(ms >= 2900 && ms < 6000, true, `默认超时应当是 3 秒左右（实际 ${ms.toFixed(0)}ms）：`);
+    // 超时之后插件照常可用（这条路径在 apply 上就是「仍然挂载成功」）
+    await store.put(createRecord({ title: '超时后的写入' }, { now: NOW, id: 'wt-after-timeout' }));
+    eq((await store.load()).map((r) => r.id), ['wt-after-timeout']);
+    await store.close();
+  });
+});
+
+await test('S1-2：超时后那个 open 才成功 → 晚到的句柄会被归还，后续挂载不会再撞 already-open', async () => {
+  await withTempHome(async () => {
+    const facility = makeFakeFacility();
+    const originalOpen = facility.open;
+    let delayNext = true;
+    facility.open = async (spec) => {
+      if (delayNext) {
+        delayNext = false;
+        await new Promise((resolve) => setTimeout(resolve, 300)); // 晚于 100ms 超时
+      }
+      return originalOpen(spec);
+    };
+    const previous = process.env.WORKTODO_UPGRADE_TIMEOUT_MS;
+    process.env.WORKTODO_UPGRADE_TIMEOUT_MS = '100';
+    try {
+      const store = await openWorkTodoStore({ ctx: serviceHolder(facility).ctx, config: {}, logger: silent });
+      eq(store.kind, 'file', '超时后先用回退文件：');
+      await new Promise((resolve) => setTimeout(resolve, 500)); // 等那个迟到的 open 落地
+      eq(facility.calls.open, 1);
+      eq(facility.calls.close, 1, '晚到的领域句柄必须被归还（close + 摘注册表），否则就是 S2-1 的泄漏再版：');
+      eq(facility.isOpen(), false);
+      // 注册表没被毒化：同一个服务上再打开一次必须成功
+      const second = await openWorkTodoStore({ ctx: serviceHolder(facility).ctx, config: {}, logger: silent });
+      eq(second.kind, 'domain', '超时不能把注册表毒化成永久 already-open：');
+      await second.close();
+      await store.close();
+    } finally {
+      if (previous === undefined) delete process.env.WORKTODO_UPGRADE_TIMEOUT_MS;
+      else process.env.WORKTODO_UPGRADE_TIMEOUT_MS = previous;
+    }
+  });
 });
 
 // 清理所有临时目录

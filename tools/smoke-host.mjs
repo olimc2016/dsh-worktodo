@@ -94,7 +94,7 @@ async function call(handler, options) {
 }
 
 /** 组装一个假 cordis 上下文，收集注册出来的路由与工具。 */
-function makeCtx({ rejection, storageDomain } = {}) {
+function makeCtx({ rejection, storageDomain, webServer } = {}) {
   const routes = new Map();
   const tools = [];
   const effects = [];
@@ -132,7 +132,7 @@ function makeCtx({ rejection, storageDomain } = {}) {
         return () => {};
       },
     },
-    webServer: {
+    webServer: webServer ?? {
       register: ({ kind, path, handler }) => {
         routes.set(path, { kind, handler });
         return () => routes.delete(path);
@@ -187,6 +187,34 @@ function makeFakeDomainFacility(initial = []) {
           await new Promise((resolve) => setTimeout(resolve, 5));
           open = false;
         },
+      };
+    },
+  };
+}
+
+/**
+ * 假 webServer：复刻真实 DSH 的**服务级**路由表语义（S1-1 的复现条件）——
+ * 路由表不属于某个 ctx，重复路径**抛错**而不是幂等；`register` 返回删除该路由的 disposer。
+ * @param {object} [options]
+ * @param {number} [options.failAt] 第 N 次 register（1 起）抛「duplicate exact route」
+ */
+function makeServerLevelWebServer({ failAt } = {}) {
+  const table = new Map();
+  const calls = { register: 0, dispose: 0, failed: [] };
+  return {
+    table,
+    calls,
+    register({ kind, path, handler }) {
+      calls.register += 1;
+      if (failAt && calls.register === failAt) {
+        calls.failed.push(path);
+        throw new Error(`webserver: duplicate exact route "${path}"（注入第 ${failAt} 条注册失败）`);
+      }
+      if (table.has(path)) throw new Error(`webserver: duplicate ${kind} route "${path}"`);
+      table.set(path, { kind, handler });
+      return () => {
+        calls.dispose += 1;
+        table.delete(path);
       };
     },
   };
@@ -558,6 +586,29 @@ await test('GET /list 的载荷带 projectGroups（面板「按项目」视图�
   eq(buckets[buckets.length - 1].project, null, '未归类必须在最后一个桶：');
 });
 
+await test('S3-3：/list?shapes=todos 只回一份（不再是同一批数据的 3 倍）；缺省仍是三份（旧面板兼容）', async () => {
+  const only = await call(routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all&shapes=todos' });
+  eq(only.statusCode, 200);
+  const data = only.json()?.data;
+  eq('todos' in data, true);
+  eq('groups' in data, false, '只要 todos 时不该再返回 groups：');
+  eq('projectGroups' in data, false, '也不该返回 projectGroups：');
+  eq(data.shapes, ['todos']);
+  eq(Array.isArray(data.todos), true);
+  eq(typeof data.stats.total, 'number', '统计/诊断这些小字段不能一起被省掉：');
+  eq(typeof data.store.kind, 'string');
+
+  const groupsOnly = await call(routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all&shapes=groups' });
+  eq('groups' in groupsOnly.json().data, true);
+  eq('todos' in groupsOnly.json().data, false);
+
+  const full = await call(routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all' });
+  const fullData = full.json().data;
+  eq([['todos' in fullData, 'groups' in fullData, 'projectGroups' in fullData]], [[true, true, true]],
+    '缺省必须保持旧面板读到三个字段：');
+  eq(fullData.shapes, ['todos', 'groups', 'projectGroups']);
+});
+
 // ---- AI 友好：批量登记 + 给模型的用法指引 ----
 
 await test('worktodo_add_many 一次登记多条，坏的那条只跳过它自己', async () => {
@@ -761,6 +812,89 @@ await test('数据读不出来时 /health 报 count:null + countError，而不�
     if (previousHome === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previousHome;
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+console.log('S1-1：路由注册失败只能降级那一条（不泄漏、不毒化后续挂载）');
+
+await test('S1-1：第 N 条路由注册抛错 → apply 不 reject、其余路由照常且卸载时清干净、随后正常挂载不撞 duplicate', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'worktodo-host-routefail-'));
+  try {
+    for (const failAt of [1, 3, 8]) {
+      // 服务级路由表在 apply 之间共享（真实 DSH 就是这样：路由进了服务，不属于某个 ctx）
+      const server = makeServerLevelWebServer({ failAt });
+      const bad = makeCtx({ webServer: server });
+      let applyError = null;
+      try {
+        await apply(bad.ctx, { storePath: join(dir, `bad-${failAt}.json`) });
+      } catch (error) {
+        applyError = error;
+      }
+      eq(applyError, null, `第 ${failAt} 条失败时 apply 绝不能 reject（改前工具与路由一起消失）：`);
+      // 单条失败只丢那一条，其余照常（改前是「回调中途抛出 → 前 N-1 条泄漏 + 后面全没」）
+      eq(server.table.size, 7, `只有失败的那一条该缺失，实际路由表：${[...server.table.keys()]}`);
+      eq(server.table.has(server.calls.failed[0]), false, `失败的那条不该进路由表：${server.calls.failed[0]}`);
+      eq(server.calls.register, 8, `8 条都要被尝试注册（失败一条不影响其余）：实际尝试 ${server.calls.register} 次`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      eq(bad.tools.length, 7, `第 ${failAt} 条失败不能连累工具注册（改前 7 个工具全没）：`);
+
+      // 卸载：那些已经注册成功的必须被 disposer 清掉，绝不留服务级残留
+      for (const effect of bad.effects.filter((e) => e.label === 'worktodo: http routes')) await effect.dispose?.();
+      eq(server.table.size, 0, `卸载后不许留下任何服务级路由（改前残留 ${failAt - 1} 条 → 只能重启 DSH）：`);
+
+      // 随后一次完全正常的挂载：不能撞 duplicate exact route
+      const good = makeCtx({ webServer: server });
+      let goodError = null;
+      try {
+        await apply(good.ctx, { storePath: join(dir, `good-${failAt}.json`) });
+      } catch (error) {
+        goodError = error;
+      }
+      eq(goodError, null, `第 ${failAt} 条失败后，下一次正常挂载不该撞 duplicate exact route（改前必须重启 DSH）：`);
+      eq(server.table.size, 8, '正常挂载应当 8 条路由都在：');
+      for (const effect of good.effects.filter((e) => e.label === 'worktodo: http routes')) await effect.dispose?.();
+      eq(server.table.size, 0, '正常挂载卸载后同样不留残留：');
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('S1-2：storageDomain.open 永不 resolve → 超时后 apply 仍然返回并完整挂载（8 路由 / 7 工具）', async () => {
+  const previousHome = process.env.DSH_HOME;
+  const previousTimeout = process.env.WORKTODO_UPGRADE_TIMEOUT_MS;
+  const dir = mkdtempSync(join(tmpdir(), 'worktodo-host-hang-'));
+  process.env.DSH_HOME = dir;
+  process.env.WORKTODO_UPGRADE_TIMEOUT_MS = '120'; // 测试里把默认 3s 缩短（同一类测试缝）
+  try {
+    const hanging = { open: () => new Promise(() => {}) }; // 永不 resolve
+    const host = makeCtx({ storageDomain: hanging });
+    const t0 = process.hrtime.bigint();
+    let applyError = null;
+    try {
+      await apply(host.ctx, {});
+    } catch (error) {
+      applyError = error;
+    }
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    eq(applyError, null, 'open 挂住时 apply 也不能抛（要降级，而不是半死）：');
+    eq(ms < 2000, true, `apply 必须被超时兜住（改前永不返回；实际 ${ms.toFixed(0)}ms）：`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    eq(host.routes.size, 8, '超时后 8 条路由照常注册（面板可用）：');
+    eq(host.tools.length, 7, '超时后 7 个工具照常注册：');
+    eq(host.logs.some((line) => line.startsWith('warn') && line.includes('超时')), true,
+      `超时必须告警（不静默）：${host.logs.filter((l) => l.includes('storage')).join(' | ')}`);
+    const health = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json();
+    eq(health.store.kind, 'file', '超时后要降级到回退文件：');
+    eq(String(health.store.mismatch).includes('超时'), true, `health/面板要能看见超时原因：${health.store.mismatch}`);
+    const listed = await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all' });
+    eq(listed.json().ok, true, '超时后业务路由照常工作：');
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+    if (previousTimeout === undefined) delete process.env.WORKTODO_UPGRADE_TIMEOUT_MS;
+    else process.env.WORKTODO_UPGRADE_TIMEOUT_MS = previousTimeout;
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

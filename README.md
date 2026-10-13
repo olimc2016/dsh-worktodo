@@ -94,6 +94,11 @@ dsh plugin --profile desktop add dsh-worktodo
     storePath: /Users/me/notes/worktodo.json
 ```
 
+**升级后回退文件会退役**：一旦数据成功合并进官方 storage，`$DSH_HOME/worktodo/todos.json` 会被改名成
+`todos.json.migrated-<时间>`（完整存档，可随时手动查看/恢复），同目录另留一个 `todos.json.retired` 哨兵。
+退役之后官方 storage 是唯一真源：如果那套组合里没有 `storageDomain`，面板会**明确报错**（不会显示空列表冒充
+「还没有待办」），页脚也会写清「官方存储不可用 · 回退文件已退役」。
+
 ## 兼容
 
 - **DSH 0.2.x**（官方版本闸门会把锁在旧版本的插件拒掉，本插件按 0.2.0-rc.2 的 API 编写并实测）

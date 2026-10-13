@@ -81,6 +81,8 @@ export function buildEditDraft(row = {}) {
 const zh = {
   'nav': '待办',
   'title': '工作待办',
+  'panelCrashTitle': '工作待办面板出错了',
+  'panelCrashHint': '渲染这块面板时抛了异常，已在这里兜住，待办数据本身没丢。点「重试」可以重新挂载，无需重启 DSH；若反复出现，请把控制台里的完整报错发出来。',
   'statOpen': '未完成',
   'statOverdue': '逾期',
   'statToday': '今天',
@@ -98,6 +100,13 @@ const zh = {
   'storeSplit': '两处数据不一致',
   'storeError': '存储读写失败',
   'storeRetired': '回退文件已迁移并退役',
+  'storeRetiredArchive': '退役档案',
+  'storeUnavailable': '不可用',
+  'storeRetiredUnavailable': '官方存储不可用，且回退文件已退役',
+  'storeRetiredUnavailableHint': '回退文件已于 {when} 退役，本次读不到待办；档案：{archive}。请在带 storage 的组合里启动，或手动恢复该文件',
+  'storeRetiredFailed': '回退文件退役失败（文件仍在，已被排除在合并源之外）',
+  'storeRetiredFailedHint': '文件仍在 {path}：请手动改名或删除，否则它可能让已删除的待办复活',
+  'storeMergeAborted': '合并两处数据失败（已回滚，未留下半截数据）',
   'storeMergeNote': '已按 id 合并两处数据：{merged} 条（同 id 冲突 {conflicts}，补入 {added}）',
   'addPlaceholder': '加一件要做的事，回车保存',
   'add': '添加',
@@ -165,6 +174,8 @@ const zh = {
 const en = {
   'nav': 'To-dos',
   'title': 'Work to-dos',
+  'panelCrashTitle': 'Work to-dos panel crashed',
+  'panelCrashHint': 'Rendering this panel threw an exception; it is caught here and your to-dos are safe. Click Retry to remount it without restarting DSH — if it keeps happening, please share the full console error.',
   'statOpen': 'Open',
   'statOverdue': 'Overdue',
   'statToday': 'Today',
@@ -182,6 +193,13 @@ const en = {
   'storeSplit': 'Data split across two locations',
   'storeError': 'Storage read/write failed',
   'storeRetired': 'Legacy file migrated and retired',
+  'storeRetiredArchive': 'archive',
+  'storeUnavailable': 'unavailable',
+  'storeRetiredUnavailable': 'Official storage unavailable and the legacy file was retired',
+  'storeRetiredUnavailableHint': 'the legacy file was retired at {when}, so to-dos cannot be read now; archive: {archive}. Start with the storage service, or restore that file manually',
+  'storeRetiredFailed': 'Retiring the legacy file failed (it still exists and is excluded as a merge source)',
+  'storeRetiredFailedHint': 'the file is still at {path}: rename or delete it manually, otherwise it may resurrect deleted to-dos',
+  'storeMergeAborted': 'Merging the two copies failed (rolled back, nothing half-written)',
   'storeMergeNote': 'Merged both copies by id: {merged} items ({conflicts} id conflicts, {added} added)',
   'addPlaceholder': 'Add something to do — Enter saves',
   'add': 'Add',
@@ -378,6 +396,120 @@ const STYLE_TEXT = `
   border: 2px solid ${C.border}; border-top-color: ${C.brand}; animation: wt-spin .8s linear infinite;
 }
 `;
+
+/* ------------------------------------------------------------------ *
+ * 错误边界
+ *
+ * 为什么必须补：slot entry 在渲染期抛异常 = 整块面板白屏/黑屏，用户只会以为插件坏了
+ * （0.2.x 就出过一次：面板里调了当时还不存在的 dayKey）。React 的错误边界是唯一能在
+ * 运行期兜住**子组件渲染抛错**的机制，所以这里加一个类组件：
+ *   - getDerivedStateFromError：把 error 收进 state，下一帧渲染兜底 UI；
+ *   - componentDidCatch：把**原始 error 和组件栈**照原样打到 console，绝不吞错（不能因为
+ *     兜了底就把真实 bug 藏起来）；
+ *   - 「重试」：清掉 error 并把 attempt+1，keyed Fragment 换 key → 子树整体重新挂载，
+ *     用户不必重启 DSH。
+ * DOM 里只放 error.message（纯文本子节点，React 负责转义；**绝不用 innerHTML**），
+ * 堆栈只进控制台。样式全部走 --dsw-alias-* 变量，且不依赖面板那张样式表 ——
+ * 面板自己崩掉时 STYLE_TEXT 很可能根本没渲染出来。
+ * ------------------------------------------------------------------ */
+export class WorkTodoErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null, attempt: 0 };
+    this.handleRetry = this.handleRetry.bind(this);
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    // 不掩盖 bug：原始 error（含 stack）与组件栈原样输出，排查时一眼能看到真凶
+    console.error(`[${SHORT_NAME}] 面板渲染出错（已兜底，未白屏）：`, error, info?.componentStack ?? '');
+  }
+
+  /** 清掉错误状态 + 换 key：把子树整个重新挂载一次。 */
+  handleRetry() {
+    this.setState((prev) => ({ error: null, attempt: (prev?.attempt ?? 0) + 1 }));
+  }
+
+  render() {
+    const state = this.state ?? {};
+    if (!state.error) {
+      // key 变化 → React 卸载旧子树、按新实例挂载（重试走的就是这条路）
+      return React.createElement(
+        React.Fragment,
+        { key: `wt-eb-${state.attempt ?? 0}` },
+        this.props?.children ?? null,
+      );
+    }
+    // 拿不到宿主注入的 t 时退回本模块的 zh 字典（同一份文案），再不行才显示 key 本身
+    const injected = typeof this.props?.t === 'function' ? this.props.t : null;
+    const t = injected ?? ((key) => zh[key] ?? key);
+    // 只取摘要：error 可能是任何东西，message 缺失就留空，绝不 String(error) 把堆栈带进 DOM
+    const detail = state.error?.message
+      ? String(state.error.message)
+      : (typeof state.error === 'string' ? state.error : '');
+    return React.createElement('div', {
+      className: 'wt-root wt-crash',
+      role: 'alert',
+      style: {
+        height: '100%', overflow: 'auto', boxSizing: 'border-box',
+        padding: '18px 18px 32px', color: C.label, fontSize: 13, lineHeight: 1.7,
+        fontFamily: 'var(--dsw-font-family, system-ui, sans-serif)',
+      },
+    }, [
+      React.createElement('div', {
+        key: 'title',
+        style: { fontWeight: 650, fontSize: 14, color: C.error, wordBreak: 'break-word' },
+      }, t('panelCrashTitle')),
+      detail
+        ? React.createElement('div', {
+          key: 'detail',
+          style: {
+            marginTop: 8, padding: '6px 9px', borderRadius: 8, fontSize: 12,
+            color: C.label2, wordBreak: 'break-word',
+            border: `1px solid ${tint(C.error, 45)}`, background: tint(C.error, 12),
+          },
+        }, detail)
+        : null,
+      React.createElement('div', {
+        key: 'hint',
+        style: { marginTop: 8, fontSize: 11.5, color: C.label3 },
+      }, t('panelCrashHint')),
+      injected
+        ? null
+        : React.createElement('div', {
+          key: 'en',
+          style: { marginTop: 4, fontSize: 11, color: C.label3 },
+        }, 'Work to-dos panel crashed — click Retry to remount it.'),
+      React.createElement('button', {
+        key: 'retry',
+        type: 'button',
+        className: 'wt-btn wt-btn-primary',
+        style: {
+          marginTop: 12, font: 'inherit', fontSize: 12, lineHeight: 1.6, padding: '4px 12px',
+          borderRadius: 8, cursor: 'pointer',
+          border: `1px solid ${tint(C.brand, 50)}`, color: C.brand, background: tint(C.brand, 10),
+        },
+        onClick: this.handleRetry,
+      }, t('retry')),
+    ]);
+  }
+}
+
+/**
+ * 把一个 slot 组件包进错误边界。
+ *
+ * 选在 `apply()` 注册处包（而不是改组件内部）：面板与侧栏两个入口一处收口，
+ * 组件本体保持纯净、不新增嵌套层级，测试里也还能直接拿到「未包的组件」做反向验证；
+ * 这是侵入最小的做法。`t` 从 slot props 透传给边界，让兜底文案跟随宿主语言。
+ */
+function withErrorBoundary(Component) {
+  return function WorkTodoEntry(props) {
+    return React.createElement(WorkTodoErrorBoundary, { t: props?.t }, React.createElement(Component, props));
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * 图标：纯 React.createElement('svg', ...) 自绘，颜色一律 currentColor，
@@ -1101,7 +1233,10 @@ function fillTemplate(text, vars) {
  *
  * `mismatch`（后端不一致）、`split`（两处数据不一致）、`backendError`（当前后端读写失败）
  * 是**必须让用户看见**的三条：它们意味着「你看到的可能不是全部数据」。
- * `retired`（回退文件已退役）与 `merge`（最近一次合并）是信息性的，解释「数据被搬去哪了」。
+ * `retired`（回退文件已退役）与 `merge`（最近一次合并）正常情况下是信息性的，
+ * 但有两种形态必须升级成 warn（复审 0.2.2 F1/F3）：
+ *   - 已退役 **且** 官方存储不可用：面板此时看不到任何待办，这条告警是唯一的解释；
+ *   - 退役改名失败（`retired.error`）：必须显示失败原因与处理建议，绝不能说「已迁移并退役」。
  *
  * @param {object} store `/list` 载荷里的 store（= 宿主的 describe()）
  * @param {(key: string) => string} t 文案函数
@@ -1110,22 +1245,81 @@ function fillTemplate(text, vars) {
 export function storeAlerts(store, t) {
   if (!store || typeof store !== 'object') return [];
   const alerts = [];
+  const retired = store.retired;
+  const retiredKnown = Boolean(retired?.path || retired?.movedTo);
   if (store.mismatch) alerts.push({ key: 'mismatch', tone: 'warn', text: `${t('storeMismatch')}：${store.mismatch}` });
   if (store.split) alerts.push({ key: 'split', tone: 'warn', text: `${t('storeSplit')}：${store.split}` });
   if (store.backendError) alerts.push({ key: 'backendError', tone: 'warn', text: `${t('storeError')}：${store.backendError}` });
-  const retiredTo = store.retired?.movedTo ?? store.retired?.path;
-  if (retiredTo) alerts.push({ key: 'retired', tone: 'info', text: `${t('storeRetired')}：${retiredTo}` });
-  const merge = store.merge;
-  if (merge && Number.isFinite(merge.merged)) {
+  // 复审 0.2.2 F3：rename 失败时**只**能说「失败 + 原因 + 建议」，且原错误不能丢
+  if (retired?.error) {
     alerts.push({
-      key: 'merge',
-      tone: 'info',
-      text: fillTemplate(t('storeMergeNote'), {
-        merged: merge.merged, conflicts: merge.conflicts ?? 0, added: merge.added ?? 0,
-      }),
+      key: 'retiredFailed',
+      tone: 'warn',
+      text: `${t('storeRetiredFailed')}：${retired.error}。`
+        + fillTemplate(t('storeRetiredFailedHint'), { path: retired.path ?? '' }),
+    });
+  } else if (retired?.movedTo) {
+    alerts.push({ key: 'retired', tone: 'info', text: `${t('storeRetired')}：${retired.movedTo}` });
+  }
+  // 复审 0.2.2 F1：退役 + 官方存储不可用 = 看不到待办；面板此时**只**剩下这条解释。
+  // 放在最后，保证 `retiredUnavailable` 是这一组里最醒目的一行。
+  const domainUnavailable = Boolean(retiredKnown
+    && (typeof store.domainUnavailable === 'boolean' ? store.domainUnavailable : store.kind !== 'domain'));
+  if (domainUnavailable) {
+    const when = Number.isFinite(retired?.at) ? new Date(retired.at).toLocaleString() : '此前';
+    const archive = retired.movedTo ?? retired.marker ?? retired.path ?? '';
+    alerts.push({
+      key: 'retiredUnavailable',
+      tone: 'warn',
+      text: `${t('storeRetiredUnavailable')}：${fillTemplate(t('storeRetiredUnavailableHint'), { when, archive })}`,
     });
   }
+  const merge = store.merge;
+  if (merge && Number.isFinite(merge.merged)) {
+    if (merge.aborted) {
+      // 合并中途失败并已回滚：这是必须让用户看见的失败，不是信息
+      alerts.push({ key: 'mergeAborted', tone: 'warn', text: `${t('storeMergeAborted')}：${merge.writeError ?? ''}` });
+    } else {
+      alerts.push({
+        key: 'merge',
+        tone: 'info',
+        text: fillTemplate(t('storeMergeNote'), {
+          merged: merge.merged, conflicts: merge.conflicts ?? 0, added: merge.added ?? 0,
+        }),
+      });
+    }
+  }
   return alerts;
+}
+
+/**
+ * 页脚「存储位置」那一行要显示什么。
+ *
+ * 复审 0.2.2 F1/F3：只要句柄知道回退文件已退役，就**不能**把那个路径当作存储位置显示
+ * （它可能根本不存在）。此时数据在官方存储：
+ *   - 官方后端可用 → 「官方 storage · 回退文件已迁移并退役 · 档案 <movedTo>」；
+ *   - 官方后端不可用 → 额外写「不可用」，与 warn 告警互相印证。
+ * 退役失败（文件还在原地）时只显示**确认存在**的哨兵路径，不显示那个半退役的原文件。
+ * @param {object} store
+ * @param {(key: string) => string} t
+ * @returns {string|null}
+ */
+export function storeLocationLabel(store, t) {
+  if (!store || typeof store !== 'object') return null;
+  const retired = store.retired;
+  const retiredKnown = Boolean(retired?.path || retired?.movedTo);
+  if (retiredKnown) {
+    const domainReady = typeof store.domainUnavailable === 'boolean'
+      ? !store.domainUnavailable
+      : store.kind === 'domain';
+    const confirmed = retired.movedTo ?? retired.marker;
+    const archive = confirmed ? ` · ${t('storeRetiredArchive')} ${confirmed}` : '';
+    const state = domainReady ? t('storeDomain') : `${t('storeDomain')} · ${t('storeUnavailable')}`;
+    return `${t('storeAt')} · ${state} · ${t('storeRetired')}${archive}`;
+  }
+  if (!store.location) return null;
+  const kind = store.kind === 'domain' ? t('storeDomain') : t('storeFile');
+  return `${t('storeAt')} · ${kind} · ${store.location}`;
 }
 
 function WorkTodoPanel(props) {
@@ -1499,12 +1693,12 @@ function WorkTodoPanel(props) {
           }, `${t('updateAvailable')} v${update.latest}`)
           : null,
       ]),
-      store && store.location
+      storeLocationLabel(store, t)
         ? React.createElement('div', {
           key: 'store',
-          title: `${t('storeAt')}：${store.location}`,
+          title: storeLocationLabel(store, t),
           style: { wordBreak: 'break-all' },
-        }, `${t('storeAt')} · ${store.kind === 'domain' ? t('storeDomain') : t('storeFile')} · ${store.location}`)
+        }, storeLocationLabel(store, t))
         : null,
       /* 复审 R4/R5：describe() 里的告警必须在面板上**看得见**，不能只躺在 /health 的 JSON 里 */
       ...storeAlerts(store, t).map((alert) => React.createElement('div', {
@@ -1528,18 +1722,19 @@ export function apply(ctx) {
   ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh, en }), `${LOCALE_NS}: dictionaries`);
 
   // 侧栏入口（id 必须与 main 面板的 key 同名，sidebar 用它去选中面板）
+  // 同样包错误边界：图标渲染抛错也不该把整个 sidebar 入口打崩
   ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
     name: 'sidebar.panellist',
     id: SLOT_ID,
     order: 88,
     label: () => '待办',
     locale: LOCALE_NS,
-  }, (props) => React.createElement(WorkTodoIcon, { size: props?.size ?? 16, active: props?.active })));
+  }, withErrorBoundary((props) => React.createElement(WorkTodoIcon, { size: props?.size ?? 16, active: props?.active }))));
 
-  // 中栏独立面板
+  // 中栏独立面板（外面包一层错误边界：渲染抛错时给中文兜底 + 重试，而不是整块白屏）
   ctx.slots.inject('main', () => ctx.slots.register({
     name: 'main',
     key: SLOT_ID,
     locale: LOCALE_NS,
-  }, WorkTodoPanel));
+  }, withErrorBoundary(WorkTodoPanel)));
 }

@@ -23,7 +23,9 @@
  *      此后既不读它也不镜像它 —— 只写一次的「快照镜像」会让用户已删除的待办在下一次合并时复活。
  */
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
+} from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { repairRecord, repairStoreDocument } from './schema.mjs';
@@ -34,6 +36,29 @@ const TABLE_NAME = 'todos';
 
 /** 后端升级失败后的重试节流（同一个服务对象）：避免每个请求都重试 + 刷日志。 */
 const UPGRADE_RETRY_MS = 5000;
+
+/**
+ * 挂载路径上等待官方 storage 打开的上限（S1-2，第四轮审计）：
+ * `storageDomain.open()` 永不 resolve 时，`apply()` 也永不返回 —— 面板 404、工具全无，
+ * 而且没有任何超时/告警。超过这个时间就按「官方存储暂不可用」降级到回退文件并告警。
+ * 官方 open 正常是本地文件 IO（毫秒级），3 秒对正常路径毫无影响。
+ * 测试可用 `WORKTODO_UPGRADE_TIMEOUT_MS` 覆盖（与 WORKTODO_TEST_FAULT 同一类测试缝）。
+ */
+const UPGRADE_TIMEOUT_MS = 3000;
+
+/** 实际生效的超时（测试可注入更短的值；非法值一律回落到默认）。 */
+function upgradeTimeoutMs() {
+  const injected = Number(process.env.WORKTODO_UPGRADE_TIMEOUT_MS);
+  return Number.isFinite(injected) && injected > 0 ? injected : UPGRADE_TIMEOUT_MS;
+}
+
+/** 每个回退文件最多保留几份 `.bak-`（超出的老备份会被清掉，复审 0.2.2 F9）。 */
+const MAX_BACKUPS = 2;
+
+/** 统一的错误消息取值（模块级：createDomainBackend 的 open 后清理也用它）。 */
+function messageOf(error) {
+  return String(error?.message ?? error);
+}
 
 /**
  * 解析 DSH 家目录：优先官方 @deepseek-ai/dsh-home-paths（与整个 harness 同一套规则：
@@ -84,6 +109,40 @@ function backupFile(path, logger) {
   } catch (error) {
     logger?.warn?.(`备份 ${path} 失败：${error?.message ?? error}`);
     return null;
+  }
+}
+
+/**
+ * 列出某个文件的所有 `.bak-<时间>` 备份（按文件名＝时间递增排序）。
+ * @param {string} path
+ * @returns {string[]} 绝对/相对路径列表
+ */
+function listBackups(path) {
+  try {
+    return readdirSync(dirname(path))
+      .filter((name) => name.startsWith(`${basename(path)}.bak-`))
+      .sort()
+      .map((name) => join(dirname(path), name));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 只保留最近 `keep` 份 `.bak-` 备份（复审 0.2.2 F9：失败重试 + 面板 30s 轮询会无限堆积）。
+ * 删除失败只记日志，绝不影响合并/退役流程。
+ * @param {string} path
+ * @param {object} [logger]
+ * @param {number} [keep]
+ */
+function pruneBackups(path, logger, keep = MAX_BACKUPS) {
+  const backups = listBackups(path);
+  for (const stale of backups.slice(0, Math.max(0, backups.length - keep))) {
+    try {
+      rmSync(stale, { force: true });
+    } catch (error) {
+      logger?.warn?.(`清理旧备份 ${stale} 失败：${error?.message ?? error}`);
+    }
   }
 }
 
@@ -258,6 +317,41 @@ function createFileBackend({ path, logger }) {
         return true;
       });
     },
+    /**
+     * 只改 `order` 的批量写（S3-1/S3-2/S4-1）。
+     *
+     * 为什么必须单独有这个方法：旧 `reorder` 逐条 `put(整条旧记录)`，每次 `put` 都要
+     * 读整个文件 + 原子重写整个文件 —— 1000 条就是 1000 次整文件读 + 1000 次整文件写
+     *（实测 3.9s / 404 MiB，事件循环全程冻结），而且写的是**读时刻的快照**，
+     * 会静默覆盖拖拽期间另一窗口改的 title/priority。
+     *
+     * 这里在一个写队列任务里只读一次、只写一次，并且**基于刚读到的最新记录**只 patch
+     * `order` 一个字段：并发写入的其它字段原样保留；没有任何 order 需要改时完全不碰磁盘。
+     * @param {string[]} ids 新的完整顺序（ids[i] 的记录得到 order=i）
+     * @returns {Promise<{updated: number}>}
+     */
+    async updateOrder(ids) {
+      return enqueue(() => {
+        const position = new Map((ids ?? []).map((id, index) => [id, index]));
+        if (!position.size) return { updated: 0 };
+        const read = readDoc();
+        const doc = read.damaged ? emptyDoc() : read.doc;
+        let updated = 0;
+        const todos = doc.todos.map((record) => {
+          if (!record?.id || !position.has(record.id)) return record;
+          const order = position.get(record.id);
+          if (record.order === order) return record;
+          updated += 1;
+          return { ...record, order }; // 只 patch order，绝不整条覆盖
+        });
+        if (!updated) return { updated: 0 };
+        protectBeforeWrite(read);
+        doc.todos = todos;
+        doc.updatedAt = Date.now();
+        writeAtomic(path, serializeDoc(doc)); // 整批一次原子写（读 1 次 / 写 1 次）
+        return { updated };
+      });
+    },
     /** 整份替换：合并两处数据后把回退文件同步成同一份并集（保证再次降级也不会看到旧数据）。 */
     async replaceAll(records) {
       return enqueue(() => {
@@ -295,9 +389,39 @@ async function createDomainBackend({ storageDomain, ctx, logger }) {
     invalidRecords: 'backup-and-skip',
   });
   const domain = await storageDomain.open(spec);
-  const table = domain.table(TABLE_NAME);
-  logger?.info?.(`待办数据使用官方 storage（领域 ${DOMAIN_NAME}）`);
+  // ⚠️ S2-1（第四轮审计）：open() 成功之后的任何一步抛出（`table()` 抛、日志抛、
+  // 构造后端时抛）都会让这个已经打开的领域句柄变成孤儿——`acquireDomain` 会把注册表项
+  // 删掉，`domainEntry` 从未被赋值，`store.close()` 里 `releaseDomain(null)` 什么也不做。
+  // 此后每次升级都撞官方 `already-open`，进程永远停在回退文件后端。
+  // 所以 open 之后的所有步骤都必须包在 try 里，失败先 close 再抛。
+  let table;
+  let backend;
+  try {
+    table = domain.table(TABLE_NAME);
+    logger?.info?.(`待办数据使用官方 storage（领域 ${DOMAIN_NAME}）`);
+    backend = createDomainHandle({ domain, table, ctx, logger });
+  } catch (error) {
+    try {
+      await domain.close();
+      logger?.warn?.(`官方 storage 领域 ${DOMAIN_NAME} 打开后又失败，已释放句柄（不会留下 already-open）：${messageOf(error)}`);
+    } catch (closeError) {
+      logger?.warn?.(`释放打不开的领域 ${DOMAIN_NAME} 句柄失败：${messageOf(closeError)}`);
+    }
+    throw error;
+  }
+  return backend;
+}
 
+/**
+ * 由已打开的官方领域句柄构造后端对象（独立出来是为了让 `createDomainBackend` 里
+ * 「open 之后的步骤」都能被同一个 try/catch 罩住，见 S2-1）。
+ * @param {object} options
+ * @param {object} options.domain 官方 open() 返回的句柄
+ * @param {object} options.table 领域表句柄
+ * @param {object} [options.ctx]
+ * @param {object} [options.logger]
+ */
+function createDomainHandle({ domain, table, ctx, logger }) {
   return {
     kind: 'domain',
     location: `storage:${DOMAIN_NAME}/${TABLE_NAME}`,
@@ -311,6 +435,38 @@ async function createDomainBackend({ storageDomain, ctx, logger }) {
     },
     async remove(id) {
       return Boolean(await table.delete(id));
+    },
+    /**
+     * 只改 `order` 的批量写（S3-1/S3-2/S4-1）：对每条记录做「读当前值 → 只 patch order → 写回」，
+     * 绝不整条覆盖，所以并发窗口里改动的 title/priority/其它字段都会保留。
+     * 优先用官方 KvTableImpl.update(key, fn)（在领域自己的写链内完成读-改-写）；
+     * 老版本没有它时退化为 get + put（仍有极小窗口，但只影响顺序，不会丢字段）。
+     */
+    async updateOrder(ids) {
+      const position = new Map((ids ?? []).map((id, index) => [id, index]));
+      if (!position.size) return { updated: 0 };
+      const keys = new Set();
+      for (const [key] of table.entries()) keys.add(key);
+      let updated = 0;
+      for (const key of keys) {
+        if (!position.has(key)) continue;
+        const order = position.get(key);
+        const current = typeof table.get === 'function' ? table.get(key) : undefined;
+        if (!current || current.order === order) continue;
+        if (typeof table.update === 'function') {
+          try {
+            await table.update(key, (record) => ({ ...record, order }));
+          } catch (error) {
+            // 并发删除：这一条跳过，其余照常（不因为一条消失就让整次拖拽失败）
+            if (String(error?.message ?? error).includes('has no record')) continue;
+            throw error;
+          }
+        } else {
+          await table.put(key, repairRecord({ ...current, order }));
+        }
+        updated += 1;
+      }
+      return { updated };
     },
     /**
      * 订阅领域变更：agent 通过工具改了列表，面板可以据此刷新。
@@ -415,6 +571,141 @@ async function releaseDomain(entry) {
 }
 
 /**
+ * 带超时地取得领域句柄（S1-2，第四轮审计）。
+ *
+ * 为什么必须有超时：官方 `open()` 正常是本地文件 IO（毫秒级），但只要它变慢或挂住
+ *（后端实现问题、$DSH_HOME 在 NFS/网络盘、domain 内部死锁），`apply()` 就永远不返回 ——
+ * 面板永远 404、工具永远不出现，而且没有任何超时/告警。`openWorkTodoStore` 是在
+ * **挂载路径**上 await 它的，所以这里必须兜住。
+ *
+ * 竞态安全：超时后如果那个 open 又成功了，句柄不能泄漏（否则后续挂载永远撞 `already-open`，
+ * 这正是 S2-1 的形态）。所以晚到的 entry 会立刻 `releaseDomain` 归还（close + 摘注册表）。
+ * @param {{storageDomain: object, ctx?: object, logger?: object}} options
+ * @returns {Promise<object>} entry
+ */
+async function acquireDomainWithTimeout(options) {
+  const timeoutMs = upgradeTimeoutMs();
+  let timedOut = false;
+  const pending = acquireDomain(options).then(
+    (entry) => {
+      if (!timedOut) return entry;
+      // 超时之后才打开成功：立刻归还句柄，绝不留在注册表里毒化后续挂载
+      void releaseDomain(entry).catch(() => {});
+      return null;
+    },
+    (error) => {
+      // 超时之后才失败：错误已经作为超时上报过，这里必须吞掉，否则是未处理 rejection
+      if (timedOut) return null;
+      throw error;
+    },
+  );
+  let timer = null;
+  const expired = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      resolve(null);
+    }, timeoutMs);
+  });
+  try {
+    const entry = await Promise.race([pending, expired]);
+    if (timedOut || !entry) {
+      const error = new Error(`打开官方 storage 超过 ${timeoutMs}ms 仍未完成（open 可能挂住）`);
+      error.code = 'STORAGE_OPEN_TIMEOUT';
+      throw error;
+    }
+    return entry;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 把回退文件改名退役（唯一一处真正会动的文件操作），带一个显式的测试故障注入点。
+ *
+ * 为什么要留注入点（复审 0.2.2 F3）：ESM 的 `node:fs` 命名空间是冻结的，测试无法替换
+ * `renameSync`，而「改名失败」正是必须保证「不显示成功、不复活已删项」的那条路径。
+ * 注入只在显式设置 `WORKTODO_TEST_FAULT=retire-rename` 时生效，生产路径零影响。
+ * @param {string} from
+ * @param {string} to
+ */
+function renameRetireFile(from, to) {
+  if (process.env.WORKTODO_TEST_FAULT === 'retire-rename') {
+    const error = new Error(`EACCES: permission denied, rename '${from}' -> '${to}'（注入）`);
+    error.code = 'EACCES';
+    throw error;
+  }
+  renameSync(from, to);
+}
+
+/**
+ * 退役哨兵文件路径：`<回退文件>.retired`。
+ *
+ * 为什么需要它（复审 0.2.2 F1/F3）：
+ *   1. 「回退文件已退役」是**持久事实**，不能只在「本进程成功合并 + 成功改名」之后才知道。
+ *      旧实现里 rename 失败 → 下次启动完全不知道这个文件已经不该再当数据源，
+ *      已删除的待办会随下一次并集复活；而「已退役 + 官方存储不在组合里」时
+ *      面板还会显示空列表 + 零告警（用户真机上文件已经退役，这是真实场景）。
+ *   2. rename **之前**先写哨兵：即使改名一直失败，下次启动也会知道「这个文件已不是真源」。
+ * @param {string} path 回退文件路径
+ */
+function retiredMarkerPath(path) {
+  return `${path}.retired`;
+}
+
+/**
+ * 写退役哨兵（JSON，人能直接看）。失败只记日志：哨兵丢了还有 `.migrated-*` 兄弟文件兜底。
+ * @param {string} path
+ * @param {{at: number, path: string, movedTo: string|null, backup: string|null, error: string|null, alreadyRetired: boolean, note: string}} info
+ * @param {object} [logger]
+ * @returns {string|null} 哨兵路径；写失败返回 null
+ */
+function writeRetiredMarker(path, info, logger) {
+  const marker = retiredMarkerPath(path);
+  const { alreadyRetired, ...rest } = info;
+  try {
+    writeAtomic(marker, `${JSON.stringify({ version: 1, retiredFile: path, ...rest, alreadyRetired: true }, null, 2)}\n`);
+    return marker;
+  } catch (error) {
+    logger?.warn?.(`写退役标记 ${marker} 失败：${error?.message ?? error}`);
+    return null;
+  }
+}
+
+/**
+ * 读退役哨兵；没有就返回 null。
+ * @param {string} path
+ * @returns {object|null}
+ */
+function readRetiredMarker(path) {
+  const marker = retiredMarkerPath(path);
+  if (!existsSync(marker)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(marker, 'utf8'));
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    // 哨兵坏了也等于「这里曾经退役过」：数据在官方存储，绝不能把这个文件当数据源
+    return {};
+  }
+}
+
+/**
+ * 从「目录里只有 `.migrated-*`，没有回退文件」推断退役事实（旧版本退役后没有哨兵）。
+ * @param {string} path
+ * @returns {string|null} 最新的 `.migrated-*` 路径；没找到返回 null
+ */
+function findMigratedSibling(path) {
+  try {
+    const siblings = readdirSync(dirname(path))
+      .filter((entry) => entry.startsWith(`${basename(path)}.migrated-`))
+      .sort();
+    return siblings.length ? join(dirname(path), siblings[siblings.length - 1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 按 id 取并集：同 id 取 `updatedAt` 较新的那条；时间相同则保留 preferred 里的那条。
  * @param {object[]} preferred 首选后端里的记录
  * @param {object[]} incoming 另一处后端里的记录
@@ -475,8 +766,20 @@ function createResilientStore({ ctx, logger }) {
     upgrades: 0,
     // 升级成功后回退文件的退役信息（复审 R1：退役后它既不是数据源也不是镜像）
     retired: null,
+    // 当前用的是哪个后端（'file' | 'domain' | null）—— 必须显式记，
+    // 不能靠 `state.retired` 是否存在来推断（复审 0.2.2 F1：退役 + 官方存储不可用
+    // 时，旧写法会让面板显示空列表且零告警）
+    backendUsable: 'file',
     // 当前后端最近一次读/写失败的原因（复审 R1 第 3 条：出错要显式报，不静默换源）
     backendError: null,
+    // 同一个「故障轮次」里已经备份过的文件（S2-2：同一次故障只复制一份，
+    // 不再靠 5 秒时间窗——那个窗口与 UPGRADE_RETRY_MS 相等，重试常常刚好落在窗外）
+    backups: {
+      merge: { path: null, dest: null, at: 0, size: -1 },
+      retire: { path: null, dest: null, at: 0, size: -1 },
+    },
+    // 每个 slot 是否处在「一次尚未恢复的故障」里：成功一次就复位
+    backupFault: { merge: false, retire: false },
   };
   let current = null;
   let ownedFile = null;
@@ -490,7 +793,6 @@ function createResilientStore({ ctx, logger }) {
   const home = async () => (homePromise ??= resolveDshHome());
   const fallbackPath = async () => join(await home(), 'worktodo', 'todos.json');
   const officialPath = async () => join(await home(), 'storages', `${DOMAIN_NAME}.json`);
-  const messageOf = (error) => String(error?.message ?? error);
 
   const emit = (change) => {
     for (const listener of listeners) {
@@ -506,6 +808,142 @@ function createResilientStore({ ctx, logger }) {
     current = backend;
     state.kind = backend.kind;
     state.location = backend.location;
+    state.backendUsable = backend.kind;
+  }
+
+  /**
+   * 备份一个文件，并记住「哪个文件 → 哪份备份 → 多大」。
+   *
+   * **同一次故障只备份一次**（S2-2，第四轮审计）：`state.backupFault[slot]` 标记
+   * 「这个 slot 正处在一次尚未恢复的故障里」——只要还在故障里，且路径与大小都没变，
+   * 就复用第一份备份；只有成功一次（合并成功 / 退役成功）才复位，下一次独立故障才重新备份。
+   *
+   * 为什么把时间窗换掉：旧实现用 `BACKUP_REUSE_MS(5000)` 时间窗，而升级重试节流
+   * `UPGRADE_RETRY_MS` 也是 5000 —— 重试周期常常刚好落在复用窗口之外，于是每一轮失败重试
+   * 都 `copyFileSync` 一整份文件（复制完马上被轮转删掉）：持续故障下每小时约 1214 MiB 读、
+   * 607 MiB 备份复制、1440 条 warn。故障轮次标记与时间无关，不会漏。
+   *
+   * 文件大小变了仍然重新备份（真正的数据保护：备份必须对应那一刻的内容），
+   * 并顺手把超过 MAX_BACKUPS 的老备份清掉。
+   * @param {'merge'|'retire'} slot
+   * @param {string} path
+   * @returns {string|null}
+   */
+  function recordBackup(slot, path) {
+    if (!path || !existsSync(path)) return null;
+    let size = -1;
+    try {
+      size = statSync(path).size;
+    } catch {
+      size = -1;
+    }
+    const previous = state.backups[slot];
+    if (state.backupFault[slot]
+      && previous.path === path
+      && previous.dest
+      && previous.size === size
+      && size >= 0
+      && existsSync(previous.dest)) {
+      return previous.dest;
+    }
+    const dest = backupFile(path, logger);
+    state.backups[slot] = { path, dest, at: Date.now(), size };
+    state.backupFault[slot] = true;
+    if (dest) pruneBackups(path, logger);
+    return dest;
+  }
+
+  /** 故障恢复：下一次独立故障可以重新备份（S2-2）。 */
+  function clearBackupFault(slot) {
+    state.backupFault[slot] = false;
+  }
+
+  /**
+   * 启动时判断「回退文件是否已经退役」（只看磁盘，不写任何东西）。
+   *
+   * 两个来源（复审 0.2.2 F1）：
+   *   1. 退役哨兵 `<path>.retired`：进程内退役或上次退役时写的，是**权威**事实；
+   *   2. 旧版本只留下 `.migrated-*` 兄弟、原路径不存在：同样说明「数据在官方存储」。
+   *
+   * `hadFile` 用于区分「全新安装，什么都没有」和「曾经有文件、后来退役了」——
+   * 前者不是退役，面板说什么都不合适。
+   * @param {string} path
+   * @returns {{retired: object|null, hadFile: boolean}}
+   */
+  function detectRetiredState(path) {
+    const hadFile = existsSync(path);
+    const markerPath = retiredMarkerPath(path);
+    const markerExists = existsSync(markerPath);
+    const marker = readRetiredMarker(path);
+
+    if (marker) {
+      return {
+        hadFile,
+        retired: {
+          at: Number(marker.at) || Date.now(),
+          path,
+          movedTo: typeof marker.movedTo === 'string' ? marker.movedTo : null,
+          backup: typeof marker.backup === 'string' ? marker.backup : null,
+          error: typeof marker.error === 'string' ? marker.error : null,
+          // 走到这里就说明「是上一次运行退役的」：不要再被哨兵里 pending 时的 false 覆盖
+          alreadyRetired: true,
+          marker: markerExists ? markerPath : null,
+          note: typeof marker.note === 'string' && marker.note
+            ? marker.note
+            : `回退文件已退役；当前数据只以官方 storage 为准`,
+        },
+      };
+    }
+
+    if (!hadFile) {
+      const movedTo = findMigratedSibling(path);
+      if (movedTo) {
+        return {
+          hadFile: false,
+          retired: {
+            at: Date.now(),
+            path,
+            movedTo,
+            backup: null,
+            error: null,
+            alreadyRetired: true,
+            marker: null,
+            note: `回退文件此前已迁移并退役，路径=${movedTo}；当前数据只以官方 storage 为准`,
+          },
+        };
+      }
+    }
+
+    return { retired: null, hadFile };
+  }
+
+  /**
+   * 退役后的唯一真源是官方 storage。官方领域服务不在组合里（或打开失败）时，
+   * **绝不能**静默返回空列表 —— 那会让用户以为待办全没了（复审 0.2.2 F1，真机上文件已退役）。
+   *
+   * 返回 true = 当前状态不可用，本实例只应报错、不应读那个已退役的文件。
+   * 注意：文件因为改名失败还在原地时，也走这条路径 —— 它已经**不是**真源，
+   * 再拿它当合并源正是「已删除的待办复活」的入口（复审 0.2.2 F3）。
+   */
+  function ensureRetiredFallbackReadable() {
+    if (!state.retired || state.backendUsable === 'domain') return false;
+    const when = new Date(state.retired.at).toISOString();
+    const archive = state.retired.movedTo ?? state.retired.marker ?? state.retired.path;
+    // 先记进 state（describe/health 立刻可见），再抛给调用方走既有失败路径
+    state.mismatch = `官方存储不可用，且回退文件已于 ${when} 退役（${state.retired.path}）`
+      + `；本次无法读取待办（档案：${archive}）。请在带 storage 的组合里启动，或手动恢复这个文件`;
+    if (!state.backendError) {
+      state.backendError = state.mismatch;
+      logger?.warn?.(`⚠️ ${state.mismatch}`);
+    }
+    return true;
+  }
+
+  /** 退役 + 官方存储不可用时的统一错误（load/put/remove 都走这条失败路径）。 */
+  function retiredUnavailableError() {
+    const error = new Error(state.mismatch ?? '官方存储不可用，且回退文件已退役');
+    error.code = 'RETIRED_FALLBACK_UNAVAILABLE';
+    return error;
   }
 
   /**
@@ -518,65 +956,92 @@ function createResilientStore({ ctx, logger }) {
    *   退役后 domain 是唯一真源，文件不再有机会当 source，也不会长期落后。
    *
    * 文件名带时间戳，等于同时保留了「迁移时的完整存档」，用户可以手动查看/恢复。
-   * 退役失败（极少见：目录权限等）只报警告：官方 storage 里的数据是安全的，
-   * 但要提醒用户手动处理，否则那个文件仍可能在下一次合并时把已删项补回来。
+   *
+   * 复审 0.2.2 的两条修正：
+   *   F3：**先把退役哨兵写下来**再改名。rename 失败时文件虽然还在原地，但它已经
+   *       「被判定退役」——下次启动不会再把它当合并源，已删除的待办也就不会复活；
+   *       面板文案是 warn + 原始错误 + 处理建议，绝不说「已迁移并退役」。
+   *   F8：只有 `renameSync` 在 try 里。成功分支的记账/日志放到 try 外面，
+   *       免得 `logger.info` 之类抛错被 catch 误报成「退役失败」。
    */
   function retireFallbackFile() {
     if (state.retired) return state.retired;
     const path = ownedFile?.location;
     if (!path) return null;
 
-    if (!existsSync(path)) {
-      // 文件本来就不存在（全新安装，或上一次运行已经退役过）：只做信息性报告
-      let movedTo = null;
-      try {
-        const siblings = readdirSync(dirname(path))
-          .filter((entry) => entry.startsWith(`${basename(path)}.migrated-`))
-          .sort();
-        if (siblings.length) movedTo = join(dirname(path), siblings[siblings.length - 1]);
-      } catch { /* 目录读不到就不报这条信息，不影响升级 */ }
-      if (movedTo) {
-        state.retired = {
-          at: Date.now(),
-          path,
-          movedTo,
-          backup: null,
-          alreadyRetired: true,
-          note: `回退文件此前已迁移并退役，路径=${movedTo}；当前数据只以官方 storage 为准`,
-        };
-      }
+    const hadFile = existsSync(path);
+    const marker = retiredMarkerPath(path);
+
+    if (!hadFile) {
+      // 文件本来就不存在：识别「此前已退役」（`.migrated-*` 兄弟）并顺手补一个哨兵。
+      // 全新安装什么都不留，state.retired 保持 null。
+      const found = findMigratedSibling(path);
+      if (!found) return state.retired;
+      const info = {
+        at: Date.now(),
+        path,
+        movedTo: found,
+        backup: null,
+        error: null,
+        alreadyRetired: true,
+        note: `回退文件此前已迁移并退役，路径=${found}；当前数据只以官方 storage 为准`,
+      };
+      if (!existsSync(marker)) writeRetiredMarker(path, info, logger);
+      state.retired = { ...info, marker: existsSync(marker) ? marker : null };
       return state.retired;
     }
 
-    // 合并时已经备份过这个文件（内容是镜像前的原样），直接复用，避免同秒内再复制一份
-    // 把「合并前」的备份盖掉；`.migrated-` 改名本身也会把整份文件保留下来。
-    const backup = state.merge?.backups?.find((p) => p.startsWith(`${path}.bak-`))
-      ?? backupFile(path, logger);
+    const backup = recordBackup('retire', path);
     const dest = uniqueSibling(`${path}.migrated-${fileStamp()}`);
+
+    // 1. 先落哨兵：从这一刻起这个文件不再是数据源（即使下面 rename 失败）
+    const pending = {
+      at: Date.now(),
+      path,
+      movedTo: null,
+      backup,
+      error: null,
+      alreadyRetired: false,
+      note: `回退文件已判定退役，等待改名到 ${dest}`,
+    };
+    writeRetiredMarker(path, pending, logger);
+
+    // 2. 再改名。只有这一步的失败才算「退役失败」
+    let renameError = null;
     try {
-      renameSync(path, dest);
+      renameRetireFile(path, dest);
+    } catch (error) {
+      renameError = error;
+    }
+
+    if (renameError) {
       state.retired = {
-        at: Date.now(),
-        path,
-        movedTo: dest,
-        backup,
-        alreadyRetired: false,
-        note: `已把回退文件迁移并退役，路径=${dest}`,
+        ...pending,
+        error: messageOf(renameError),
+        marker: existsSync(marker) ? marker : null,
+        note: `回退文件退役失败（${messageOf(renameError)}）：${path} 仍然存在`,
       };
+      // 也把失败写进哨兵：下次启动照样知道它不是数据源
+      writeRetiredMarker(path, state.retired, logger);
+      logger?.warn?.(`⚠️ ${state.retired.note}；官方 storage 里的数据不受影响；`
+        + `该文件已被排除在合并源之外（不会把已删除的待办补回来），请手动改名或删除它`
+        + (backup ? `；退役前备份：${backup}` : ''));
+      return state.retired;
+    }
+
+    state.retired = {
+      ...pending,
+      movedTo: dest,
+      note: `已把回退文件迁移并退役，路径=${dest}`,
+      marker: existsSync(marker) ? marker : null,
+    };
+    writeRetiredMarker(path, state.retired, logger);
+    clearBackupFault('retire'); // 退役成功（S2-2）：下一次独立故障可以重新备份
+    // 日志在 try 之外（F8）：日志抛错也不能把「退役成功」说成失败
+    try {
       logger?.info?.(`${state.retired.note}${backup ? `（退役前备份：${backup}）` : ''}；`
         + '此后待办数据只以官方 storage 为准，这个文件不会再被读写作数据源');
-    } catch (error) {
-      state.retired = {
-        at: Date.now(),
-        path,
-        movedTo: null,
-        backup,
-        error: messageOf(error),
-        note: `回退文件退役失败（${messageOf(error)}）：${path} 仍然存在`,
-      };
-      logger?.warn?.(`⚠️ ${state.retired.note}；官方 storage 里的数据不受影响，`
-        + '但请手动把该文件改名或删除，否则下一次合并可能把已删除的待办补回来');
-    }
+    } catch { /* 日志不该影响数据路径 */ }
     return state.retired;
   }
 
@@ -599,17 +1064,31 @@ function createResilientStore({ ctx, logger }) {
 
     let entry;
     try {
-      entry = await acquireDomain({ storageDomain: service, ctx, logger });
+      entry = await acquireDomainWithTimeout({ storageDomain: service, ctx, logger });
     } catch (error) {
-      state.mismatch = `首选官方 storage（领域 ${DOMAIN_NAME}）但打开失败：${messageOf(error)}；当前仍在使用 JSON 文件 ${ownedFile?.location ?? '?'}`;
+      const timedOut = error?.code === 'STORAGE_OPEN_TIMEOUT';
+      state.mismatch = timedOut
+        ? `首选官方 storage（领域 ${DOMAIN_NAME}）但打开超时（>${upgradeTimeoutMs()}ms）：官方存储暂不可用，本次降级用回退文件；`
+          + (existsSync(ownedFile?.location ?? '')
+            ? `当前仍在使用 JSON 文件 ${ownedFile?.location ?? '?'}`
+            : `回退文件已退役/不存在，本次列表为空（官方 storage 里仍有数据，稍后会自动重试打开）`)
+        : `首选官方 storage（领域 ${DOMAIN_NAME}）但打开失败：${messageOf(error)}；`
+          + (existsSync(ownedFile?.location ?? '')
+            ? `当前仍在使用 JSON 文件 ${ownedFile?.location ?? '?'}`
+            : `回退文件已退役/不存在，本次列表为空（官方 storage 里仍有数据，打开失败原因见上）`);
       logger?.warn?.(`⚠️ ${state.mismatch}`);
       return false;
     }
 
     try {
-      await mergeInto(entry.backend);
+      // 回退文件已退役（含 rename 失败但已写哨兵的情况）：它**不是**数据源，
+      // 绝不能把它并进 domain —— 那个文件可能落后，并集会把用户已删除的待办复活（复审 0.2.2 F3）。
+      if (!state.retired) await mergeInto(entry.backend);
     } catch (error) {
-      state.mismatch = `官方 storage 已就绪，但合并两处数据失败：${messageOf(error)}；当前仍在使用 JSON 文件 ${ownedFile?.location ?? '?'}`;
+      state.mismatch = `官方 storage 已就绪，但合并两处数据失败：${messageOf(error)}；`
+        + (existsSync(ownedFile?.location ?? '')
+          ? `当前仍在使用 JSON 文件 ${ownedFile?.location ?? '?'}`
+          : `回退文件已退役/不存在，本次列表为空`);
       logger?.warn?.(`⚠️ ${state.mismatch}`);
       await releaseDomain(entry);
       return false;
@@ -649,15 +1128,24 @@ function createResilientStore({ ctx, logger }) {
   function reportBackendError(operation, error) {
     state.backendError = `当前后端（${current?.kind ?? '?'}）${operation}失败：${messageOf(error)}`
       + (state.retired
-        ? `；回退文件已在升级时退役（${state.retired.movedTo ?? state.retired.path}），不会静默改用它`
+        ? `；回退文件已退役（${state.retired.movedTo ?? state.retired.path}），不会静默改用它`
         : '');
     logger?.warn?.(`⚠️ ${state.backendError}`);
   }
 
-  /** 所有公开读/写都先确保后端就绪，再执行；成功清掉错误标记，失败显式上报。 */
+  /**
+   * 所有公开读/写都先确保后端就绪，再执行；成功清掉错误标记，失败显式上报。
+   *
+   * 复审 0.2.2 F12：升级检查（`refreshBackend`）原来在 try 之外，它抛出的任何异常
+   * 会绕开 `backendError` 直接冒给调用方（`init()` 里没有兜底 → `apply()` 挂载失败，
+   * 工具与路由全没）。这里把「确保就绪」也纳入同一个 try，并保证 `current` 一定有值：
+   * 任何异常都变成显式错误状态，而不是让插件挂不上。
+   */
   async function currentOp(operation, run) {
-    await refreshBackend();
     try {
+      await refreshBackend();
+      if (!current) throw new Error('待办存储未初始化完成（后端不可用）');
+      if (ensureRetiredFallbackReadable()) throw retiredUnavailableError();
       const result = await run(current);
       state.backendError = null;
       return result;
@@ -670,24 +1158,76 @@ function createResilientStore({ ctx, logger }) {
   /**
    * 把当前后端（正常是 JSON 文件）里的记录与官方 storage 里的记录按 id 合并，
    * 写回官方 storage；动手前备份两个落盘文件。
+   *
+   * 复审 0.2.2 F2：合并必须对目标端「全有或全无」。旧实现逐条 `put`，中途失败就
+   * 在 domain 留下半截数据；用户随后在文件侧删掉的那条，会在 domain 恢复后
+   * 被下一次并集**复活**。这里的做法是：
+   *   1. 写之前先把所有记录过一遍 `repairRecord`（schema 类确定性失败挡在写之前）；
+   *   2. 记下每条 key 合并前的值（不存在 = undefined）；
+   *   3. 中途失败 → 逐条恢复到「合并前」（新增的删掉、覆盖过的写回原值），
+   *      并把失败原因一并报出来（回滚本身失败也不吞掉原始错误）。
    */
   async function mergeInto(target) {
     const source = current;
     const sourceRecords = (await source.load()) ?? [];
     const targetRecords = (await target.load()) ?? [];
 
-    // 备份两个后端的落盘文件（存在才备份，原文件不动）
+    // 备份两个后端的落盘文件（存在才备份，原文件不动；同一轮内复用，复审 F9）
     const backups = [];
     const seen = new Set();
     for (const candidate of [ownedFile?.location, await officialPath()]) {
       if (!candidate || seen.has(candidate)) continue;
       seen.add(candidate);
-      const backup = backupFile(candidate, logger);
+      const backup = recordBackup('merge', candidate);
       if (backup) backups.push(backup);
     }
 
     const { todos, conflicts, added } = unionById(targetRecords, sourceRecords);
-    for (const record of todos) await target.put(record);
+    // 1. 全量校验：schema 拒绝之类的确定性失败绝不能留下半截写入
+    const records = todos.map((record) => repairRecord(record));
+
+    // 2. 逐条写，同时记住合并前的值，失败时全部还原
+    const previous = new Map(targetRecords.filter((record) => record?.id).map((record) => [record.id, record]));
+    const writeErrors = [];
+    for (const record of records) {
+      try {
+        await target.put(record);
+      } catch (error) {
+        writeErrors.push(`${record.id}：${messageOf(error)}`);
+        break;
+      }
+    }
+
+    if (writeErrors.length) {
+      const rollbackErrors = [];
+      for (const record of records) {
+        try {
+          if (previous.has(record.id)) await target.put(previous.get(record.id));
+          else await target.remove(record.id);
+        } catch (error) {
+          rollbackErrors.push(`${record.id}：${messageOf(error)}`);
+        }
+      }
+      state.merge = {
+        at: Date.now(),
+        from: source.kind,
+        into: target.kind,
+        merged: 0,
+        conflicts,
+        added,
+        backups,
+        mirror: null,
+        mirrorError: null,
+        aborted: true,
+        writeError: writeErrors.join('；'),
+        rollbackError: rollbackErrors.length ? rollbackErrors.join('；') : null,
+      };
+      const rollbackNote = rollbackErrors.length
+        ? `；回滚也有 ${rollbackErrors.length} 条失败（${rollbackErrors.join('；')}），目标端可能仍有本次残留`
+        : '；已回滚到合并前状态（目标端没有留下半截数据）';
+      logger?.warn?.(`⚠️ 合并两处待办失败：${state.merge.writeError}${rollbackNote}`);
+      throw new Error(`合并写入失败：${state.merge.writeError}${rollbackNote}`);
+    }
 
     // 退役前把回退文件写成同一份并集：这样 `.migrated-<时间>` 里留下的是一份
     // **完整的迁移存档**（用户随时能查/能恢复），而不是升级那一刻的半截快照。
@@ -697,7 +1237,7 @@ function createResilientStore({ ctx, logger }) {
     let mirrorError = null;
     if (source.kind === 'file' && sourceRecords.length) {
       try {
-        await source.replaceAll(todos);
+        await source.replaceAll(records);
         mirror = source.location;
       } catch (error) {
         mirrorError = String(error?.message ?? error);
@@ -709,37 +1249,52 @@ function createResilientStore({ ctx, logger }) {
       at: Date.now(),
       from: source.kind,
       into: target.kind,
-      merged: todos.length,
+      merged: records.length,
       conflicts,
       added,
       backups,
       mirror,
       mirrorError,
     };
-    logger?.info?.(`已按 id 合并两处待办（${source.kind} → ${target.kind}）：合并后 ${todos.length} 条`
+    clearBackupFault('merge'); // 故障恢复（S2-2）：下一次独立故障可以重新备份
+    logger?.info?.(`已按 id 合并两处待办（${source.kind} → ${target.kind}）：合并后 ${records.length} 条`
       + `（同 id 冲突 ${conflicts} 条取 updatedAt 较新者；从另一处补入 ${added} 条）`
       + (backups.length ? `；备份：${backups.join('、')}` : '；无需备份'));
     return state.merge;
   }
 
-  /** 当前用回退文件、但官方 storage 文件里已有数据 → 明确报出「两处数据不一致」。 */
+  /**
+   * 当前用回退文件、但官方 storage 文件里已有数据 → 明确报出「两处数据不一致」。
+   *
+   * 复审 0.2.2 F1：**本地为空不等于健康**。旧实现在 `localIds.size === 0` 时直接 return，
+   * 于是「回退文件已退役（或被清空）而官方 storage 里有 N 条」这种最需要告警的状态
+   * 反而零输出。现在空列表照样报告，并且区分「文件不存在/已退役」与「文件在但为空」。
+   */
   async function detectSplit() {
     const official = await officialPath();
     const officialIds = readStoredIds(official);
     if (!officialIds || !officialIds.size) return;
     let local = [];
+    let localError = null;
     try {
       local = (await ownedFile.load()) ?? [];
-    } catch {
-      return;
+    } catch (error) {
+      localError = messageOf(error);
     }
     const localIds = new Set(local.map((record) => record.id));
-    if (!localIds.size) return;
     const onlyOfficial = [...officialIds].filter((id) => !localIds.has(id));
     const onlyLocal = [...localIds].filter((id) => !officialIds.has(id));
-    if (!onlyOfficial.length && !onlyLocal.length) return;
-    state.split = `官方 storage 文件里 ${officialIds.size} 条、回退文件里 ${localIds.size} 条；`
-      + `官方独有 ${onlyOfficial.length} 条、文件独有 ${onlyLocal.length} 条（两处 id 不完全一致）`;
+    const fileExists = existsSync(ownedFile?.location ?? '');
+    if (localIds.size && !onlyOfficial.length && !onlyLocal.length) return;
+    const localState = localError
+      ? `回退文件读不出来（${localError}）`
+      : (fileExists
+        ? `回退文件里 ${localIds.size} 条`
+        : (state.retired
+          ? `回退文件已于 ${new Date(state.retired.at).toISOString()} 退役，原路径不存在`
+          : '回退文件不存在'));
+    state.split = `官方 storage 文件里 ${officialIds.size} 条、${localState}；`
+      + `官方独有 ${onlyOfficial.length} 条、文件独有 ${onlyLocal.length} 条（本次列表为空/不完整）`;
     logger?.warn?.(`⚠️ 检测到两处待办数据不一致：${state.split}。`
       + 'storageDomain 服务就绪后会自动按 id 合并，不会丢记录；在此之前面板只显示回退文件里的那部分');
   }
@@ -747,12 +1302,27 @@ function createResilientStore({ ctx, logger }) {
   async function init() {
     const path = await fallbackPath();
     ownedFile = createFileBackend({ path, logger });
+    // 先认「这个文件是否已经退役」（只看磁盘）：这一步必须在 tryUpgrade 之前，
+    // 因为退役事实决定了「官方存储不可用时能不能读这个文件」（复审 0.2.2 F1）
+    const { retired } = detectRetiredState(path);
+    if (retired) state.retired = retired;
     adopt(ownedFile);
-    const upgraded = await tryUpgrade({ force: true });
+    // F12：init 里的升级必须有兜底 —— 「首次升级抛异常」原来会让 openWorkTodoStore
+    // reject，进而让 apply() 挂载失败（工具与路由全没，历史事故类别）。失败降级为显式状态。
+    let upgraded = false;
+    try {
+      upgraded = await tryUpgrade({ force: true });
+    } catch (error) {
+      state.mismatch = `启动时升级官方 storage 失败：${messageOf(error)}；本次先用 JSON 文件 ${path}`;
+      state.backendError = state.mismatch;
+      logger?.warn?.(`⚠️ ${state.mismatch}`);
+    }
     if (!upgraded) {
       logger?.info?.(`待办数据使用 JSON 文件：${path}`);
       await detectSplit();
     }
+    // 退役 + 官方存储不可用：这里就把状态摆明（面板页脚与 /health 都要能看见）
+    ensureRetiredFallbackReadable();
   }
 
   return {
@@ -766,6 +1336,23 @@ function createResilientStore({ ctx, logger }) {
     },
     async remove(id) {
       return currentOp('删除', (backend) => backend.remove(id));
+    },
+    /**
+     * 只改 `order` 的批量写（S3-1/S3-2/S4-1）：交给当前后端在一次读-改-写周期里完成，
+     * 文件后端 = 读 1 次 + 原子写 1 次（不再是 N 次整文件重写），domain 后端 = 逐条在写链里 patch。
+     * 取消/加载失败走与其它写操作一致的显式错误路径。
+     * @param {string[]} ids 新的完整顺序
+     * @returns {Promise<{updated: number}>}
+     */
+    async updateOrder(ids) {
+      return currentOp('排序', (backend) => {
+        if (typeof backend.updateOrder !== 'function') {
+          const error = new Error('当前存储后端不支持只改排序字段的批量写');
+          error.code = 'ORDER_UNSUPPORTED';
+          throw error;
+        }
+        return backend.updateOrder(ids);
+      });
     },
     /** 变更订阅：文件后端下没有事件（永远不触发）；升级到 domain 后由领域事件驱动。 */
     onChanged(listener) {
@@ -789,6 +1376,9 @@ function createResilientStore({ ctx, logger }) {
         retired: state.retired,
         // 复审 R1：当前后端出错时显式上报（不再有「静默换源」这种可能）
         backendError: state.backendError,
+        // 复审 0.2.2 F1：退役 + 官方存储不可用必须能被面板一眼判定
+        backendUsable: state.backendUsable,
+        domainUnavailable: Boolean(state.retired) && state.backendUsable !== 'domain',
       };
     },
     async close() {

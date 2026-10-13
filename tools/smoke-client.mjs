@@ -11,7 +11,7 @@
  * import 任何 @deepseek-ai/dsh-client-* 包（它们不保证兼容、会随时改），
  * 所以这里把「require 了别的东西」直接判为失败，而不是默默放行。
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -46,6 +46,17 @@ function eq(actual, expected, hint = '') {
   const a = JSON.stringify(actual);
   const b = JSON.stringify(expected);
   if (a !== b) throw new Error(`${hint}期望 ${b}，实际 ${a}`);
+}
+
+/**
+ * 严格同一性断言。`eq` 走 JSON.stringify，对函数会双双变成 undefined —— 用它比较组件
+ * 类型等于没比，所以「注册处包的确实是这个边界类」必须走这里。
+ */
+function same(actual, expected, hint = '') {
+  if (actual !== expected) {
+    const name = (value) => (typeof value === 'function' ? (value.name || 'anonymous') : String(value));
+    throw new Error(`${hint}期望 ${name(expected)}，实际 ${name(actual)}`);
+  }
 }
 
 /** 少数用例需要等一个真实微/宏任务（例如首屏 fetch 落地后再重渲染）。 */
@@ -128,12 +139,32 @@ globalThis.setInterval = (fn, ms) => {
 };
 globalThis.clearInterval = (handle) => { clearedIntervals.push(handle); };
 
+/** 类组件的基类替身：错误边界要 `extends React.Component` 并调 setState。 */
+class StubComponent {
+  constructor(props) {
+    this.props = props ?? {};
+    this.state = {};
+    this.context = {};
+  }
+
+  setState(patch) {
+    const next = typeof patch === 'function' ? patch(this.state) : patch;
+    this.state = { ...(this.state ?? {}), ...(next ?? {}) };
+  }
+
+  forceUpdate() {}
+}
+
 /** 极简 React 替身：让首屏渲染与首次请求真的跑起来，但不做重渲染。 */
 const stubReact = {
   createElement(type, props, ...children) {
     rendered.push(typeof type === 'string' ? type : (type?.name ?? 'component'));
-    return { type, props: props ?? {}, children };
+    // 与 React 对齐：children 同时进 props.children（错误边界读 this.props.children）
+    const merged = { ...(props ?? {}) };
+    if (children.length) merged.children = children.length === 1 ? children[0] : children;
+    return { type, props: merged, children };
   },
+  Component: StubComponent,
   Fragment: 'Fragment',
   memo: (c) => c,
   forwardRef: (c) => c,
@@ -157,6 +188,64 @@ const stubReact = {
   useTransition: () => [false, (fn) => fn?.()],
   useId: () => 'stub-id',
 };
+
+/* ------------------------------------------------------------------ *
+ * 迷你渲染器
+ *
+ * 替身 React 只做 createElement：以前测试靠**直接调用**函数组件来渲染。
+ * 但错误边界的前提是「父组件在渲染期捕获子组件抛错」，这件事只有真的把树渲染
+ * 一遍才验证得了，所以这里补一个最小渲染器：函数组件直接调用；类组件 new 出来
+ * 调 render；子渲染抛错时按 React 的语义走 getDerivedStateFromError →
+ * componentDidCatch → 用兜底 UI 重渲染。它只服务测试，不进 bundle。
+ * ------------------------------------------------------------------ */
+function renderInstance(instance) {
+  const type = instance.constructor;
+  try {
+    return renderNode(instance.render());
+  } catch (error) {
+    if (typeof type.getDerivedStateFromError !== 'function') throw error;
+    instance.state = { ...(instance.state ?? {}), ...(type.getDerivedStateFromError(error) ?? {}) };
+    if (typeof instance.componentDidCatch === 'function') {
+      instance.componentDidCatch(error, { componentStack: 'stub-component-stack' });
+    }
+    return renderNode(instance.render());
+  }
+}
+
+function renderNode(node) {
+  if (Array.isArray(node)) return node.map(renderNode);
+  if (!node || typeof node !== 'object') return node;
+  const type = node.type;
+  const props = node.props ?? {};
+  if (typeof type === 'function') {
+    const isClass = Boolean(type.prototype && typeof type.prototype.render === 'function');
+    return isClass ? renderInstance(new type(props)) : renderNode(type(props));
+  }
+  // 宿主元素 / Fragment：继续往下渲染子节点（子级里的组件元素也要真的渲染出来）
+  return { ...node, children: renderNode(node.children) };
+}
+
+/**
+ * 渲染一个注册入口。注册处返回的是「错误边界包住的面板」，渲染后拿到的
+ * 仍然是原来那棵面板 DOM 树 —— 后面的断言与以前完全一致。
+ *
+ * 关键：兜底 UI 一旦出现就说明成功路径其实崩了。错误边界在生产环境负责「不白屏」，
+ * 但绝不能把烟测也一起兜绿，所以这里直接抛错（反向验证正是靠它 + same() 变红）。
+ * @param {Function} component 注册处给 slot 的组件
+ */
+function renderRegistered(component, props = {}) {
+  const tree = renderNode(component(props));
+  const nodes = flattenTree(tree);
+  if (nodes.some((n) => String(n.props?.className ?? '').includes('wt-crash'))) {
+    throw new Error(`注册组件渲染时抛错（已被错误边界兜住）：${nodes.map(textOf).join(' ').slice(0, 200)}`);
+  }
+  return tree;
+}
+
+/** 渲染主面板（= 错误边界 + WorkTodoPanel）。 */
+function renderPanel(props = {}) {
+  return renderRegistered(main.component, props);
+}
 
 /** 记录 fetch 调用，并给面板一份可用的假数据。 */
 const fetchCalls = [];
@@ -260,18 +349,41 @@ test('bundle 只 require react（没有偷偷依赖 Harness 客户端包）', ()
   eq(unexpected, []);
 });
 
-test('bundle 是这个 src/client 的产物（改了 src 忘了 build 必须红，复审 R3）', () => {
+test('bundle 是这个 src 的产物（改了 src 忘了 build 必须红，复审 R3）', () => {
   // `verify-all.mjs` 会先 build，所以正常路径下这里必然相等；
   // 但直接跑 `node tools/smoke-client.mjs`（或 build 失败被忽略）时，这条断言会立刻抓出
   // 「浏览器里跑的其实是旧 bundle」——那是审计里最危险的假绿状态。
-  const map = JSON.parse(readFileSync(join(here, '..', 'lib', 'client.js.map'), 'utf8'));
-  const names = ['src/client/index.js', 'src/parse-due.mjs'];
+  //
+  // 复审 0.2.2 F6：**不能只比对两个写死的文件**。新增 `src/client/helper.js` 后只改它、
+  // 不 build，写死名单照样全绿，而浏览器里跑的是旧代码。这里改成遍历 sourcemap 里的
+  // **全部 `src/**` 源文件**（bundle 里有两个以上源文件，源都在 src 下），逐一比对，
+  // 并反向检查「src/client 下的文件都在 bundle 里」。
+  const root = join(here, '..');
+  const map = JSON.parse(readFileSync(join(root, 'lib', 'client.js.map'), 'utf8'));
   eq(Array.isArray(map.sourcesContent), true, 'bundle 必须带 sourcesContent（构建配置的一部分）：');
-  for (const name of names) {
-    const index = map.sources.findIndex((source) => source.replace(/\\/g, '/').endsWith(name));
-    eq(index >= 0, true, `sourcemap 里缺 ${name}：`);
-    eq(map.sourcesContent[index], readFileSync(join(here, '..', name), 'utf8'),
-      `${name} 与 bundle 里的副本不一致 —— 请重新构建（node tools/build-client.mjs）：`);
+  eq(map.sources.length, map.sourcesContent.length, 'sources 与 sourcesContent 长度必须一致：');
+
+  const sourceFiles = [];
+  map.sources.forEach((source, index) => {
+    const normalized = String(source).replace(/\\/g, '/');
+    const match = normalized.match(/(?:^|\/)(src\/.+)$/);
+    if (!match) return;
+    sourceFiles.push({ index, rel: match[1] });
+  });
+  eq(sourceFiles.length >= 2, true, `sourcemap 里应当包含多个 src 源文件，实际 ${sourceFiles.length} 个：`);
+
+  for (const { index, rel } of sourceFiles) {
+    const abs = join(root, rel);
+    eq(existsSync(abs), true, `sourcemap 指向的源文件不存在 ${rel}：`);
+    eq(map.sourcesContent[index], readFileSync(abs, 'utf8'),
+      `${rel} 与 bundle 里的副本不一致 —— 请重新构建（node tools/build-client.mjs）：`);
+  }
+
+  // 反向：src/client 下的每个源文件都必须出现在 bundle 里（新增文件没 import 也要能发现）
+  for (const name of readdirSync(join(root, 'src', 'client'))) {
+    if (!name.endsWith('.js')) continue;
+    const rel = `src/client/${name}`;
+    eq(sourceFiles.some((entry) => entry.rel === rel), true, `${rel} 没有被打进 bundle：`);
   }
 });
 
@@ -349,28 +461,29 @@ console.log('首屏渲染（白屏是这里唯一不可接受的失败）');
 
 test('主面板首屏渲染不抛异常', () => {
   rendered.length = 0;
-  const tree = main.component({});
+  // 注册处现在多包了一层错误边界，这里真的渲染一遍（成功路径的产物不变）
+  const tree = renderPanel({});
   if (!tree) throw new Error('渲染返回了空值');
   eq(rendered.length > 0, true, '应该创建出元素：');
 });
 
 test('主面板在没有 props（没有 useProjection）时也能渲染', () => {
-  main.component({ useProjection: undefined });
-  main.component({});
+  renderPanel({ useProjection: undefined });
+  renderPanel({});
 });
 
 test('主面板对 useProjection 返回空值时安全', () => {
   // 会话没有 todos 时必须只是隐藏「提升」入口，而不是崩
-  main.component({ useProjection: () => null });
-  main.component({ useProjection: () => [] });
+  renderPanel({ useProjection: () => null });
+  renderPanel({ useProjection: () => [] });
 });
 
 test('侧栏图标渲染不抛异常（active 与非 active）', () => {
   const render = typeof sidebar.component === 'function' ? sidebar.component : null;
   eq(Boolean(render), true, '侧栏入口必须是可渲染函数：');
-  render({ size: 16, active: true });
-  render({ size: 16, active: false });
-  render({});
+  renderRegistered(render, { size: 16, active: true });
+  renderRegistered(render, { size: 16, active: false });
+  renderRegistered(render, {});
 });
 
 test('渲染后确实去拉了 /worktodo/list', () => {
@@ -437,14 +550,82 @@ test('数据不一致告警必须在面板上渲染出来，不能只躺在 /hea
     merge: { merged: 3, conflicts: 1, added: 2 },
   }, t);
   const keys = alerts.map((a) => a.key);
-  eq(keys, ['mismatch', 'split', 'backendError', 'retired', 'merge'], `五条告警都要在：${JSON.stringify(keys)}`);
-  eq(alerts.filter((a) => a.tone === 'warn').length, 3, 'mismatch/split/backendError 是警告级：');
+  eq(keys, ['mismatch', 'split', 'backendError', 'retired', 'retiredUnavailable', 'merge'],
+    `六条告警都要在：${JSON.stringify(keys)}`);
+  eq(alerts.filter((a) => a.tone === 'warn').length, 4, 'mismatch/split/backendError/退役+存储不可用 是警告级：');
   eq(alerts.some((a) => a.text.includes('already open')), true, '告警要带上原始原因：');
   const mergeText = alerts.find((a) => a.key === 'merge').text;
   eq(mergeText.includes('3 条') && mergeText.includes('冲突 1') && mergeText.includes('补入 2'), true, `合并报告要填上占位符：${mergeText}`);
   eq(mergeText.includes('{merged}'), false, '占位符不能原样显示给用户：');
-  // 只有 retired 也必须能报出来（用户在面板上看得见「数据被搬去哪了」）
-  eq(mod.storeAlerts({ retired: { path: '/tmp/todos.json' } }, t).some((a) => a.text.includes('/tmp/todos.json')), true);
+  // 只有 retired、且官方存储仍在（kind=domain）→ 信息性一行，不报「不可用」
+  const healthyRetired = mod.storeAlerts({ kind: 'domain', retired: { path: '/tmp/todos.json' } }, t);
+  eq(healthyRetired.length, 0, '退役但官方存储可用时不该报警（原路径只在 path 字段里，不是展示位置）：');
+  // 复审 0.2.2 F1：退役 + 官方存储不可用 → 必须有一条 warn，把退役时间与档案写清楚
+  const unavailable = mod.storeAlerts({
+    kind: 'file',
+    location: '/tmp/todos.json',
+    domainUnavailable: true,
+    retired: { at: new Date(2026, 9, 13, 22, 6, 27).getTime(), path: '/tmp/todos.json', movedTo: null, error: null },
+  }, t);
+  eq(unavailable.map((a) => a.key), ['retiredUnavailable']);
+  eq(unavailable[0].tone, 'warn', '退役 + 官方存储不可用必须是警告级：');
+  eq(unavailable[0].text.includes('storeRetiredUnavailableHint'), true, `文案要带处理建议：${unavailable[0].text}`);
+  eq(unavailable[0].text.includes('{when}') || unavailable[0].text.includes('{archive}'), false,
+    '占位符必须被替换掉：');
+  // 复审 0.2.2 F3：rename 失败必须是「失败 + 原因 + 建议」，绝不能说「已迁移并退役」
+  const failed = mod.storeAlerts({
+    kind: 'domain',
+    retired: { path: '/tmp/todos.json', movedTo: null, error: 'EPERM: operation not permitted, rename' },
+  }, t);
+  eq(failed.map((a) => a.key), ['retiredFailed']);
+  eq(failed[0].tone, 'warn', '退役失败必须是警告级：');
+  eq(failed[0].text.includes('EPERM'), true, `原始错误不能丢：${failed[0].text}`);
+  eq(failed[0].text.includes('storeRetiredFailedHint'), true, '要给出「文件仍在，请手动改名或删除」的建议：');
+  eq(failed.some((a) => a.key === 'retired'), false, '失败时绝不能再说「已迁移并退役」：');
+  // 合并被中止（已回滚）也要有 warn
+  const aborted = mod.storeAlerts({ kind: 'file', merge: { merged: 0, aborted: true, writeError: 'wt-b：disk full' } }, t);
+  eq(aborted.map((a) => a.key), ['mergeAborted']);
+  eq(aborted[0].tone, 'warn', '半截合并被中止必须是警告级：');
+  eq(aborted[0].text.includes('disk full'), true, '中止原因要显示出来：');
+});
+
+test('页脚存储位置：已退役时不得把不存在的回退文件当存储位置（复审 0.2.2 F1/F3）', () => {
+  eq(typeof mod.storeLocationLabel, 'function', '面板应当导出存储位置文案函数：');
+  const t = (key) => key;
+  // 正常：官方 storage
+  const domain = mod.storeLocationLabel({ kind: 'domain', location: 'storage:worktodo/todos' }, t);
+  eq(domain.includes('storage:worktodo/todos'), true, `官方后端要显示位置：${domain}`);
+  // 正常：JSON 文件
+  const file = mod.storeLocationLabel({ kind: 'file', location: '/tmp/todos.json' }, t);
+  eq(file.includes('/tmp/todos.json'), true, `文件后端要显示位置：${file}`);
+  // 已退役 + 官方存储可用：说「数据在官方存储」，把档案当附注，**不**把原路径当存储位置
+  const retired = mod.storeLocationLabel({
+    kind: 'domain',
+    domainUnavailable: false,
+    retired: { at: Date.now(), path: '/tmp/todos.json', movedTo: '/tmp/todos.json.migrated-20261013-220627' },
+  }, t);
+  eq(retired.includes('storeDomain'), true, `要说明数据在官方存储：${retired}`);
+  eq(retired.includes('storeUnavailable'), false, '官方存储可用时不能说不可用：');
+  eq(retired.includes('/tmp/todos.json.migrated-20261013-220627'), true, `要显示退役档案路径：${retired}`);
+  // 已退役 + 官方存储不可用：明确说「不可用」
+  const down = mod.storeLocationLabel({
+    kind: 'file',
+    location: '/tmp/todos.json',
+    domainUnavailable: true,
+    retired: { at: Date.now(), path: '/tmp/todos.json', movedTo: null, marker: '/tmp/todos.json.retired' },
+  }, t);
+  eq(down.includes('storeUnavailable'), true, `官方存储不可用必须写出来：${down}`);
+  eq(down.includes('/tmp/todos.json.retired'), true, `要给出确认存在的哨兵路径：${down}`);
+  // 退役失败（没有 movedTo / marker）时，不能把原路径当存储位置显示
+  const failedLabel = mod.storeLocationLabel({
+    kind: 'domain',
+    location: '/tmp/todos.json',
+    domainUnavailable: false,
+    retired: { at: Date.now(), path: '/tmp/todos.json', movedTo: null, error: 'EPERM' },
+  }, t);
+  eq(failedLabel.includes('/tmp/todos.json'), false, `退役失败时不能把原路径当存储位置：${failedLabel}`);
+  // 什么都没有时返回 null（不渲染这一行）
+  eq(mod.storeLocationLabel({ kind: 'domain', location: null }, t), null);
 });
 
 test('卸载时清掉定时器与窗口监听（审计 F7：面板切走后不能一直打宿主）', () => {
@@ -467,7 +648,7 @@ await testAsync('真渲染一次带告警的面板：页脚里确实出现了告
   store.split = '官方 2 条 / 文件 1 条（两处 id 不完全一致）';
   store.retired = { movedTo: '/tmp/todos.json.migrated-20261013-193439' };
   store.merge = { merged: 3, conflicts: 1, added: 2 };
-  const tree = main.component({});
+  const tree = renderPanel();
   const nodes = flattenTree(tree);
   const warns = nodes.filter((n) => String(n.props?.className ?? '').includes('wt-store-alert-warn'));
   eq(warns.length, 2, `mismatch 与 split 必须各渲染一行告警：${warns.length}`);
@@ -475,6 +656,128 @@ await testAsync('真渲染一次带告警的面板：页脚里确实出现了告
   eq(allText.includes('already open'), true, '页脚要显示不一致的原始原因：');
   eq(allText.includes('.migrated-'), true, '页脚要显示退役文件路径（数据被搬去哪了）：');
   eq(allText.includes('{merged}'), false, '页脚不能出现未替换的占位符：');
+});
+
+await testAsync('退役 + 官方存储不可用：面板页脚必须渲染出警告与「数据在官方存储」（复审 0.2.2 F1）', async () => {
+  const store = fakeListPayload.data.store;
+  // 模拟宿主 describe()：回退文件已退役，官方存储不可用，列表为空
+  store.kind = 'file';
+  store.location = '/tmp/wt-local/worktodo/todos.json';
+  store.domainUnavailable = true;
+  store.mismatch = '官方存储不可用，且回退文件已于 2026-10-13T14:06:27.000Z 退役';
+  store.split = null;
+  store.backendError = '当前后端（file）读取失败：官方存储不可用';
+  store.retired = {
+    at: new Date(2026, 9, 13, 22, 6, 27).getTime(),
+    path: '/tmp/wt-local/worktodo/todos.json',
+    movedTo: null,
+    marker: '/tmp/wt-local/worktodo/todos.json.retired',
+    error: null,
+  };
+  store.merge = null;
+  const tree = renderPanel();
+  const nodes = flattenTree(tree);
+  const warns = nodes.filter((n) => String(n.props?.className ?? '').includes('wt-store-alert-warn'));
+  eq(warns.length >= 2, true, `mismatch/backendError 与「退役 + 存储不可用」都要有 warn：${warns.length}`);
+  const allText = nodes.map(textOf).join('\n');
+  eq(allText.includes('官方存储不可用，且回退文件已退役'), true, `页脚必须出现「退役 + 官方存储不可用」告警：${allText}`);
+  eq(allText.includes('不可用'), true, '页脚存储位置要写「官方 storage · 不可用」：');
+  eq(allText.includes('/tmp/wt-local/worktodo/todos.json '), false,
+    '页脚不能把不存在的回退文件当存储位置：');
+  eq(allText.includes('/tmp/wt-local/worktodo/todos.json.retired'), true, '页脚要给出退役哨兵/档案路径：');
+  // 收尾：恢复 fixture，避免影响别的用例
+  store.kind = 'domain';
+  store.location = 'storage:worktodo/todos';
+  store.domainUnavailable = false;
+  store.mismatch = null;
+  store.backendError = null;
+  store.retired = null;
+  store.split = null;
+});
+
+console.log('错误边界（渲染抛错不能再整块白屏）');
+
+test('主面板与侧栏入口都注册在错误边界里（摘掉边界这条必红）', () => {
+  same(typeof mod.WorkTodoErrorBoundary, 'function', '应当导出错误边界类组件：');
+  const panelEntry = main.component({});
+  same(panelEntry?.type, mod.WorkTodoErrorBoundary, '主面板注册处必须被错误边界包住：');
+  same(typeof panelEntry?.props?.children?.type, 'function', '边界里包的应当是可渲染的面板组件：');
+  const sidebarEntry = sidebar.component({ size: 16, active: true });
+  same(sidebarEntry?.type, mod.WorkTodoErrorBoundary, '侧栏入口注册处必须被错误边界包住：');
+});
+
+test('边界捕获子组件抛错：中文兜底 + error.message 摘要，且堆栈绝不进 DOM', () => {
+  // 构造一个「渲染必定抛错」的子组件，塞进注册处同一个位置的错误边界里
+  let explode = true;
+  function ExplodingPanelChild() {
+    if (explode) {
+      const boom = new Error('子组件渲染时抛错（测试用消息）');
+      boom.name = 'ExplodingPanelChildError';
+      throw boom;
+    }
+    return stubReact.createElement('div', { className: 'wt-recovered' }, '恢复成功');
+  }
+
+  const logged = [];
+  const originalError = console.error;
+  console.error = (...args) => { logged.push(args); };
+  try {
+    const entry = main.component({});
+    same(entry?.type, mod.WorkTodoErrorBoundary, '注册处必须被错误边界包住：');
+    const boundary = new mod.WorkTodoErrorBoundary({
+      ...entry.props,
+      children: stubReact.createElement(ExplodingPanelChild),
+    });
+
+    // --- 捕获后：显示中文兜底 ---
+    const fallbackTree = renderInstance(boundary);
+    const fallbackText = flattenTree(fallbackTree).map(textOf).join('\n');
+    eq(fallbackText.includes('出错了'), true, `兜底文案必须含「出错了」：${fallbackText}`);
+    eq(fallbackText.includes('子组件渲染时抛错'), true, `必须显示 error.message 摘要：${fallbackText}`);
+    // 堆栈只能进 console：DOM 里既没有函数名，也没有堆栈帧
+    eq(fallbackText.includes('ExplodingPanelChild'), false, `DOM 里不能出现堆栈里的函数名：${fallbackText}`);
+    eq(fallbackText.includes('at '), false, `DOM 里不能出现堆栈帧：${fallbackText}`);
+    // 原始 error（含 stack）必须打到 console，不能因为兜底就把 bug 藏起来
+    eq(logged.length > 0, true, '必须留下控制台记录：');
+    eq(logged.some((args) => args.some((arg) => arg instanceof Error
+      && String(arg.stack).includes('ExplodingPanelChild'))), true,
+    'componentDidCatch 必须 console.error 原始错误（含完整堆栈）：');
+
+    // --- 点「重试」：清错误 + 换 key → 子树重新挂载 ---
+    const retry = flattenTree(fallbackTree).find((n) => n.type === 'button' && textOf(n).includes('重试'));
+    eq(Boolean(retry), true, '兜底 UI 必须有「重试」按钮：');
+    explode = false;
+    retry.props.onClick();
+    eq(boundary.state?.error ?? null, null, '重试必须清掉错误状态：');
+    eq(boundary.state?.attempt, 1, '重试必须让 attempt +1（key 变化 → 子树重新挂载）：');
+    const recoveredText = flattenTree(renderInstance(boundary)).map(textOf).join('\n');
+    eq(recoveredText.includes('恢复成功'), true, `重试后必须重新挂载并渲染成功：${recoveredText}`);
+    eq(recoveredText.includes('出错了'), false, '重试成功后不能再显示兜底 UI：');
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('边界优先用注入的 t()；拿不到 t 时退回中文 + 一行英文', () => {
+  const failed = () => {
+    const instance = new mod.WorkTodoErrorBoundary({ t: undefined, children: null });
+    instance.state = { error: new Error('boom'), attempt: 0 };
+    return flattenTree(renderInstance(instance)).map(textOf).join('\n');
+  };
+  const zhText = failed();
+  eq(zhText.includes('工作待办面板出错了'), true, `拿不到 t 时用中文兜底：${zhText}`);
+  eq(zhText.includes('Work to-dos panel crashed'), true, '拿不到 t 时补一行英文：');
+
+  const localized = new mod.WorkTodoErrorBoundary({ t: (key) => `[${key}]`, children: null });
+  localized.state = { error: new Error('boom'), attempt: 0 };
+  const localizedText = flattenTree(renderInstance(localized)).map(textOf).join('\n');
+  eq(localizedText.includes('[panelCrashTitle]'), true, `有 t 时必须走 t() 文案：${localizedText}`);
+  eq(localizedText.includes('[retry]'), true, '「重试」按钮文案也要走 t()：');
+  eq(localizedText.includes('Work to-dos panel crashed'), false, '有 t 时不该再塞硬编码英文行：');
+});
+
+test('错误信息只走文本子节点：bundle 里不存在 innerHTML', () => {
+  eq(code.includes('innerHTML'), false, '绝不能把 error.message 拼进 innerHTML：');
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);
