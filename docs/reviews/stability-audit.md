@@ -44,7 +44,7 @@ $ git status --porcelain            # 审计结束时（README 两个文件是�
 - ⚠️ **审计期间工作区在被并发编辑**（另一路修复）：`README.md`/`README.en.md` 在我开始审计后才变成 M；
   `tools/smoke-client.mjs` 也在我第一次跑测试的同一分钟内被改过。四个被审计的源码文件哈希始终未变，结论仍可追溯。
   这条也解释了一次**假红**：第一次跑 `node tools/verify-all.mjs` 时 `verify-store`/`verify-privacy` 报错
-  （`/home/worktodo` 命中），几分钟后同样命令连续 3 次全绿 —— 那次是读到了**半写**的文件，不是真失败。
+  （家目录路径规则命中），几分钟后同样命令连续 3 次全绿 —— 那次是读到了**半写**的文件，不是真失败。
   在并发编辑期间跑门禁会得到不可信的结论，建议改完一轮再跑。
   审计结束前又完整跑了一次，**10/10 全绿**（`WORKTODO_NO_UPDATE_CHECK=1 node tools/verify-all.mjs`）。
 - 环境：Node `v24.21.0`（`~/​.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node`），macOS。
