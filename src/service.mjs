@@ -52,6 +52,16 @@ function attempt(job) {
 export function createWorkTodoService({ store, clock = () => Date.now(), logger }) {
   /** 变更监听者（宿主用它做日志/未来的推送）。 */
   const listeners = new Set();
+
+  /**
+   * 存储自检信息：health 路由、`/list` 载荷（面板页脚要渲染这些告警）与 README 排查都用它。
+   * 可纠正的存储句柄会额外报出首选后端、不一致/分裂警告、最近一次合并报告与回退文件退役状态。
+   */
+  const describe = () => {
+    const base = { kind: store.kind, location: store.location };
+    return typeof store.describe === 'function' ? { ...base, ...store.describe() } : base;
+  };
+
   const emit = (change) => {
     for (const listener of listeners) {
       try {
@@ -130,7 +140,10 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
       sort: mode,
       stats: statsOf(records, now),
       today: dayKey(now),
-      store: { kind: store.kind, location: store.location },
+      // 复审 R4/R5：面板只能看到 /list 载荷，给它的必须是**完整的** describe()——
+      // 只给 {kind, location} 的话，mismatch/split/backendError/retired/merge 这些告警
+      // 永远到不了面板页脚（「数据不一致必须让用户看得见」就是断在这里的）。
+      store: describe(),
       projects: [...new Set(records.map((r) => r.project).filter(Boolean))].sort(),
     };
   }
@@ -319,10 +332,6 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
       return () => listeners.delete(listener);
     },
     /** 存储自检信息，health 路由与 README 排查都用它。 */
-    describe() {
-      const base = { kind: store.kind, location: store.location };
-      // 可纠正的存储句柄会额外报出首选后端、不一致/分裂警告与最近一次合并报告
-      return typeof store.describe === 'function' ? { ...base, ...store.describe() } : base;
-    },
+    describe,
   };
 }

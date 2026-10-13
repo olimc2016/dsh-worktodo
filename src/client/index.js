@@ -37,9 +37,12 @@ const ROUTE_LIST = `${ROUTE_BASE}/list`;
 /**
  * 面板自动刷新间隔：agent 通过 worktodo_* 工具改了列表时宿主不会推送，
  * 面板只能自己定期拉一次（以及窗口重新获得焦点时拉一次），否则用户得手点刷新才看得到。
- * 10 秒是「够快」与「别一直打宿主」之间的折中；卸载时定时器会被清掉。
+ *
+ * 复审 R4：从 10 秒放宽到 30 秒 —— 每次轮询都是一次全量 `load()`（domain 路径要遍历整张表），
+ * 10 秒一次在待办多起来时是纯浪费；用户重新聚焦窗口时那条路径会立刻补上新鲜度。
+ * 卸载时定时器与监听都会被清掉。
  */
-const CHANGE_POLL_MS = 10000;
+export const CHANGE_POLL_MS = 30000;
 
 /**
  * 编辑表单的优先级档位。`none` 必须在里面：它代表「不设优先级」这个真实状态，
@@ -91,6 +94,11 @@ const zh = {
   'storeAt': '存储位置',
   'storeDomain': '官方 storage',
   'storeFile': 'JSON 文件',
+  'storeMismatch': '存储后端不一致',
+  'storeSplit': '两处数据不一致',
+  'storeError': '存储读写失败',
+  'storeRetired': '回退文件已迁移并退役',
+  'storeMergeNote': '已按 id 合并两处数据：{merged} 条（同 id 冲突 {conflicts}，补入 {added}）',
   'addPlaceholder': '加一件要做的事，回车保存',
   'add': '添加',
   'dueLabel': '截止',
@@ -170,6 +178,11 @@ const en = {
   'storeAt': 'Stored at',
   'storeDomain': 'official storage',
   'storeFile': 'JSON file',
+  'storeMismatch': 'Storage backend mismatch',
+  'storeSplit': 'Data split across two locations',
+  'storeError': 'Storage read/write failed',
+  'storeRetired': 'Legacy file migrated and retired',
+  'storeMergeNote': 'Merged both copies by id: {merged} items ({conflicts} id conflicts, {added} added)',
   'addPlaceholder': 'Add something to do — Enter saves',
   'add': 'Add',
   'dueLabel': 'Due',
@@ -1078,6 +1091,43 @@ const GROUPS = [
   { key: 'completed', label: 'groupCompleted' },
 ];
 
+/** 极简占位符替换：`{name}` → vars[name]（面板文案的少量插值，不引第三方库）。 */
+function fillTemplate(text, vars) {
+  return String(text).replace(/\{(\w+)\}/g, (match, key) => (key in vars ? String(vars[key]) : match));
+}
+
+/**
+ * 把 `describe()` 里的存储告警整理成面板上真的能看见的几行（复审 R4/R5）。
+ *
+ * `mismatch`（后端不一致）、`split`（两处数据不一致）、`backendError`（当前后端读写失败）
+ * 是**必须让用户看见**的三条：它们意味着「你看到的可能不是全部数据」。
+ * `retired`（回退文件已退役）与 `merge`（最近一次合并）是信息性的，解释「数据被搬去哪了」。
+ *
+ * @param {object} store `/list` 载荷里的 store（= 宿主的 describe()）
+ * @param {(key: string) => string} t 文案函数
+ * @returns {{key: string, tone: 'warn'|'info', text: string}[]}
+ */
+export function storeAlerts(store, t) {
+  if (!store || typeof store !== 'object') return [];
+  const alerts = [];
+  if (store.mismatch) alerts.push({ key: 'mismatch', tone: 'warn', text: `${t('storeMismatch')}：${store.mismatch}` });
+  if (store.split) alerts.push({ key: 'split', tone: 'warn', text: `${t('storeSplit')}：${store.split}` });
+  if (store.backendError) alerts.push({ key: 'backendError', tone: 'warn', text: `${t('storeError')}：${store.backendError}` });
+  const retiredTo = store.retired?.movedTo ?? store.retired?.path;
+  if (retiredTo) alerts.push({ key: 'retired', tone: 'info', text: `${t('storeRetired')}：${retiredTo}` });
+  const merge = store.merge;
+  if (merge && Number.isFinite(merge.merged)) {
+    alerts.push({
+      key: 'merge',
+      tone: 'info',
+      text: fillTemplate(t('storeMergeNote'), {
+        merged: merge.merged, conflicts: merge.conflicts ?? 0, added: merge.added ?? 0,
+      }),
+    });
+  }
+  return alerts;
+}
+
 function WorkTodoPanel(props) {
   // t 由 locale 服务通过 slot props 注入；拿不到时退回中文，至少不显示裸 key
   const t = typeof props?.t === 'function' ? props.t : (key) => zh[key] ?? key;
@@ -1090,18 +1140,21 @@ function WorkTodoPanel(props) {
   /**
    * 跟随外部改动刷新（审计 F7：宿主的 onChanged/onChange 原来是死代码，面板只在
    * 挂载 / 切排序 / 点刷新 / 自己写操作后才拉数据，agent 用工具加了一条用户看不到）。
-   * 这里定期 + 窗口重新聚焦时拉一次；清理函数里清掉定时器与监听，卸载后不留活动引用。
+   * 这里定期 + 窗口重新聚焦 / 重新可见时拉一次；清理函数里清掉定时器与监听，卸载后不留活动引用。
+   * 复审 R4：轮询已放宽到 CHANGE_POLL_MS（30s），「重新聚焦」那条路径负责补新鲜度；
+   * `visibilitychange` 只在**变成可见**时刷新（隐藏时也刷等于白打一次宿主）。
    */
   React.useEffect(() => {
     const timer = setInterval(() => refresh(), CHANGE_POLL_MS);
     timer?.unref?.(); // Node（测试环境）里不要因为这个定时器挂住事件循环
     const onActive = () => refresh();
+    const onVisible = () => { if (document.visibilityState !== 'hidden') refresh(); };
     window?.addEventListener?.('focus', onActive);
-    if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', onActive);
+    if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', onVisible);
     return () => {
       clearInterval(timer);
       window?.removeEventListener?.('focus', onActive);
-      if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', onActive);
+      if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', onVisible);
     };
   }, [refresh]);
 
@@ -1453,6 +1506,15 @@ function WorkTodoPanel(props) {
           style: { wordBreak: 'break-all' },
         }, `${t('storeAt')} · ${store.kind === 'domain' ? t('storeDomain') : t('storeFile')} · ${store.location}`)
         : null,
+      /* 复审 R4/R5：describe() 里的告警必须在面板上**看得见**，不能只躺在 /health 的 JSON 里 */
+      ...storeAlerts(store, t).map((alert) => React.createElement('div', {
+        key: `alert-${alert.key}`,
+        className: `wt-store-alert wt-store-alert-${alert.tone}`,
+        title: alert.text,
+        style: alert.tone === 'warn'
+          ? { color: C.warn, wordBreak: 'break-word' }
+          : { color: C.label3, wordBreak: 'break-word' },
+      }, alert.text)),
     ]),
   ]);
 }

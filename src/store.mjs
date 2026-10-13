@@ -19,10 +19,12 @@
  *   2. **绝不静默切换**：当前后端与首选后端不一致、或两处都有数据时，在日志与 /health 里明确报出来；
  *   3. **合并而不是二选一**：升级时把两处记录按 id 取并集（同 id 取 updatedAt 较新者）写回首选后端，
  *      动手前把两个落盘文件都复制成 `.bak-<时间>` 备份。
+ *   4. **升级成功后回退文件退役**（0.2.1 复审 R1）：改名成 `<path>.migrated-<时间>`，
+ *      此后既不读它也不镜像它 —— 只写一次的「快照镜像」会让用户已删除的待办在下一次合并时复活。
  */
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { repairRecord, repairStoreDocument } from './schema.mjs';
 
@@ -74,7 +76,8 @@ function fileStamp(now = Date.now()) {
  */
 function backupFile(path, logger) {
   if (!existsSync(path)) return null;
-  const dest = `${path}.bak-${fileStamp()}`;
+  // 同秒内的第二次备份不能覆盖第一次（退役时的备份会盖掉「合并前」那份，见复审 R1）
+  const dest = uniqueSibling(`${path}.bak-${fileStamp()}`);
   try {
     copyFileSync(path, dest);
     return dest;
@@ -103,6 +106,19 @@ function quarantineFile(path, logger) {
     logger?.warn?.(`备份坏文件 ${path} 失败：${error?.message ?? error}`);
     return null;
   }
+}
+
+/**
+ * 找一个不冲突的兄弟路径（同秒内重复退役时用）：`<path>`、`<path>-1`、`<path>-2`…
+ * @param {string} path
+ * @returns {string}
+ */
+function uniqueSibling(path) {
+  if (!existsSync(path)) return path;
+  let n = 1;
+  let dest = `${path}-${n}`;
+  while (existsSync(dest)) dest = `${path}-${++n}`;
+  return dest;
 }
 
 /**
@@ -332,15 +348,25 @@ const domainRegistry = new WeakMap();
 
 /**
  * 取得（必要时打开）某个 storageDomain 服务上的待办领域，引用计数 +1。
+ *
+ * 「正在关闭」的哨兵（复审 R2）：卸载 → 立刻重载时，旧实例的 `close()` 可能还没跑完，
+ * 此时**不能**直接复用那个半关闭的句柄（会写到正在关闭的领域上），也**不能**立刻
+ * `open` 一个新的（会撞官方 `already-open`）。这里先等关闭落地，再从零打开。
  * @returns {Promise<{service: object, refs: number, backend: object|null}>}
  */
 async function acquireDomain({ storageDomain, ctx, logger }) {
   let entry = domainRegistry.get(storageDomain);
+  if (entry?.closing) {
+    await entry.closing.catch(() => {});
+    entry = domainRegistry.get(storageDomain);
+  }
   if (!entry) {
     entry = {
       service: storageDomain,
       refs: 0,
       backend: null,
+      closing: null,
+      logger,
       promise: createDomainBackend({ storageDomain, ctx, logger }),
     };
     domainRegistry.set(storageDomain, entry);
@@ -356,13 +382,36 @@ async function acquireDomain({ storageDomain, ctx, logger }) {
   return entry;
 }
 
-/** 释放引用；最后一个使用者关闭时才真的关领域。 */
+/**
+ * 释放引用；最后一个使用者关闭时才真的关领域。
+ *
+ * ⚠️ 顺序很重要（复审 R2）：**先 await 关闭、再摘注册表**。反过来的话，
+ * 「卸载后立刻重载」会在「已删注册表、还没关完」的窗口里撞官方 `already-open`，
+ * 从而静默降级到回退文件（用户视角就是待办全没了）。关闭失败也必须摘，
+ * 否则一个坏句柄会永远留在表里挡住后续挂载；失败只记日志，不影响卸载流程。
+ * @param {{service: object, refs: number, backend: object|null, closing: Promise<void>|null, logger?: object}} entry
+ */
 async function releaseDomain(entry) {
   if (!entry) return;
   entry.refs = Math.max(0, entry.refs - 1);
   if (entry.refs > 0) return;
-  if (domainRegistry.get(entry.service) === entry) domainRegistry.delete(entry.service);
-  await entry.backend?.close();
+  // 并发 close（多个实例同时卸载）：共用同一次关闭，不要重复关
+  if (entry.closing) return entry.closing;
+  let closeError = null;
+  entry.closing = (async () => {
+    try {
+      await entry.backend?.close();
+    } catch (error) {
+      closeError = error;
+    } finally {
+      if (domainRegistry.get(entry.service) === entry) domainRegistry.delete(entry.service);
+      entry.closing = null;
+    }
+  })();
+  await entry.closing;
+  if (closeError) {
+    entry.logger?.warn?.(`关闭待办领域失败（已从注册表摘除，后续挂载会重新打开）：${closeError?.message ?? closeError}`);
+  }
 }
 
 /**
@@ -424,6 +473,10 @@ function createResilientStore({ ctx, logger }) {
     split: null,
     merge: null,
     upgrades: 0,
+    // 升级成功后回退文件的退役信息（复审 R1：退役后它既不是数据源也不是镜像）
+    retired: null,
+    // 当前后端最近一次读/写失败的原因（复审 R1 第 3 条：出错要显式报，不静默换源）
+    backendError: null,
   };
   let current = null;
   let ownedFile = null;
@@ -432,6 +485,7 @@ function createResilientStore({ ctx, logger }) {
   let lastAttempt = { service: undefined, at: 0 };
   let upgrading = null;
   let homePromise = null;
+  let closed = false;
 
   const home = async () => (homePromise ??= resolveDshHome());
   const fallbackPath = async () => join(await home(), 'worktodo', 'todos.json');
@@ -455,10 +509,83 @@ function createResilientStore({ ctx, logger }) {
   }
 
   /**
+   * 升级成功后把回退文件**退役**：先备份（`.bak-<时间>`），再改名成 `.migrated-<时间>`。
+   *
+   * 为什么必须退役（0.2.1 复审 R1，实跑 exp8）：
+   *   `mergeInto` 只用「升级那一刻的快照」覆盖回退文件，之后 `put/remove` 全部落在 domain，
+   *   回退文件从此不再更新；而合并是**并集**（没有墓碑），于是下一次以文件为 source 的
+   *   合并（重载 / domain 重开）会把用户**已经删掉的待办复活**。
+   *   退役后 domain 是唯一真源，文件不再有机会当 source，也不会长期落后。
+   *
+   * 文件名带时间戳，等于同时保留了「迁移时的完整存档」，用户可以手动查看/恢复。
+   * 退役失败（极少见：目录权限等）只报警告：官方 storage 里的数据是安全的，
+   * 但要提醒用户手动处理，否则那个文件仍可能在下一次合并时把已删项补回来。
+   */
+  function retireFallbackFile() {
+    if (state.retired) return state.retired;
+    const path = ownedFile?.location;
+    if (!path) return null;
+
+    if (!existsSync(path)) {
+      // 文件本来就不存在（全新安装，或上一次运行已经退役过）：只做信息性报告
+      let movedTo = null;
+      try {
+        const siblings = readdirSync(dirname(path))
+          .filter((entry) => entry.startsWith(`${basename(path)}.migrated-`))
+          .sort();
+        if (siblings.length) movedTo = join(dirname(path), siblings[siblings.length - 1]);
+      } catch { /* 目录读不到就不报这条信息，不影响升级 */ }
+      if (movedTo) {
+        state.retired = {
+          at: Date.now(),
+          path,
+          movedTo,
+          backup: null,
+          alreadyRetired: true,
+          note: `回退文件此前已迁移并退役，路径=${movedTo}；当前数据只以官方 storage 为准`,
+        };
+      }
+      return state.retired;
+    }
+
+    // 合并时已经备份过这个文件（内容是镜像前的原样），直接复用，避免同秒内再复制一份
+    // 把「合并前」的备份盖掉；`.migrated-` 改名本身也会把整份文件保留下来。
+    const backup = state.merge?.backups?.find((p) => p.startsWith(`${path}.bak-`))
+      ?? backupFile(path, logger);
+    const dest = uniqueSibling(`${path}.migrated-${fileStamp()}`);
+    try {
+      renameSync(path, dest);
+      state.retired = {
+        at: Date.now(),
+        path,
+        movedTo: dest,
+        backup,
+        alreadyRetired: false,
+        note: `已把回退文件迁移并退役，路径=${dest}`,
+      };
+      logger?.info?.(`${state.retired.note}${backup ? `（退役前备份：${backup}）` : ''}；`
+        + '此后待办数据只以官方 storage 为准，这个文件不会再被读写作数据源');
+    } catch (error) {
+      state.retired = {
+        at: Date.now(),
+        path,
+        movedTo: null,
+        backup,
+        error: messageOf(error),
+        note: `回退文件退役失败（${messageOf(error)}）：${path} 仍然存在`,
+      };
+      logger?.warn?.(`⚠️ ${state.retired.note}；官方 storage 里的数据不受影响，`
+        + '但请手动把该文件改名或删除，否则下一次合并可能把已删除的待办补回来');
+    }
+    return state.retired;
+  }
+
+  /**
    * 升级到官方 storage，并把两处记录合并过去。任何一步失败都只记录不一致状态，
    * **不改变当前后端**（继续用回退文件活着，但 health/日志里明确报出来）。
    */
   async function tryUpgrade({ force = false } = {}) {
+    if (closed) return false;
     if (state.preferred !== 'domain') return false;
     if (current?.kind === 'domain') return false;
     const service = ctx?.get?.('storageDomain');
@@ -491,7 +618,13 @@ function createResilientStore({ ctx, logger }) {
     domainEntry = entry;
     domainUnsubscribe?.();
     domainUnsubscribe = entry.backend.onChanged?.(emit) ?? null;
+    // 合并成功 = 数据已经在 domain 里了：退役回退文件，让 domain 成为唯一真源（复审 R1）
+    const sourceWasFile = current?.kind === 'file';
     adopt(entry.backend);
+    if (sourceWasFile) {
+      const retired = retireFallbackFile();
+      if (retired && state.merge) state.merge.fallbackRetiredTo = retired.movedTo ?? null;
+    }
     state.mismatch = null;
     state.split = null;
     state.upgrades += 1;
@@ -501,10 +634,37 @@ function createResilientStore({ ctx, logger }) {
 
   /** 升级失败后的重试节流 + 并发去重。 */
   function refreshBackend() {
+    if (closed) return Promise.resolve(false);
     if (state.preferred !== 'domain' || current?.kind === 'domain') return Promise.resolve(false);
     if (upgrading) return upgrading;
     upgrading = tryUpgrade().finally(() => { upgrading = null; });
     return upgrading;
+  }
+
+  /**
+   * 当前后端读/写失败时的统一处理：记进 `describe()`/health 并打日志，然后**原样抛出**。
+   * 绝不因为 domain 出错就静默改用回退文件 —— 升级后那个文件已经退役（复审 R1 第 3 条），
+   * 「静默换源」正是「待办看着没了 / 已删除的又回来」的根源。
+   */
+  function reportBackendError(operation, error) {
+    state.backendError = `当前后端（${current?.kind ?? '?'}）${operation}失败：${messageOf(error)}`
+      + (state.retired
+        ? `；回退文件已在升级时退役（${state.retired.movedTo ?? state.retired.path}），不会静默改用它`
+        : '');
+    logger?.warn?.(`⚠️ ${state.backendError}`);
+  }
+
+  /** 所有公开读/写都先确保后端就绪，再执行；成功清掉错误标记，失败显式上报。 */
+  async function currentOp(operation, run) {
+    await refreshBackend();
+    try {
+      const result = await run(current);
+      state.backendError = null;
+      return result;
+    } catch (error) {
+      reportBackendError(operation, error);
+      throw error;
+    }
   }
 
   /**
@@ -529,8 +689,9 @@ function createResilientStore({ ctx, logger }) {
     const { todos, conflicts, added } = unionById(targetRecords, sourceRecords);
     for (const record of todos) await target.put(record);
 
-    // 回退文件同步成同一份并集：以后再降级也不会看到旧数据 / 复活已删条目。
-    // 注意只在「另一处真的有记录」时才回写，避免把不存在的文件凭空写出来。
+    // 退役前把回退文件写成同一份并集：这样 `.migrated-<时间>` 里留下的是一份
+    // **完整的迁移存档**（用户随时能查/能恢复），而不是升级那一刻的半截快照。
+    // 写完之后这个文件就被 `retireFallbackFile()` 改名退役，不会再被当作数据源。
     // 同步失败不影响官方 storage 里已经写好的数据，只记一行并继续升级。
     let mirror = null;
     let mirrorError = null;
@@ -598,16 +759,13 @@ function createResilientStore({ ctx, logger }) {
     get kind() { return current?.kind ?? state.kind; },
     get location() { return current?.location ?? state.location; },
     async load() {
-      await refreshBackend();
-      return current.load();
+      return currentOp('读取', (backend) => backend.load());
     },
     async put(record) {
-      await refreshBackend();
-      return current.put(record);
+      return currentOp('写入', (backend) => backend.put(record));
     },
     async remove(id) {
-      await refreshBackend();
-      return current.remove(id);
+      return currentOp('删除', (backend) => backend.remove(id));
     },
     /** 变更订阅：文件后端下没有事件（永远不触发）；升级到 domain 后由领域事件驱动。 */
     onChanged(listener) {
@@ -617,7 +775,7 @@ function createResilientStore({ ctx, logger }) {
     /** 供 apply 的 `ctx.inject(['storageDomain'])` 回调与测试主动触发升级。 */
     refreshBackend,
     init,
-    /** 存储自检：后端、位置、首选后端、不一致/分裂警告、最近一次合并报告。 */
+    /** 存储自检：后端、位置、首选后端、不一致/分裂警告、最近一次合并报告、回退文件退役状态。 */
     describe() {
       return {
         kind: current?.kind ?? state.kind,
@@ -627,16 +785,27 @@ function createResilientStore({ ctx, logger }) {
         split: state.split,
         merge: state.merge,
         upgrades: state.upgrades,
+        // 复审 R1：升级后回退文件已退役，health/面板必须能看见这件事
+        retired: state.retired,
+        // 复审 R1：当前后端出错时显式上报（不再有「静默换源」这种可能）
+        backendError: state.backendError,
       };
     },
     async close() {
+      closed = true;
       domainUnsubscribe?.();
       domainUnsubscribe = null;
       try {
         await ownedFile?.close();
       } catch { /* 关闭失败不应打断卸载 */ }
-      await releaseDomain(domainEntry);
+      // 升级可能在飞行中：等它落地再释放，否则 releaseDomain 拿不到 entry、
+      // 领域句柄会泄漏，后续挂载一直撞 already-open（复审 R4/R2）
+      try {
+        await upgrading;
+      } catch { /* 升级失败的异常已经由 tryUpgrade 自己记录 */ }
+      const entry = domainEntry;
       domainEntry = null;
+      await releaseDomain(entry);
     },
   };
 }

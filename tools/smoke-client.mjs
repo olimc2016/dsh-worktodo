@@ -48,15 +48,64 @@ function eq(actual, expected, hint = '') {
   if (a !== b) throw new Error(`${hint}期望 ${b}，实际 ${a}`);
 }
 
+/** 少数用例需要等一个真实微/宏任务（例如首屏 fetch 落地后再重渲染）。 */
+async function testAsync(label, run) {
+  try {
+    await run();
+    passed += 1;
+    console.log(`  ✓ ${label}`);
+  } catch (error) {
+    failures.push({ label, error });
+    console.log(`  ✗ ${label}\n      ${error?.message ?? error}`);
+  }
+}
+
+/** 把 React 替身造出来的树摊平，便于按 className 找节点。 */
+function flattenTree(node, out = []) {
+  if (Array.isArray(node)) {
+    for (const child of node) flattenTree(child, out);
+    return out;
+  }
+  if (!node || typeof node !== 'object') return out;
+  out.push(node);
+  flattenTree(node.children, out);
+  return out;
+}
+
+/** 取一个替身节点的纯文本（children 里可能是嵌套数组/节点）。 */
+function textOf(node) {
+  if (Array.isArray(node)) return node.map(textOf).join('');
+  if (node && typeof node === 'object') return textOf(node.children);
+  return node === null || node === undefined ? '' : String(node);
+}
+
 /* ------------------------------------------------------------------ *
  * 模拟外壳：window.__ModuleLoader__ + 基座模块表
  * ------------------------------------------------------------------ */
 
 let captured = null;
+/** window 上注册的事件监听（面板的「重新聚焦就刷新」走这里，复审 R4）。 */
+const windowListeners = new Map();
 globalThis.window = {
   __ModuleLoader__: {
     load(entry) { captured = entry; },
   },
+  addEventListener: (event, handler) => {
+    if (!windowListeners.has(event)) windowListeners.set(event, new Set());
+    windowListeners.get(event).add(handler);
+  },
+  removeEventListener: (event, handler) => windowListeners.get(event)?.delete(handler),
+};
+
+/** document 替身：面板只在这里注册 visibilitychange（复审 R4）。 */
+const documentListeners = new Map();
+globalThis.document = {
+  visibilityState: 'visible',
+  addEventListener: (event, handler) => {
+    if (!documentListeners.has(event)) documentListeners.set(event, new Set());
+    documentListeners.get(event).add(handler);
+  },
+  removeEventListener: (event, handler) => documentListeners.get(event)?.delete(handler),
 };
 
 /** 记录组件树里出现过的元素类型，方便断言「渲染确实发生了」。 */
@@ -211,6 +260,21 @@ test('bundle 只 require react（没有偷偷依赖 Harness 客户端包）', ()
   eq(unexpected, []);
 });
 
+test('bundle 是这个 src/client 的产物（改了 src 忘了 build 必须红，复审 R3）', () => {
+  // `verify-all.mjs` 会先 build，所以正常路径下这里必然相等；
+  // 但直接跑 `node tools/smoke-client.mjs`（或 build 失败被忽略）时，这条断言会立刻抓出
+  // 「浏览器里跑的其实是旧 bundle」——那是审计里最危险的假绿状态。
+  const map = JSON.parse(readFileSync(join(here, '..', 'lib', 'client.js.map'), 'utf8'));
+  const names = ['src/client/index.js', 'src/parse-due.mjs'];
+  eq(Array.isArray(map.sourcesContent), true, 'bundle 必须带 sourcesContent（构建配置的一部分）：');
+  for (const name of names) {
+    const index = map.sources.findIndex((source) => source.replace(/\\/g, '/').endsWith(name));
+    eq(index >= 0, true, `sourcemap 里缺 ${name}：`);
+    eq(map.sourcesContent[index], readFileSync(join(here, '..', name), 'utf8'),
+      `${name} 与 bundle 里的副本不一致 —— 请重新构建（node tools/build-client.mjs）：`);
+  }
+});
+
 console.log('slot 注册');
 
 const registrations = [];
@@ -327,7 +391,7 @@ test('编辑草稿原样保留 priority:none，且下拉里有「无」这一档
   eq(mod.buildEditDraft({}).priority, 'normal', '只有缺省/非法值才回退 normal：');
 });
 
-test('面板注册了自动刷新定时器，且卸载时清掉（审计 F7：agent 改动要能看到）', () => {
+test('面板注册了自动刷新定时器，间隔 30s（审计 F7 / 复审 R4）', () => {
   eq(intervals.length > 0, true, '面板必须注册自动刷新定时器：');
   // 找出「触发时会请求刷新（setTick）」的那一个，而不是只看定时器数量
   let poll = null;
@@ -337,13 +401,80 @@ test('面板注册了自动刷新定时器，且卸载时清掉（审计 F7：ag
     if (stateUpdates.length > before) { poll = handle; break; }
   }
   eq(Boolean(poll), true, '定时器触发时必须真的请求刷新（走 refresh）：');
-  // 清理函数（挂在 useEffect 上）必须清掉定时器：面板切走后不能一直打宿主
+  // 复审 R4：轮询放宽到 30 秒（每次轮询都是一次全量 load），不能又变回 10 秒
+  eq(mod.CHANGE_POLL_MS, 30000, '轮询间隔必须放宽到 30 秒：');
+  eq(poll.ms, mod.CHANGE_POLL_MS, '定时器要真的按这个间隔注册：');
+});
+
+test('窗口重新聚焦 / 重新可见时会立刻刷新（复审 R4：轮询放宽后的新鲜度靠这条路）', () => {
+  const focus = [...(windowListeners.get('focus') ?? [])];
+  eq(focus.length > 0, true, '面板必须监听窗口 focus：');
+  const before = stateUpdates.length;
+  for (const handler of focus) handler();
+  eq(stateUpdates.length > before, true, '窗口重新聚焦时必须请求刷新：');
+  const visible = [...(documentListeners.get('visibilitychange') ?? [])];
+  eq(visible.length > 0, true, '面板必须监听 visibilitychange：');
+  const beforeVisible = stateUpdates.length;
+  for (const handler of visible) handler();
+  eq(stateUpdates.length > beforeVisible, true, '重新可见时必须请求刷新：');
+});
+
+test('数据不一致告警必须在面板上渲染出来，不能只躺在 /health 的 JSON 里（复审 R4/R5）', () => {
+  // describe() 的告警 → 面板页脚的真文字
+  eq(typeof mod.storeAlerts, 'function', '面板应当导出告警整理函数：');
+  const t = (key) => (key === 'storeMergeNote'
+    ? '已按 id 合并两处数据：{merged} 条（同 id 冲突 {conflicts}，补入 {added}）'
+    : key);
+  const clean = mod.storeAlerts({ kind: 'domain', location: 'storage:worktodo/todos', mismatch: null, split: null, merge: null }, t);
+  eq(clean, [], '一切正常时不该有告警：');
+  const alerts = mod.storeAlerts({
+    kind: 'file',
+    location: '/tmp/todos.json',
+    mismatch: '首选官方 storage 但打开失败：already open',
+    split: '官方 6 条 / 文件 4 条（两处 id 不完全一致）',
+    backendError: '当前后端（domain）读取失败：boom；回退文件已在升级时退役',
+    retired: { movedTo: '/tmp/todos.json.migrated-20261013-193439' },
+    merge: { merged: 3, conflicts: 1, added: 2 },
+  }, t);
+  const keys = alerts.map((a) => a.key);
+  eq(keys, ['mismatch', 'split', 'backendError', 'retired', 'merge'], `五条告警都要在：${JSON.stringify(keys)}`);
+  eq(alerts.filter((a) => a.tone === 'warn').length, 3, 'mismatch/split/backendError 是警告级：');
+  eq(alerts.some((a) => a.text.includes('already open')), true, '告警要带上原始原因：');
+  const mergeText = alerts.find((a) => a.key === 'merge').text;
+  eq(mergeText.includes('3 条') && mergeText.includes('冲突 1') && mergeText.includes('补入 2'), true, `合并报告要填上占位符：${mergeText}`);
+  eq(mergeText.includes('{merged}'), false, '占位符不能原样显示给用户：');
+  // 只有 retired 也必须能报出来（用户在面板上看得见「数据被搬去哪了」）
+  eq(mod.storeAlerts({ retired: { path: '/tmp/todos.json' } }, t).some((a) => a.text.includes('/tmp/todos.json')), true);
+});
+
+test('卸载时清掉定时器与窗口监听（审计 F7：面板切走后不能一直打宿主）', () => {
+  // 清理函数（挂在 useEffect 上）必须清掉定时器
   for (const cleanup of [...effectCleanups]) {
     try {
       cleanup();
     } catch { /* 单个清理失败不影响结论 */ }
   }
-  eq(clearedIntervals.includes(poll), true, '卸载时必须 clearInterval：');
+  eq(intervals.every((handle) => clearedIntervals.includes(handle)), true, '卸载时必须 clearInterval：');
+  eq([...windowListeners.values()].every((set) => set.size === 0), true, '卸载时必须移除窗口监听：');
+  eq([...documentListeners.values()].every((set) => set.size === 0), true, '卸载时必须移除 visibilitychange 监听：');
+});
+
+await testAsync('真渲染一次带告警的面板：页脚里确实出现了告警节点（复审 R4/R5，不只是有个函数）', async () => {
+  // 首屏 fetch 是异步的：等它落地，`lastList` 才有数据，下一次渲染才是「ready」态
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const store = fakeListPayload.data.store;
+  store.mismatch = '首选官方 storage 但打开失败：already open';
+  store.split = '官方 2 条 / 文件 1 条（两处 id 不完全一致）';
+  store.retired = { movedTo: '/tmp/todos.json.migrated-20261013-193439' };
+  store.merge = { merged: 3, conflicts: 1, added: 2 };
+  const tree = main.component({});
+  const nodes = flattenTree(tree);
+  const warns = nodes.filter((n) => String(n.props?.className ?? '').includes('wt-store-alert-warn'));
+  eq(warns.length, 2, `mismatch 与 split 必须各渲染一行告警：${warns.length}`);
+  const allText = nodes.map(textOf).join('\n');
+  eq(allText.includes('already open'), true, '页脚要显示不一致的原始原因：');
+  eq(allText.includes('.migrated-'), true, '页脚要显示退役文件路径（数据被搬去哪了）：');
+  eq(allText.includes('{merged}'), false, '页脚不能出现未替换的占位符：');
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);

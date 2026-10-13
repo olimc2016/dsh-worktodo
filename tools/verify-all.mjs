@@ -28,6 +28,21 @@ const SUITES = [
 const results = [];
 let failed = false;
 
+/**
+ * 先构建客户端 bundle（复审 R3）。
+ *
+ * 为什么必须先构建：`smoke-client.mjs` 读的是**构建产物** `lib/client.js`，
+ * 而这里原来直接跑测试 —— 于是「改了 `src/client` 忘了 build」这个最危险的状态
+ * （浏览器里跑的其实是旧 bundle）在测试里是**绿的**。构建失败或产物过期必须让整体变红。
+ */
+process.stdout.write(`${'='.repeat(60)}\n构建客户端 bundle（build-client.mjs）\n${'='.repeat(60)}\n`);
+const build = spawnSync(process.execPath, [join(here, 'build-client.mjs')], { stdio: 'inherit' });
+if (build.status !== 0) {
+  failed = true;
+  process.stdout.write('\n✗ 客户端 bundle 构建失败 —— 后面的测试与浏览器里跑的代码都不可信，直接判失败\n');
+}
+results.push({ label: '客户端 bundle 构建', file: 'build-client.mjs', ok: build.status === 0, status: build.status });
+
 for (const [file, label] of SUITES) {
   process.stdout.write(`\n${'='.repeat(60)}\n${label}（${file}）\n${'='.repeat(60)}\n`);
   const run = spawnSync(process.execPath, [join(here, file)], { stdio: 'inherit' });
@@ -41,6 +56,6 @@ for (const r of results) {
   process.stdout.write(`${r.ok ? '  ✓' : '  ✗'} ${r.label}  (${r.file})\n`);
 }
 const passedCount = results.filter((r) => r.ok).length;
-process.stdout.write(`\n${passedCount}/${results.length} 个测试文件通过\n`);
+process.stdout.write(`\n${passedCount}/${results.length} 个步骤通过（含构建）\n`);
 
 process.exit(failed ? 1 : 0);

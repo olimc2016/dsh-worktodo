@@ -156,10 +156,13 @@ function makeCtx({ rejection, storageDomain } = {}) {
 function makeFakeDomainFacility(initial = []) {
   const records = new Map(initial.map((record) => [record.id, record]));
   const calls = { open: 0, close: 0 };
+  /** 测试开关：模拟「领域突然读不出来」（复审 R4/F16：/health 必须报 count: null 而不是 0）。 */
+  const control = { failLoad: false };
   let open = false;
   return {
     records,
     calls,
+    control,
     async open(spec) {
       calls.open += 1;
       if (open) throw new Error("domain 'worktodo' is already open");
@@ -167,7 +170,10 @@ function makeFakeDomainFacility(initial = []) {
       return {
         table: (name) => ({
           get: (key) => records.get(key),
-          entries: () => [...records.entries()][Symbol.iterator](),
+          entries: () => {
+            if (control.failLoad) throw new Error('领域读不出来（模拟 domain 不可用）');
+            return [...records.entries()][Symbol.iterator]();
+          },
           size: records.size,
           put: async (key, value) => {
             records.set(key, spec.tables[name].valueSchema.parse(value));
@@ -176,6 +182,9 @@ function makeFakeDomainFacility(initial = []) {
         }),
         close: async () => {
           calls.close += 1;
+          // 官方领域关闭是**异步**的（要等落盘/释放）；这里用一次宏任务模拟。
+          // 少了这个延迟，「卸载后立刻重载」的 already-open 窗口在测试里根本不存在（复审 R2）。
+          await new Promise((resolve) => setTimeout(resolve, 5));
           open = false;
         },
       };
@@ -668,6 +677,86 @@ await test('apply 两次（同一 storageDomain）不降级、不丢数据，dom
     for (const effect of host.effects.filter((e) => e.label === 'worktodo: store lifecycle')) effect.dispose?.();
     await new Promise((resolve) => setTimeout(resolve, 30));
     eq(facility.calls.close >= 1, true, '卸载时应释放领域句柄：');
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+await test('卸载后立刻重载：清理可 await，新句柄仍是 domain（不撞 already-open 降级到 file，复审 R2）', async () => {
+  const previousHome = process.env.DSH_HOME;
+  const home = mkdtempSync(join(tmpdir(), 'worktodo-host-reload-'));
+  process.env.DSH_HOME = home;
+  try {
+    const facility = makeFakeDomainFacility();
+    const host = makeCtx({ storageDomain: facility });
+    await apply(host.ctx, {});
+    const healthA = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json();
+    eq(healthA.store.kind, 'domain');
+    await call(host.routes.get('/worktodo/create').handler, { method: 'POST', url: '/worktodo/create', body: { title: '卸载前的数据' } });
+
+    // 卸载：生命周期清理必须**返回** close 的 promise（cordis 会 await 它）。
+    // 原来是 fire-and-forget，卸载与重载重叠时会在「注册表已摘、领域还没关完」的窗口里撞 already-open。
+    const lifecycle = host.effects.filter((e) => e.label === 'worktodo: store lifecycle');
+    const closing = lifecycle.map((effect) => effect.dispose?.());
+    eq(closing.some((p) => p && typeof p.then === 'function'), true, '清理函数必须返回可 await 的 promise（不能在飞行中返回）：');
+    host.logs.length = 0;
+
+    // 立刻重载：不等关闭完成
+    await apply(host.ctx, {});
+    const healthB = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json();
+    eq(healthB.store.kind, 'domain', '立刻重载也必须仍然是 domain（不能停在 file 后端）：');
+    eq(healthB.store.mismatch, null, '不该留下「后端不一致」：');
+    eq(host.logs.some((line) => line.includes('already open')), false, `不能撞官方 already-open：${host.logs.filter((l) => l.includes('storage')).join(' | ')}`);
+    const listed = await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all' });
+    eq(listed.json().data.todos.map((t) => t.title), ['卸载前的数据'], '重载不能丢数据：');
+    eq(facility.records.size, 1);
+    await Promise.all(closing);
+    // 收尾：把新实例的句柄也放掉
+    for (const effect of host.effects.filter((e) => e.label === 'worktodo: store lifecycle')) await effect.dispose?.();
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+await test('数据读不出来时 /health 报 count:null + countError，而不是假装 count:0（复审 R4 / 审计 F16）', async () => {
+  const previousHome = process.env.DSH_HOME;
+  const home = mkdtempSync(join(tmpdir(), 'worktodo-host-health-'));
+  process.env.DSH_HOME = home;
+  try {
+    const facility = makeFakeDomainFacility();
+    const host = makeCtx({ storageDomain: facility });
+    await apply(host.ctx, {});
+    await call(host.routes.get('/worktodo/create').handler, { method: 'POST', url: '/worktodo/create', body: { title: '先存一条' } });
+
+    const ok = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json();
+    eq(ok.count, 1, '正常时 count 是个数：');
+    eq(ok.countError, null);
+
+    // 复审 R4/R5：面板只能看到 /list 载荷 —— 诊断字段必须真的在它里面，否则页脚无从渲染
+    const listOk = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all' })).json();
+    eq(listOk.ok, true);
+    for (const key of ['mismatch', 'split', 'merge', 'retired', 'backendError']) {
+      eq(key in listOk.data.store, true, `/list 的 store 必须带 ${key}（面板页脚要渲染这些告警）：`);
+    }
+
+    facility.control.failLoad = true;
+    const bad = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json();
+    eq(bad.ok, true, 'health 路由本身不该 500：');
+    eq(bad.count, null, '读不出来时必须 count:null —— 报 0 会让人以为待办真的没了：');
+    eq(typeof bad.countError === 'string' && bad.countError.includes('领域读不出来'), true, `要给失败原因：${bad.countError}`);
+    eq(bad.store.kind, 'domain', '后端不该因为读失败就换：');
+    eq(typeof bad.store.backendError, 'string', 'describe() 里也要有这条错误：');
+    eq(bad.store.backendError.includes('domain') && bad.store.backendError.includes('读取失败'), true, `错误要说清是哪个后端的什么操作：${bad.store.backendError}`);
+
+    facility.control.failLoad = false;
+    const back = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json();
+    eq(back.count, 1, '恢复后 count 要回到真实条数：');
+    eq(back.countError, null, '恢复后错误要清掉：');
+    eq(back.store.backendError, null);
   } finally {
     if (previousHome === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previousHome;

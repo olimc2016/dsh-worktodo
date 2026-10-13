@@ -12,7 +12,7 @@
  * 这里用等价的假 facility 走通 store.mjs 的调用序列（open → table.put/delete/entries），
  * 完整运行时验证留给装进 profile 后的 health 路由。
  */
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openWorkTodoStore, unionById } from '../src/store.mjs';
@@ -104,10 +104,13 @@ function serviceHolder(initial = null) {
 function makeFakeFacility(initial = []) {
   const records = new Map(initial.map((record) => [record.id, record]));
   const calls = { open: 0, close: 0 };
+  /** 测试开关：模拟「domain 突然读不出来」（复审 R1 第 3 条：不能静默换回退役文件）。 */
+  const control = { failLoad: false };
   let open = false;
   return {
     records,
     calls,
+    control,
     async open(spec) {
       calls.open += 1;
       if (open) throw new Error("domain 'worktodo' is already open");
@@ -118,7 +121,10 @@ function makeFakeFacility(initial = []) {
       return {
         table: (name) => ({
           get: (key) => records.get(key),
-          entries: () => [...records.entries()][Symbol.iterator](),
+          entries: () => {
+            if (control.failLoad) throw new Error('领域读不出来（模拟 domain 不可用）');
+            return [...records.entries()][Symbol.iterator]();
+          },
           size: records.size,
           put: async (key, value) => {
             records.set(key, spec.tables[name].valueSchema.parse(value));
@@ -243,9 +249,13 @@ await test('storageDomain 晚注册：后续请求升级到 domain，并把两�
     // 备份内容就是合并前的回退文件
     const backupText = readFileSync(described.merge.backups[0], 'utf8');
     eq(JSON.parse(backupText).todos.map((t) => t.id).sort(), ['wt-file-a', 'wt-file-b']);
-    // 回退文件同步成同一份并集：以后再降级也不会看到旧数据
-    const mirror = JSON.parse(readFileSync(join(home, 'worktodo', 'todos.json'), 'utf8'));
-    eq(mirror.todos.map((t) => t.id).sort(), ['wt-dom-c', 'wt-file-a', 'wt-file-b']);
+    // 复审 R1：升级成功后回退文件**退役**（改名成 .migrated-<时间>），原路径不再存在
+    eq(described.retired?.movedTo?.includes('.migrated-'), true, `升级后必须退役回退文件：${JSON.stringify(described.retired)}`);
+    eq(existsSync(join(home, 'worktodo', 'todos.json')), false, '退役后原路径不该还留着待办文件：');
+    eq(described.retired.note.includes('已把回退文件迁移并退役'), true, 'describe() 必须能报出「已退役」：');
+    // 退役文件里留的是一份完整存档（合并后的并集），用户随时能查/能恢复
+    const migrated = JSON.parse(readFileSync(described.retired.movedTo, 'utf8'));
+    eq(migrated.todos.map((t) => t.id).sort(), ['wt-dom-c', 'wt-file-a', 'wt-file-b']);
     await store.close();
   });
 });
@@ -274,6 +284,81 @@ await test('合并同 id 冲突时以 updatedAt 较新的那条为准', async ()
     eq(merged2[0].title, '文件里更新');
     await store.close();
     await store2.close();
+  });
+});
+
+console.log('回退文件退役：升级后单一真源（0.2.1 复审 R1）');
+
+await test('升级后删掉一条再重开（第二次合并）不会复活，新增的也不会重复（复审 R1 / 实跑 exp8）', async () => {
+  await withTempHome(async (home) => {
+    const facility = makeFakeFacility();
+    const holder = serviceHolder(null); // 先只有回退文件
+    const first = await openWorkTodoStore({ ctx: holder.ctx, config: {}, logger: silent });
+    for (const [id, title] of [['wt-a', 'A'], ['wt-b', 'B'], ['wt-c', 'C']]) {
+      await first.put(createRecord({ title }, { now: NOW, id }));
+    }
+    // 服务就绪：升级、合并、退役回退文件
+    holder.current = facility;
+    eq((await first.load()).map((r) => r.id).sort(), ['wt-a', 'wt-b', 'wt-c']);
+    eq(first.kind, 'domain');
+    eq(existsSync(join(home, 'worktodo', 'todos.json')), false, '升级后回退文件必须退役：');
+
+    // 用户在 domain 侧删除一条（旧的「快照镜像」修法就是在这里留下腐肉）
+    await first.remove('wt-c');
+    // 再新增一条，用于验证「再次合并不重复」
+    await first.put(createRecord({ title: 'D' }, { now: NOW, id: 'wt-d' }));
+    await first.close();
+
+    // 「重载」：新的句柄会重新走一次 init → 以回退文件为 source 的合并
+    const reloaded = await openWorkTodoStore({ ctx: serviceHolder(facility).ctx, config: {}, logger: silent });
+    eq(reloaded.kind, 'domain');
+    const ids = (await reloaded.load()).map((r) => r.id).sort();
+    eq(ids.includes('wt-c'), false, '已删除的待办不能复活：');
+    eq(ids, ['wt-a', 'wt-b', 'wt-d'], '既不能复活已删项，也不能重复：');
+    eq(facility.records.has('wt-c'), false, 'domain 里也不该有 wt-c：');
+    eq(existsSync(join(home, 'worktodo', 'todos.json')), false, '重载后也不该把回退文件复活：');
+    eq(reloaded.describe().retired?.alreadyRetired, true, '已经退役过的文件要被识别出来（信息性报告）：');
+
+    // 再增一条 → 再重载 → 仍然不重复、不复活
+    await reloaded.put(createRecord({ title: 'E' }, { now: NOW, id: 'wt-e' }));
+    await reloaded.close();
+    const third = await openWorkTodoStore({ ctx: serviceHolder(facility).ctx, config: {}, logger: silent });
+    eq((await third.load()).map((r) => r.id).sort(), ['wt-a', 'wt-b', 'wt-d', 'wt-e'], '第三次合并也不能重复：');
+    await third.close();
+    // 整个过程只有一个「已退役」存档，不会再生成新的回退文件
+    eq(readdirSync(join(home, 'worktodo')).filter((n) => n.includes('.migrated-')).length, 1);
+  });
+});
+
+await test('升级后 domain 读失败：显式报错并保持 domain 句柄，绝不静默读回退役的回退文件（复审 R1 第 3 条）', async () => {
+  await withTempHome(async (home) => {
+    const facility = makeFakeFacility();
+    const holder = serviceHolder(null);
+    const store = await openWorkTodoStore({ ctx: holder.ctx, config: {}, logger: silent });
+    await store.put(createRecord({ title: '只存在于回退文件' }, { now: NOW, id: 'wt-only-file' }));
+    holder.current = facility;
+    await store.load(); // 升级 + 合并 + 退役
+    eq(store.kind, 'domain');
+    const migrated = store.describe().retired.movedTo;
+    eq(existsSync(migrated), true, '退役存档要留着（用户可以手动查/恢复）：');
+
+    facility.control.failLoad = true; // domain 突然不可用
+    let error = null;
+    try {
+      await store.load();
+    } catch (caught) {
+      error = caught;
+    }
+    eq(Boolean(error), true, 'domain 读不出来时必须显式失败，而不是换源：');
+    eq(store.kind, 'domain', '出错不能改变当前后端：');
+    const described = store.describe();
+    eq(typeof described.backendError, 'string', '错误必须进 describe()/health：');
+    eq(described.backendError.includes('不会静默改用它'), true, `要让用户看到「没有静默换源」：${described.backendError}`);
+    eq(described.retired.movedTo, migrated, '退役记录不该被清掉：');
+    // 退役文件本身没被读过、也没被改写：内容还在（只是不再当数据源）
+    eq(JSON.parse(readFileSync(migrated, 'utf8')).todos.map((t) => t.id), ['wt-only-file']);
+    eq(existsSync(join(home, 'worktodo', 'todos.json')), false, '不能把退役文件重新变回回退文件：');
+    await store.close();
   });
 });
 
