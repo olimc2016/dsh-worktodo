@@ -306,6 +306,13 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
     adopt,
     all,
     sortForView,
+    /**
+     * 外部（官方 storage 的 domain/changed 事件、别的进程/插件实例）产生的变更，
+     * 由宿主原样广播给 `onChange` 的监听者——面板刷新与 /health 的变更计数都接这里。
+     */
+    notifyStoreChange(change) {
+      emit(change);
+    },
     /** 订阅变更，返回注销函数。 */
     onChange(listener) {
       listeners.add(listener);
@@ -313,7 +320,9 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
     },
     /** 存储自检信息，health 路由与 README 排查都用它。 */
     describe() {
-      return { kind: store.kind, location: store.location };
+      const base = { kind: store.kind, location: store.location };
+      // 可纠正的存储句柄会额外报出首选后端、不一致/分裂警告与最近一次合并报告
+      return typeof store.describe === 'function' ? { ...base, ...store.describe() } : base;
     },
   };
 }

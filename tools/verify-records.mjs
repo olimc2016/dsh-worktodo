@@ -27,7 +27,7 @@ import {
   statsOf,
   weekStartKey,
 } from '../src/records.mjs';
-import { repairRecord, repairStoreDocument } from '../src/schema.mjs';
+import { MISSING_TITLE_PLACEHOLDER, repairRecord, repairStoreDocument } from '../src/schema.mjs';
 
 let passed = 0;
 const failures = [];
@@ -245,7 +245,7 @@ test('排序：高优先级在前，同优先级按截止日期，无日期垫�
 
 console.log('持久化校验');
 
-test('坏记录被跳过而不是让整个列表读不出来', () => {
+test('缺 title 的记录用占位标题保留（不再静默丢弃），垃圾条目进 dropped', () => {
   const doc = repairStoreDocument({
     version: 1,
     todos: [
@@ -256,10 +256,23 @@ test('坏记录被跳过而不是让整个列表读不出来', () => {
       { id: 'partial', title: '缺字段', status: '奇怪的' },
     ],
   });
-  eq(doc.todos.map((t) => t.id), ['ok', 'partial']);
-  eq(doc.todos[1].status, 'pending', '未知状态回退到 pending ');
-  eq(doc.todos[1].priority, 'none', '缺字段补「无」：');
-  eq(doc.todos[1].due, null);
+  // 审计 F3：以前 {} / 缺 title 的记录被静默跳过，下一次任何写入就从磁盘上永久消失。
+  // 现在给可见的占位标题并保留位置；只有完全不是对象的垃圾条目才被跳过（并通过 dropped 备份）。
+  eq(doc.todos.map((t) => t.id), ['ok', 'wt-recovered-2', 'partial']);
+  eq(doc.todos[1].title, MISSING_TITLE_PLACEHOLDER, '缺 title 要留占位标题：');
+  eq(doc.todos[2].status, 'pending', '未知状态回退到 pending ');
+  eq(doc.todos[2].priority, 'none', '缺字段补「无」：');
+  eq(doc.todos[2].due, null);
+  eq(doc.dropped.map((d) => d.index), [2, 3], '只有非对象条目该被跳过：');
+  eq(doc.dropped[0].reason.includes('不是对象'), true);
+});
+
+test('缺 id 的记录用文件内位置派生稳定 id（同一条记录不会每次读都换身份）', () => {
+  const raw = { version: 1, todos: [{ title: '没有 id 的记录' }] };
+  const first = repairStoreDocument(raw).todos[0];
+  const second = repairStoreDocument(raw).todos[0];
+  eq(first.id, 'wt-recovered-1');
+  eq(first.id, second.id, '两次读必须是同一个 id：');
 });
 
 test('手改的记录按同义词归一，真正乱写的日期才丢掉', () => {

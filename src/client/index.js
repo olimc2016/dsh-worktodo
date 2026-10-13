@@ -34,6 +34,44 @@ const ROUTE_BASE = `/${SHORT_NAME}`;
 const LOCALE_NS = SHORT_NAME;
 const ROUTE_LIST = `${ROUTE_BASE}/list`;
 
+/**
+ * 面板自动刷新间隔：agent 通过 worktodo_* 工具改了列表时宿主不会推送，
+ * 面板只能自己定期拉一次（以及窗口重新获得焦点时拉一次），否则用户得手点刷新才看得到。
+ * 10 秒是「够快」与「别一直打宿主」之间的折中；卸载时定时器会被清掉。
+ */
+const CHANGE_POLL_MS = 10000;
+
+/**
+ * 编辑表单的优先级档位。`none` 必须在里面：它代表「不设优先级」这个真实状态，
+ * 缺了它（或把 `none` 兜底成 `normal`）会让用户打开编辑器、什么都不改、点保存
+ * 就把这条记录永久改成「普通」（审计 F6，且宿主工具侧曾无法改回 none）。
+ */
+export const EDIT_PRIORITY_OPTIONS = ['high', 'normal', 'low', 'none'];
+
+/** 优先级 → 文案 key。 */
+const PRIORITY_LABEL_KEYS = {
+  high: 'prioHigh', normal: 'prioNormal', low: 'prioLow', none: 'prioNone',
+};
+
+/**
+ * 从一行待办构造编辑草稿。
+ *
+ * 抽成纯函数有两个原因：面板与测试用同一份逻辑（不是测试里再抄一遍），
+ * 以及 `none` 必须**原样保留**而不是被 `|| 'normal'` 之类兜底改掉。
+ * @param {object} row
+ * @returns {{title: string, due: string, priority: string, project: string, dueTime: string, notes: string}}
+ */
+export function buildEditDraft(row = {}) {
+  return {
+    title: typeof row.title === 'string' ? row.title : '',
+    due: typeof row.due === 'string' ? row.due : '',
+    priority: EDIT_PRIORITY_OPTIONS.includes(row.priority) ? row.priority : 'normal',
+    project: typeof row.project === 'string' ? row.project : '',
+    dueTime: typeof row.dueTime === 'string' ? row.dueTime : '',
+    notes: typeof row.notes === 'string' ? row.notes : '',
+  };
+}
+
 /* ------------------------------------------------------------------ *
  * 文案：zh / en 两份 key 必须一一对应（宿主按 key 取词，缺 key 会显示 key 本身）
  * ------------------------------------------------------------------ */
@@ -721,14 +759,7 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
   const overdue = !done && Boolean(due) && Boolean(today) && due < today;
 
   const beginEdit = () => {
-    setDraft({
-      title: typeof row.title === 'string' ? row.title : '',
-      due,
-      priority: row.priority === 'high' || row.priority === 'low' ? row.priority : 'normal',
-      project: typeof row.project === 'string' ? row.project : '',
-      dueTime: typeof row.dueTime === 'string' ? row.dueTime : '',
-      notes: typeof row.notes === 'string' ? row.notes : '',
-    });
+    setDraft(buildEditDraft(row));
     setNotesOpen(Boolean(row.notes));
     setEditing(true);
   };
@@ -751,8 +782,8 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
     }
     const nextDueTime = String(draft.dueTime ?? '').trim();
     if (nextDue && nextDueTime !== (row.dueTime ?? '')) patch.dueTime = nextDueTime === '' ? 'none' : nextDueTime;
-    const priority = draft.priority || 'normal';
-    if (priority !== (row.priority ?? 'normal')) patch.priority = priority;
+    const priority = draft.priority || row.priority || 'none';
+    if (priority !== (row.priority ?? 'none')) patch.priority = priority;
     const project = String(draft.project ?? '').trim();
     if (project !== (row.project ?? '')) patch.project = project; // 空串 = 去掉项目
     const notes = String(draft.notes ?? '').trim();
@@ -811,11 +842,11 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
           className: 'wt-input', style: inputStyle, value: draft.priority,
           'aria-label': t('priorityLabel'),
           onChange: (event) => setDraft((prev) => ({ ...prev, priority: event.target.value })),
-        }, [
-          React.createElement('option', { key: 'high', value: 'high' }, t('prioHigh')),
-          React.createElement('option', { key: 'normal', value: 'normal' }, t('prioNormal')),
-          React.createElement('option', { key: 'low', value: 'low' }, t('prioLow')),
-        ])),
+        }, EDIT_PRIORITY_OPTIONS.map((value) => React.createElement(
+          'option',
+          { key: value, value },
+          t(PRIORITY_LABEL_KEYS[value]),
+        )))),
         field('project', t('projectLabel'), React.createElement('input', {
           className: 'wt-input', style: { ...inputStyle, width: 130 }, value: draft.project,
           placeholder: t('projectPlaceholder'),
@@ -1056,6 +1087,24 @@ function WorkTodoPanel(props) {
   const [dragId, setDragId] = React.useState(null);
   const { status, data, error, refresh } = useList(sort);
 
+  /**
+   * 跟随外部改动刷新（审计 F7：宿主的 onChanged/onChange 原来是死代码，面板只在
+   * 挂载 / 切排序 / 点刷新 / 自己写操作后才拉数据，agent 用工具加了一条用户看不到）。
+   * 这里定期 + 窗口重新聚焦时拉一次；清理函数里清掉定时器与监听，卸载后不留活动引用。
+   */
+  React.useEffect(() => {
+    const timer = setInterval(() => refresh(), CHANGE_POLL_MS);
+    timer?.unref?.(); // Node（测试环境）里不要因为这个定时器挂住事件循环
+    const onActive = () => refresh();
+    window?.addEventListener?.('focus', onActive);
+    if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', onActive);
+    return () => {
+      clearInterval(timer);
+      window?.removeEventListener?.('focus', onActive);
+      if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', onActive);
+    };
+  }, [refresh]);
+
   // 写操作的错误条；readError 是拉取错误（用户关掉之后，只有换成新错误才再弹）
   const [barError, setBarError] = React.useState(null);
   const [dismissedReadError, setDismissedReadError] = React.useState(null);
@@ -1099,6 +1148,9 @@ function WorkTodoPanel(props) {
     return runWrite(() => postJson('/create', {
       title,
       due: input?.due ? String(input.due) : null,
+      // 必须一起发：QuickAdd 已经把「下午3点」这类时间词从标题里摘掉了，
+      // 这里漏掉就等于用户输入的时间被永久丢弃（审计 F5）。空值统一给 null，别给 undefined。
+      dueTime: input?.dueTime ? String(input.dueTime) : null,
       priority: input?.priority ?? 'normal',
     })).then((result) => result.ok);
   }, [runWrite, t]);

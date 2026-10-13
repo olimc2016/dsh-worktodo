@@ -111,11 +111,13 @@ function extractClientPosts() {
  * @returns {string[]}
  */
 function topLevelKeys(literalText) {
+  // 先剥掉行注释：注释会挡在 `,` 与下一个键之间，让键抽不出来（`dueTime` 就踩过这个）
+  const text = literalText.replace(/\/\/[^\n]*/g, '');
   const keys = [];
-  for (const m of literalText.matchAll(/(?:^|[,{])\s*([A-Za-z_$][\w$]*)\s*(?=[,:}\n])/g)) {
+  for (const m of text.matchAll(/(?:^|[,{])\s*([A-Za-z_$][\w$]*)\s*(?=[,:}\n])/g)) {
     if (!keys.includes(m[1])) keys.push(m[1]);
   }
-  if (/\.\.\.\s*patch/.test(literalText)) keys.push('...patch');
+  if (/\.\.\.\s*patch/.test(text)) keys.push('...patch');
   return keys;
 }
 
@@ -145,6 +147,19 @@ await test('能抽出列表 GET 路径与行内编辑字段', () => {
   eq(clientGetPaths.length, 1, '应当只有一个列表 GET：');
   eq(clientGetPaths[0].startsWith('/list?filter=all'), true, `列表路径前缀不对：${clientGetPaths[0]}`);
   eq(patchFields, ['due', 'dueTime', 'notes', 'priority', 'project', 'title']);
+});
+
+await test('客户端新建待办必须把 dueTime 一起发出去（否则用户选的时间被静默丢弃，审计 F5）', () => {
+  const create = clientPosts.find((p) => p.path === '/create');
+  eq(Boolean(create), true, '没有从客户端源码抽出 /create 的报文：');
+  eq(create.keys.includes('dueTime'), true, `/create 报文缺 dueTime：${JSON.stringify(create.keys)}`);
+  // 空值必须是 null（不是 undefined）：undefined 会被宿主当成「没有这个键」，
+  // 而 QuickAdd 已经把时间词从标题里摘掉了，丢了就找不回来
+  eq(
+    /dueTime:\s*input\?\.dueTime\s*\?\s*String\(input\.dueTime\)\s*:\s*null/.test(clientSource),
+    true,
+    'dueTime 的空值必须显式给 null：',
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -246,12 +261,24 @@ await test('create 的报文（无截止日期时 due:null）能落库', async (
   const body = await hit('/worktodo/create', {
     method: 'POST',
     url: '/worktodo/create',
-    body: { title: '契约测试：写周报', due: null, priority: 'high' },
+    body: { title: '契约测试：写周报', due: null, dueTime: null, priority: 'high' },
   });
   eq(body.ok, true);
   eq(body.data.todo.due, null);
+  eq(body.data.todo.dueTime, null);
   eq(body.data.todo.priority, 'high');
   eq(body.data.todo.status, 'pending');
+});
+
+await test('create 带 dueTime 的报文能落库（面板新加的字段宿主真的消费）', async () => {
+  const body = await hit('/worktodo/create', {
+    method: 'POST',
+    url: '/worktodo/create',
+    body: { title: '契约测试：下午三点交报告', due: '2026-11-02', dueTime: '15:00', priority: 'normal' },
+  });
+  eq(body.ok, true);
+  eq(body.data.todo.due, '2026-11-02');
+  eq(body.data.todo.dueTime, '15:00', '用户选的时间必须真的存下来：');
 });
 
 await test('update 的空串约定能清空截止日期与项目（面板就靠这个）', async () => {

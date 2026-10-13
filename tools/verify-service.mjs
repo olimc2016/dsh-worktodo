@@ -255,6 +255,20 @@ await test('写操作会通知监听者（面板/日志将来接这里）', asyn
   eq(seen, ['create', 'adopt']);
 });
 
+await test('外部变更（domain/changed）经 notifyStoreChange 广播给监听者', async () => {
+  // 审计 F7：store.onChanged 与 service.onChange 原来都是死代码，
+  // 宿主现在把存储层事件经这个方法转给服务监听者（面板刷新 / health 计数）。
+  const s = makeService();
+  const seen = [];
+  s.onChange((change) => seen.push(change.operation));
+  s.notifyStoreChange({ operation: 'external-write' });
+  eq(seen, ['external-write']);
+  const unsubscribe = s.onChange(() => { throw new Error('不该被调用'); });
+  unsubscribe();
+  s.notifyStoreChange({ operation: 'external-write-2' });
+  eq(seen, ['external-write', 'external-write-2'], '注销后不该再收到：');
+});
+
 console.log('存储故障');
 
 await test('存储读失败时不抛，返回 store-unreadable', async () => {

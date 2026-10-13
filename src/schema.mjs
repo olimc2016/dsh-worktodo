@@ -122,26 +122,66 @@ export const todoRecordSchema = {
   },
 };
 
-/** 整个领域文件（JSON 回退存储用）的形状校验。 */
 /**
+ * 缺标题的记录用的占位标题。
+ *
+ * 为什么不直接丢弃：文件后端是「给人看、给人改」的形态，写路径又是读-改-写，
+ * 被跳过的记录会在下一次任何写入时从磁盘上**永久消失**（用户不会收到任何提示）。
+ * 宁可让用户看到一条「(无标题记录)」并自己补上，也不能静默删掉他手写的内容。
+ */
+export const MISSING_TITLE_PLACEHOLDER = '(无标题记录)';
+
+/**
+ * 修复一份存盘文档（JSON 回退存储的整个领域文件）。
+ *
+ * 与 `repairRecord` 的差别：这里**不丢弃可修复的记录**——
+ *   - 缺 title → 用 `MISSING_TITLE_PLACEHOLDER` 占位并保留 id/其它字段；
+ *   - 缺 id → 用「文件内位置」派生稳定 id（不是每次读都换一个随机 id），
+ *     否则这些记录每次读都是新身份，写回磁盘还会不断累积重复条目；
+ *   - 完全不是对象的垃圾条目才记入 `dropped`，由调用方在写入前另存备份。
  * @param {unknown} raw
- * @returns {{version: number, updatedAt: number, todos: object[]}}
+ * @returns {{version: number, updatedAt: number, todos: object[], dropped: {index: number, reason: string, raw: unknown}[]}}
  */
 export function repairStoreDocument(raw) {
   const doc = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const list = Array.isArray(doc.todos) ? doc.todos : [];
   const todos = [];
+  const dropped = [];
+  const usedIds = new Set();
+  // 先把文件里本来就有的 id 全部登记，避免派生 id 撞上后面的记录
   for (const item of list) {
-    try {
-      todos.push(repairRecord(item));
-    } catch {
-      // 单条坏记录不能拖垮整个列表：跳过它，其余照常读出
+    if (item && typeof item === 'object' && !Array.isArray(item) && typeof item.id === 'string' && item.id.trim()) {
+      usedIds.add(item.id.trim());
     }
   }
+  list.forEach((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      dropped.push({ index, reason: '记录不是对象', raw: item });
+      return;
+    }
+    try {
+      let candidate = item;
+      if (!(typeof item.id === 'string' && item.id.trim())) {
+        let id = `wt-recovered-${index + 1}`;
+        let n = 1;
+        while (usedIds.has(id)) id = `wt-recovered-${index + 1}-${n++}`;
+        candidate = { ...candidate, id };
+      }
+      if (!(typeof item.title === 'string' && item.title.trim())) {
+        candidate = { ...candidate, title: MISSING_TITLE_PLACEHOLDER };
+      }
+      const repaired = repairRecord(candidate);
+      usedIds.add(repaired.id);
+      todos.push(repaired);
+    } catch (error) {
+      dropped.push({ index, reason: String(error?.message ?? error), raw: item });
+    }
+  });
   return {
     version: 1,
     updatedAt: Number.isFinite(doc.updatedAt) ? Number(doc.updatedAt) : Date.now(),
     todos,
+    dropped,
   };
 }
 

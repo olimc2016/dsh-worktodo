@@ -94,14 +94,28 @@ async function call(handler, options) {
 }
 
 /** 组装一个假 cordis 上下文，收集注册出来的路由与工具。 */
-function makeCtx({ rejection } = {}) {
+function makeCtx({ rejection, storageDomain } = {}) {
   const routes = new Map();
   const tools = [];
   const effects = [];
   const logs = [];
+  // 事件总线：domain/changed 这类领域事件走这里（F7 的变更通知）
+  const listeners = new Map();
   const ctx = {
     logger: () => ({ info: (m) => logs.push(`info ${m}`), warn: (m) => logs.push(`warn ${m}`) }),
-    get: (name) => (name === 'connection' && rejection ? { requestRejection: rejection } : undefined),
+    get: (name) => {
+      if (name === 'storageDomain') return storageDomain;
+      if (name === 'connection' && rejection) return { requestRejection: rejection };
+      return undefined;
+    },
+    on: (event, handler) => {
+      if (!listeners.has(event)) listeners.set(event, new Set());
+      listeners.get(event).add(handler);
+      return () => listeners.get(event)?.delete(handler);
+    },
+    emit: (event, payload) => {
+      for (const handler of [...(listeners.get(event) ?? [])]) handler(payload);
+    },
     inject: (deps, callback) => {
       // 只回放本烟测真正关心的服务；缺服务的情况由 store/service 自己降级
       callback(ctx);
@@ -131,7 +145,42 @@ function makeCtx({ rejection } = {}) {
       },
     },
   };
-  return { ctx, routes, tools, effects, logs, systemPromptSections };
+  return { ctx, routes, tools, effects, logs, listeners, systemPromptSections };
+}
+
+/**
+ * 假 storageDomain facility：复刻官方 open/table 契约 + 「第二次 open 抛 already-open」语义。
+ * 用来在宿主层验证「二次挂载不降级」（审计 F1）与「domain/changed 事件真的接通」（审计 F7）。
+ * @param {object[]} [initial]
+ */
+function makeFakeDomainFacility(initial = []) {
+  const records = new Map(initial.map((record) => [record.id, record]));
+  const calls = { open: 0, close: 0 };
+  let open = false;
+  return {
+    records,
+    calls,
+    async open(spec) {
+      calls.open += 1;
+      if (open) throw new Error("domain 'worktodo' is already open");
+      open = true;
+      return {
+        table: (name) => ({
+          get: (key) => records.get(key),
+          entries: () => [...records.entries()][Symbol.iterator](),
+          size: records.size,
+          put: async (key, value) => {
+            records.set(key, spec.tables[name].valueSchema.parse(value));
+          },
+          delete: async (key) => records.delete(key),
+        }),
+        close: async () => {
+          calls.close += 1;
+          open = false;
+        },
+      };
+    },
+  };
 }
 
 const root = mkdtempSync(join(tmpdir(), 'worktodo-smoke-'));
@@ -572,6 +621,58 @@ await test('GET /list 的载荷带 version 与 update（面板角落的版本信
   eq(typeof payload.update.page === 'string' && payload.update.page.includes('npmjs.com'), true, 'update.page 应指向 npm 页面：');
   // 关了更新检查时不该声称有新版本
   eq(payload.update.hasUpdate, false);
+});
+
+console.log('存储后端与变更通知（审计 F1 / F7）');
+
+await test('apply 两次（同一 storageDomain）不降级、不丢数据，domain/changed 真的接到 health', async () => {
+  const previousHome = process.env.DSH_HOME;
+  const home = mkdtempSync(join(tmpdir(), 'worktodo-host-home-'));
+  process.env.DSH_HOME = home; // 不传 storePath 时会读写 DSH_HOME，绝不能碰真实 ~/.dsh
+  try {
+    const facility = makeFakeDomainFacility();
+    const host = makeCtx({ storageDomain: facility });
+    await apply(host.ctx, {});
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const healthA = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json();
+    eq(healthA.store.kind, 'domain', 'storageDomain 可用时应选 domain 后端：');
+
+    const created = await call(host.routes.get('/worktodo/create').handler, {
+      method: 'POST', url: '/worktodo/create', body: { title: '共享的数据' },
+    });
+    eq(created.json().ok, true);
+
+    // 二次挂载：官方对同名领域的第二次 open 抛 already-open——0.2.0 就是在这里静默降级到文件的
+    await apply(host.ctx, {});
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    eq(facility.calls.open, 1, '同一服务上只应打开一次领域：');
+    const listed = await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all' });
+    eq(listed.json().data.todos.map((t) => t.title), ['共享的数据'], '二次挂载不能丢数据：');
+    const healthB = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json();
+    eq(healthB.store.kind, 'domain', '二次挂载不能降级到回退文件：');
+
+    // F7：别的写入者发的 domain/changed → store.onChanged → service.onChange → health 计数
+    const before = healthB.changes.count;
+    host.ctx.emit('domain/changed', { domain: 'worktodo' });
+    const after = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json().changes.count;
+    eq(after, before + 1, '外部变更必须通知到服务监听者（原来 onChanged/onChange 是死代码）：');
+
+    // 注销函数挂在 ctx.effect 上：注销后不该继续收到变更（不泄漏）
+    for (const effect of host.effects.filter((e) => e.label === 'worktodo: store change events')) effect.dispose?.();
+    host.ctx.emit('domain/changed', { domain: 'worktodo' });
+    const still = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json().changes.count;
+    eq(still, after, '注销后不该再收到变更：');
+
+    // 卸载释放领域句柄（close 挂在 effect 上，否则二次挂载会撞 already-open）
+    for (const effect of host.effects.filter((e) => e.label === 'worktodo: store lifecycle')) effect.dispose?.();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    eq(facility.calls.close >= 1, true, '卸载时应释放领域句柄：');
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);

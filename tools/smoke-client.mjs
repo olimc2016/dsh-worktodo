@@ -66,6 +66,18 @@ const rendered = [];
 const effectRuns = [];
 /** effect 返回的清理函数，收起来验证面板确实做了回收。 */
 const effectCleanups = [];
+/** 组件请求过的状态更新（setter 是空实现，只记录「刷新被请求过」）。 */
+const stateUpdates = [];
+
+/* 定时器替身：记录面板注册的自动刷新定时器，验证「有轮询且卸载时清掉」。 */
+const intervals = [];
+const clearedIntervals = [];
+globalThis.setInterval = (fn, ms) => {
+  const handle = { fn, ms, unref() {} };
+  intervals.push(handle);
+  return handle;
+};
+globalThis.clearInterval = (handle) => { clearedIntervals.push(handle); };
 
 /** 极简 React 替身：让首屏渲染与首次请求真的跑起来，但不做重渲染。 */
 const stubReact = {
@@ -76,8 +88,8 @@ const stubReact = {
   Fragment: 'Fragment',
   memo: (c) => c,
   forwardRef: (c) => c,
-  useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
-  useReducer: (reducer, init) => [typeof init === 'function' ? init() : init, () => {}],
+  useState: (init) => [typeof init === 'function' ? init() : init, (next) => { stateUpdates.push(next); }],
+  useReducer: (reducer, init) => [typeof init === 'function' ? init() : init, (next) => { stateUpdates.push(next); }],
   // 真的执行 effect：否则「组件挂载后去拉列表」这条最关键的路径根本不会被测到
   useEffect(fn) {
     effectRuns.push('useEffect');
@@ -300,6 +312,38 @@ test('侧栏图标渲染不抛异常（active 与非 active）', () => {
 test('渲染后确实去拉了 /worktodo/list', () => {
   eq(fetchCalls.length > 0, true, '首屏应该发起一次列表请求：');
   eq(fetchCalls.some((c) => c.url.includes('/worktodo/list')), true, '请求路径：');
+});
+
+console.log('静默数据变形回归（审计 F5 / F6 / F7）');
+
+test('编辑草稿原样保留 priority:none，且下拉里有「无」这一档（审计 F6）', () => {
+  // 原来 beginEdit 用 `|| 'normal'` 兜底、下拉里又没有 none：
+  // 「打开编辑器 → 什么都不改 → 保存」就会把这条的优先级永久改成普通
+  eq(Array.isArray(mod.EDIT_PRIORITY_OPTIONS), true, '应当导出编辑表单的优先级档位：');
+  eq(mod.EDIT_PRIORITY_OPTIONS.includes('none'), true, `下拉必须含 none：${JSON.stringify(mod.EDIT_PRIORITY_OPTIONS)}`);
+  eq(mod.buildEditDraft({ id: 'x', title: 't', priority: 'none' }).priority, 'none', '打开编辑器不能把 none 改成 normal：');
+  eq(mod.buildEditDraft({ priority: 'high' }).priority, 'high');
+  eq(mod.buildEditDraft({ priority: 'low' }).priority, 'low');
+  eq(mod.buildEditDraft({}).priority, 'normal', '只有缺省/非法值才回退 normal：');
+});
+
+test('面板注册了自动刷新定时器，且卸载时清掉（审计 F7：agent 改动要能看到）', () => {
+  eq(intervals.length > 0, true, '面板必须注册自动刷新定时器：');
+  // 找出「触发时会请求刷新（setTick）」的那一个，而不是只看定时器数量
+  let poll = null;
+  for (const handle of [...intervals].reverse()) {
+    const before = stateUpdates.length;
+    handle.fn();
+    if (stateUpdates.length > before) { poll = handle; break; }
+  }
+  eq(Boolean(poll), true, '定时器触发时必须真的请求刷新（走 refresh）：');
+  // 清理函数（挂在 useEffect 上）必须清掉定时器：面板切走后不能一直打宿主
+  for (const cleanup of [...effectCleanups]) {
+    try {
+      cleanup();
+    } catch { /* 单个清理失败不影响结论 */ }
+  }
+  eq(clearedIntervals.includes(poll), true, '卸载时必须 clearInterval：');
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);
