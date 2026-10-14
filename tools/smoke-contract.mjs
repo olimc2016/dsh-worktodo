@@ -137,7 +137,9 @@ const clientGetPaths = [...clientSource.matchAll(/fetch\(`\$\{ROUTE_LIST\}([^`]*
 console.log('静态提取');
 
 await test('能从客户端源码里抽出全部写请求', () => {
-  const paths = clientPosts.map((p) => p.path).sort();
+  // 去重：`/update` 现在有两个调用点（改待办 + 自升级 `{action:'plugin-update'}`），
+  // 但它们是同一个路由；断言的是「路径集合」而不是「调用点个数」。
+  const paths = [...new Set(clientPosts.map((p) => p.path))].sort();
   eq(paths, ['/adopt', '/create', '/remove', '/reorder', '/status', '/update']);
 });
 
@@ -231,7 +233,8 @@ console.log('契约：客户端发的字段必须被宿主真正消费');
 /** 各路由接受的字段（镜像 lib/index.js 的 handler 与 service 的输入）。 */
 const ACCEPTED = {
   '/create': ['title', 'notes', 'priority', 'due', 'dueTime', 'project', 'status'],
-  '/update': ['ref', 'id', 'title', 'notes', 'priority', 'due', 'dueTime', 'project', 'status', '...patch'],
+  // `action:'plugin-update'` 是自升级开关（同一个路径两个动词/两种语义，见 lib/index.js 的 /update）
+  '/update': ['action', 'ref', 'id', 'title', 'notes', 'priority', 'due', 'dueTime', 'project', 'status', '...patch'],
   '/status': ['ref', 'id', 'status', 'toggle'],
   '/remove': ['ref', 'id'],
   '/adopt': ['todos'],

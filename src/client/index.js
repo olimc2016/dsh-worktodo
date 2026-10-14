@@ -56,6 +56,15 @@ const FALLBACK_T = (key) => zh[key] ?? key;
 export const CHANGE_POLL_MS = 30000;
 
 /**
+ * 自升级进行中的状态轮询间隔（2 秒）。
+ *
+ * 关键约束：**只在升级进行中轮询** —— 面板挂载本身不注册这个定时器；点了「立即更新」、
+ * 或者宿主报告 `state === 'running'` 时才注册，一旦状态不再是 running 立刻清掉。
+ * 常驻一个 2 秒的定时器会让「省着打宿主」这件事前功尽弃（见 CHANGE_POLL_MS 的说明）。
+ */
+export const UPDATE_POLL_MS = 2000;
+
+/**
  * 窗口是否不可见。
  *
  * 抽成纯函数有两个原因：SSR/无 document 环境（测试）里要安全；以及行为可以直接单测。
@@ -154,7 +163,15 @@ const zh = {
   'versionLabel': '版本',
   'versionHint': '当前安装的 dsh-worktodo 版本',
   'updateAvailable': '有新版本',
-  'updateHint': '更新命令（重启 DSH 生效）',
+  'updateHint': '点击立即更新（升级到最新版；装好后重启 DSH 生效）',
+  'updateNow': '立即更新',
+  'updating': '正在更新…',
+  'updatedRestart': '已更新到 {version}，重启 DSH 生效',
+  'updateRestartHint': '已更新完成，重启 DSH 生效',
+  'updateFailed': '更新失败',
+  'updateLinked': '这是本地链接安装（link:），请在仓库里用 git/pnpm 工作流更新',
+  'updateRetry': '重试',
+  'updateRetryHint': '点击重试',
   'addOpen': '新增待办',
   'addCancel': '取消',
   'prioNone': '无',
@@ -247,7 +264,15 @@ const en = {
   'versionLabel': 'Version',
   'versionHint': 'Installed dsh-worktodo version',
   'updateAvailable': 'Update available',
-  'updateHint': 'Update command (restart DSH to apply)',
+  'updateHint': 'Click to update now (installs the latest version; restart DSH to apply)',
+  'updateNow': 'Update now',
+  'updating': 'Updating…',
+  'updatedRestart': 'Updated to {version} — restart DSH to apply',
+  'updateRestartHint': 'Update finished — restart DSH to apply',
+  'updateFailed': 'Update failed',
+  'updateLinked': 'This is a local link: install — update it with the git/pnpm workflow',
+  'updateRetry': 'Retry',
+  'updateRetryHint': 'Click to retry',
   'addOpen': 'New todo',
   'addCancel': 'Cancel',
   'prioNone': 'None',
@@ -314,6 +339,14 @@ const C = {
 };
 /** 语义色的淡底/淡边：pct 是混入比例 */
 const tint = (color, pct) => `color-mix(in srgb, ${color} ${pct}%, transparent)`;
+
+/** 页面底部「自升级」那一格的配色（走主题变量，不写死颜色）。 */
+const UPDATE_TONE_STYLE = {
+  ok: { color: C.ok, borderColor: tint(C.ok, 50), background: tint(C.ok, 12) },
+  busy: { color: C.label2, borderColor: tint(C.label2, 40), background: tint(C.label2, 10) },
+  warn: { color: C.warn, borderColor: tint(C.warn, 50), background: tint(C.warn, 12) },
+  error: { color: C.error, borderColor: tint(C.error, 50), background: tint(C.error, 12) },
+};
 
 /** 面板自带样式表：几何字面量（间距/字号/圆角）写死，颜色全部走变量。 */
 const STYLE_TEXT = `
@@ -412,6 +445,11 @@ const STYLE_TEXT = `
 }
 .wt-link { cursor: pointer; user-select: none; color: var(--dsw-alias-link); font-size: 11px; }
 .wt-link:hover { text-decoration: underline; }
+/* 自升级那一格：本身是 <button>（可点），但外观必须与旁边的 chip 一致 */
+.wt-update { font: inherit; cursor: pointer; background: transparent; appearance: none; }
+.wt-update:hover { text-decoration: underline; }
+.wt-update:disabled { cursor: default; opacity: .7; }
+.wt-update:disabled:hover { text-decoration: none; }
 .wt-title { cursor: pointer; word-break: break-word; }
 .wt-title:hover { text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
 .wt-spin {
@@ -616,6 +654,9 @@ const asArray = (value) => (Array.isArray(value) ? value : []);
  * 面板上的写操作统一走这里。
  * 约定：宿主所有路由都回 200，成败看 `ok`；失败时把宿主的 error 原文抛出去，
  * 由面板顶部的错误条原样显示——绝不吞掉原因（用户要看到「标题过长」这种具体话）。
+ *
+ * `reason` 会**挂在 Error 上**一起抛出去：有些失败的原因码本身就是给用户看的分类
+ *（自升级的 `linked` 要换成「本地链接安装」的专门文案），只有 message 是分不出来的。
  * @param {string} path 相对路由前缀的路径，如 '/create'
  * @param {object} body
  * @returns {Promise<object>} 成功时返回 data
@@ -632,12 +673,32 @@ async function postJson(path, body) {
     // S4-3：宿主对请求体超时/超限回的是 4xx + `{reason, error}`（以前直接掐断连接，
     // 客户端只能看到 ECONNRESET）。这里优先把宿主的原文取出来，用户才看得到「请求体过大」。
     const detail = await response.json().catch(() => null);
-    throw new Error(detail?.error ?? detail?.reason ?? `HTTP ${response.status}`);
+    const error = new Error(detail?.error ?? detail?.reason ?? `HTTP ${response.status}`);
+    if (detail?.reason) error.reason = detail.reason;
+    throw error;
   }
   const parsed = await response.json().catch(() => null);
   if (!parsed) throw new Error('响应不是 JSON');
-  if (!parsed.ok) throw new Error(parsed.error ?? parsed.reason ?? '未知错误');
+  if (!parsed.ok) {
+    const error = new Error(parsed.error ?? parsed.reason ?? '未知错误');
+    if (parsed.reason) error.reason = parsed.reason;
+    throw error;
+  }
   return parsed.data ?? {};
+}
+
+/**
+ * GET /worktodo/update：自升级进度。
+ * 只在 `state === 'running'` 时被轮询调用（见 UPDATE_POLL_MS），不做任何缓存。
+ * @returns {Promise<object|null>} 宿主的升级状态
+ */
+async function fetchUpdateRun() {
+  const response = await fetch(`${ROUTE_BASE}/update`, { cache: 'no-store', credentials: 'same-origin' });
+  const parsed = await response.json().catch(() => null);
+  if (!response.ok || !parsed?.ok) {
+    throw new Error(parsed?.error ?? parsed?.reason ?? `HTTP ${response.status}`);
+  }
+  return parsed.data ?? null;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1418,6 +1479,69 @@ export function storeLocationLabel(store, t) {
   return `${t('storeAt')} · ${kind} · ${store.location}`;
 }
 
+/**
+ * 页脚「版本」旁边那一格该显示什么 —— 纯函数（导出供单测），不碰 DOM、不用 innerHTML。
+ *
+ * 状态优先级（升级过程本身比「有新版本」更重要）：
+ *   running → 正在更新…（不可点）
+ *   done    → 已更新到 vX，重启 DSH 生效
+ *   failed  → 失败原因（`linked` 换成「本地链接安装」的专门说明，那不是一个故障）
+ *   idle + hasUpdate → 「有新版本 vX · 立即更新」（可点）
+ *
+ * @param {object|null} run 宿主 /worktodo/update 的状态（或 /list 载荷里的摘要）
+ * @param {object|null} update /list 载荷里的 update 字段
+ * @param {(key: string) => string} t 文案函数
+ * @returns {{text: string, title: string, tone: 'ok'|'busy'|'warn'|'error', action: 'update'|'retry'|null, disabled: boolean}|null}
+ */
+export function updateBadgeState(run, update, t) {
+  const state = run?.state ?? 'idle';
+  if (state === 'running') {
+    const to = run?.to ? ` v${run.to}` : '';
+    return {
+      text: `${t('updating')}${to}`,
+      title: run?.command ? String(run.command) : t('updating'),
+      tone: 'busy',
+      action: null,
+      disabled: true,
+    };
+  }
+  if (state === 'done') {
+    const to = run?.to ?? update?.installed ?? update?.latest;
+    return {
+      text: to ? t('updatedRestart').replace('{version}', `v${to}`) : t('updateRestartHint'),
+      title: to ? `v${to}` : '',
+      tone: 'ok',
+      action: null,
+      disabled: true,
+    };
+  }
+  if (state === 'failed') {
+    const reason = run?.reason;
+    if (reason === 'linked') {
+      return { text: t('updateLinked'), title: t('updateLinked'), tone: 'warn', action: null, disabled: true };
+    }
+    const detail = String(run?.error ?? reason ?? '');
+    return {
+      // 失败要能重试：用户可能只是网络抖了一下
+      text: `${t('updateFailed')}：${detail}`,
+      title: `${t('updateRetryHint')}${detail ? ` — ${detail}` : ''}`,
+      tone: 'error',
+      action: 'retry',
+      disabled: false,
+    };
+  }
+  if (update?.hasUpdate) {
+    return {
+      text: `${t('updateAvailable')} v${update.latest} · ${t('updateNow')}`,
+      title: t('updateHint'),
+      tone: 'ok',
+      action: 'update',
+      disabled: false,
+    };
+  }
+  return null;
+}
+
 function WorkTodoPanel(props) {
   // t 由 locale 服务通过 slot props 注入；拿不到时退回中文，至少不显示裸 key。
   // 兜底必须是模块级常量（FALLBACK_T）：每次渲染新建箭头函数会让 TodoRow 的 memo 永远失效。
@@ -1430,6 +1554,11 @@ function WorkTodoPanel(props) {
   const [view, setView] = React.useState('due');
   const shapes = shapesForView(view);
   const { status, data, error, refresh } = useList(sort, shapes);
+
+  // 版本与自升级状态必须在**任何依赖它们的 hook 之前**解析：
+  // hook 的依赖数组是在渲染期求值的，放到后面（早退分支之后）会踩 TDZ。
+  const version = typeof data?.version === 'string' ? data.version : '';
+  const update = data?.update ?? null;
 
   /**
    * 跟随外部改动刷新（审计 F7：宿主的 onChanged/onChange 原来是死代码，面板只在
@@ -1454,6 +1583,37 @@ function WorkTodoPanel(props) {
       if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', onVisible);
     };
   }, [refresh]);
+
+  /**
+   * 自升级的本地状态：点下「立即更新」后，到轮询结束前的状态由它渲染。
+   * `null` 表示「跟随 /list 载荷里的 update.run」（例如刚刷新页面时宿主还在跑）。
+   */
+  const [updateRun, setUpdateRun] = React.useState(null);
+  const run = updateRun ?? update?.run ?? null;
+  const runState = run?.state ?? 'idle';
+
+  /**
+   * 升级进度轮询：**只在 running 时存在**，一离开 running 立刻停（依赖数组里就是 runState）。
+   * 常驻定时器会让「不打无用请求」这条约束作废，所以这里刻意不做成固定间隔的常驻 effect。
+   */
+  React.useEffect(() => {
+    if (runState !== 'running') return undefined;
+    let alive = true;
+    const timer = setInterval(() => {
+      if (isWindowHidden()) return; // 后台窗口不轮询；重新可见时由 visibilitychange 补
+      fetchUpdateRun()
+        .then((next) => {
+          if (!alive || !next) return;
+          if (next.state !== 'running') {
+            setUpdateRun(next);
+            refresh(); // 升级落盘后列表/版本信息要重取一次
+          }
+        })
+        .catch(() => { /* 单次轮询失败不改状态，下一次再试；升级子进程不受影响 */ });
+    }, UPDATE_POLL_MS);
+    timer?.unref?.(); // Node（测试环境）里不要因为这个定时器挂住事件循环
+    return () => { alive = false; clearInterval(timer); };
+  }, [runState, refresh]);
 
   // 写操作的错误条；readError 是拉取错误（用户关掉之后，只有换成新错误才再弹）
   const [barError, setBarError] = React.useState(null);
@@ -1485,6 +1645,34 @@ function WorkTodoPanel(props) {
       refresh();
     }
   }, [refresh]);
+
+  /**
+   * 「立即更新」：POST 触发升级 → 立刻把本地状态设成 running（按钮马上变成「正在更新…」），
+   * 之后由上面那个 2 秒轮询接管，直到 done/failed。
+   *
+   * 刻意**不走 runWrite**：升级不是待办写操作，失败原因（尤其 `linked`）要留在页脚那一格，
+   * 而不是弹到面板顶部的写错误条上。
+   */
+  const handleUpdate = React.useCallback(() => {
+    if (runState === 'running') return Promise.resolve(false);
+    setUpdateRun({ state: 'running', from: version || null, to: update?.latest ?? null });
+    return postJson('/update', { action: 'plugin-update' })
+      .then((next) => {
+        // 宿主可能同步就给结论（linked / profile-not-found），也可能给 running
+        if (next && typeof next === 'object' && next.state) setUpdateRun(next);
+        else setUpdateRun({ state: 'done', to: update?.latest ?? null });
+        refresh();
+        return true;
+      })
+      .catch((updateError) => {
+        setUpdateRun({
+          state: 'failed',
+          reason: updateError?.reason ?? null,
+          error: String(updateError?.message ?? updateError),
+        });
+        return false;
+      });
+  }, [runState, version, update?.latest, refresh]);
 
   const handleAdd = React.useCallback((input) => {
     const title = String(input?.title ?? '').trim();
@@ -1623,9 +1811,9 @@ function WorkTodoPanel(props) {
   const stats = data?.stats ?? {};
   const today = typeof data?.today === 'string' && data.today ? data.today : localToday();
   const store = data?.store ?? null;
-  const version = typeof data?.version === 'string' ? data.version : '';
-  const update = data?.update ?? null;
   const num = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+  // 页脚「升级」那一格：纯函数决定文案/配色/是否可点（见 updateBadgeState）
+  const updateBadge = updateBadgeState(run, update, t);
   const overdueCount = num(stats.overdue);
   // 视图分桶：按截止（原有 GROUPS）或按项目（宿主给的 projectGroups，附 未完成/总数/逾期）
   const projectGroups = asArray(data?.projectGroups);
@@ -1800,13 +1988,17 @@ function WorkTodoPanel(props) {
           title: t('versionHint'),
           style: { color: C.label3 },
         }, `${t('versionLabel')} ${version ? `v${version}` : '—'}`),
-        update?.hasUpdate
-          ? React.createElement('span', {
+        updateBadge
+          ? React.createElement('button', {
             key: 'u',
-            className: 'wt-chip',
-            style: { fontSize: 10, color: C.ok, borderColor: tint(C.ok, 50), background: tint(C.ok, 12) },
-            title: `${t('updateHint')}：dsh plugin --profile desktop add dsh-worktodo@${update.latest}`,
-          }, `${t('updateAvailable')} v${update.latest}`)
+            type: 'button',
+            className: 'wt-chip wt-update',
+            // 升级进行中或面板还有写操作在飞时不可点，避免连点出第二个子进程
+            disabled: updateBadge.disabled || pending > 0,
+            onClick: updateBadge.action ? handleUpdate : undefined,
+            title: updateBadge.title,
+            style: { fontSize: 10, ...UPDATE_TONE_STYLE[updateBadge.tone] },
+          }, updateBadge.text)
           : null,
       ]),
       storeLocationLabel(store, t)

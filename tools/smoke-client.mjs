@@ -1115,6 +1115,66 @@ test('S6-2：客户端重复注册只降级那一条，不能让 apply 把面板
   eq(mainOnly.map((spec) => spec.key), ['worktodo'], '侧栏被占用时 main 面板必须照常注册：');
 });
 
+console.log('自升级（客户端）：只读提示变成可点的「立即更新」');
+
+test('updateBadgeState：有新版=可点，进行中/已完成/失败/linked 各有正确形态', () => {
+  eq(typeof mod.updateBadgeState, 'function', '面板应当导出升级徽标状态函数：');
+  // 只给「已更新到 {version}」这个带占位符的文案真身，其余返回 key，便于断言
+  const t = (key) => (key === 'updatedRestart' ? '已更新到 {version}，重启 DSH 生效' : key);
+
+  const idle = mod.updateBadgeState({ state: 'idle' }, { hasUpdate: true, latest: '0.2.4' }, t);
+  eq(idle.action, 'update', '有新版必须可点：');
+  eq(idle.disabled, false);
+  eq(idle.text.includes('0.2.4'), true, `要显示新版本号：${idle.text}`);
+  eq(idle.text.includes('updateNow'), true, `要明确写「立即更新」：${idle.text}`);
+
+  const running = mod.updateBadgeState({ state: 'running', to: '0.2.4', command: 'pnpm add dsh-worktodo@latest' }, null, t);
+  eq(running.disabled, true, '更新中不可点（防连点出第二个子进程）：');
+  eq(running.action, null);
+  eq(running.tone, 'busy');
+  eq(running.text.includes('updating'), true, `更新中要显示进行时文案：${running.text}`);
+
+  const done = mod.updateBadgeState({ state: 'done', to: '0.2.4' }, null, t);
+  eq(done.text.includes('{version}'), false, '不能留下未替换的占位符：');
+  eq(done.text.includes('0.2.4'), true, `完成态要报出升级到的版本：${done.text}`);
+  eq(done.disabled, true);
+
+  const linked = mod.updateBadgeState({ state: 'failed', reason: 'linked', error: 'link: 安装' }, null, t);
+  eq(linked.text, 'updateLinked', 'linked 要用「本地链接安装」的专门说明（那不是故障）：');
+  eq(linked.action, null, 'linked 不该给「重试」（重试一百次也一样）：');
+
+  const failed = mod.updateBadgeState({ state: 'failed', reason: 'exit-nonzero', error: '安装命令退出码 3' }, null, t);
+  eq(failed.action, 'retry', '失败必须能重试：');
+  eq(failed.text.includes('安装命令退出码 3'), true, `失败原因要显示出来：${failed.text}`);
+
+  eq(mod.updateBadgeState({ state: 'idle' }, { hasUpdate: false }, t), null, '没新版、没在升级时不该渲染这一格：');
+  eq(mod.updateBadgeState(null, null, t), null);
+});
+
+test('页脚：有新版时渲染成可点的按钮（不是只读 span），进行中则禁用并改文案', () => {
+  const t = (key) => key;
+  const previous = fakeListPayload.data.update;
+  try {
+    fakeListPayload.data.update = { current: '0.2.0', latest: '0.2.4', hasUpdate: true, run: { state: 'idle' } };
+    const ready = flattenTree(renderPanel({ t }))
+      .filter((n) => n.type === 'button' && String(n.props?.className ?? '').includes('wt-update'));
+    eq(ready.length, 1, `页脚必须渲染恰好一个升级按钮：${ready.length}`);
+    eq(typeof ready[0].props.onClick, 'function', '升级按钮必须真的挂了点击处理：');
+    eq(ready[0].props.disabled, false, '有新版时可点：');
+    eq(textOf(ready[0]).includes('0.2.4'), true, `徽标要显示新版本：${textOf(ready[0])}`);
+    eq(textOf(ready[0]).includes('updateNow'), true, `要写「立即更新」：${textOf(ready[0])}`);
+
+    fakeListPayload.data.update = { current: '0.2.0', latest: '0.2.4', hasUpdate: true, run: { state: 'running', to: '0.2.4' } };
+    const busy = flattenTree(renderPanel({ t }))
+      .filter((n) => n.type === 'button' && String(n.props?.className ?? '').includes('wt-update'));
+    eq(busy.length, 1);
+    eq(busy[0].props.disabled, true, '更新中必须禁用按钮：');
+    eq(textOf(busy[0]).includes('updating'), true, `更新中要变成「正在更新…」：${textOf(busy[0])}`);
+  } finally {
+    fakeListPayload.data.update = previous;
+  }
+});
+
 console.log(`\n${passed} 通过，${failures.length} 失败`);
 if (failures.length) {
   for (const f of failures) console.error(`- ${f.label}: ${f.error?.stack ?? f.error}`);
