@@ -898,6 +898,159 @@ await test('S1-2：storageDomain.open 永不 resolve → 超时后 apply 仍然�
   }
 });
 
+console.log('S4-2 / S4-3：请求体读取必须有时间上限，失败必须给明确状态码');
+
+/**
+ * 半包请求：声明了 body 却**永远不 end**（慢客户端 / 不关 socket）。
+ * 审计 S4-2 的复现条件：旧实现只监听 data/end/error，这个请求永远不会 settle。
+ * @param {{method?: string, url?: string, body?: string, [key: string]: any}} [options]
+ */
+function makeHalfOpenRequest({ method = 'POST', url, body = '{"title":"半包' } = {}) {
+  const req = new Readable({ read() {} });
+  req.method = method;
+  req.url = url;
+  req.push(body); // 注意：不 push(null) → 'end' 永远不来
+  return req;
+}
+
+await test('S4-2：半包/不结束的请求在超时后回 408 + 原因，handler 绝不悬挂', async () => {
+  const previousTimeout = process.env.WORKTODO_BODY_TIMEOUT_MS;
+  process.env.WORKTODO_BODY_TIMEOUT_MS = '120'; // 测试里把默认 5s 缩短（同一类测试缝）
+  const dir = mkdtempSync(join(tmpdir(), 'worktodo-host-body-'));
+  try {
+    const host = makeCtx();
+    await apply(host.ctx, { storePath: join(dir, 'todos.json') });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const response = makeResponse();
+    const started = Date.now();
+    const settled = await Promise.race([
+      host.routes.get('/worktodo/create').handler(makeHalfOpenRequest({ url: '/worktodo/create' }), response)
+        .then(() => true),
+      // 反向验证的安全网：改前这里会一直挂着（靠 Node 默认 300s 的 requestTimeout 兜底）
+      new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
+    ]);
+    const ms = Date.now() - started;
+
+    eq(settled, true, `handler 必须在超时后 settle（改前会挂住不返回；已等 ${ms}ms）：`);
+    eq(response.statusCode, 408, `超时必须回 408（实际 ${response.statusCode}）：`);
+    const body = response.json();
+    eq(body.ok, false);
+    eq(body.reason, 'body-timeout');
+    eq(String(body.error).includes('超时'), true, `要说明是超时：${body.error}`);
+    eq(ms < 1500, true, `要在超时值附近就返回（实际 ${ms}ms）：`);
+
+    // 之后的请求照常，坏请求没有留下任何坏状态
+    const after = await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
+    eq(after.statusCode, 200);
+    eq(after.json().ok, true, '超时请求之后业务必须照常：');
+  } finally {
+    if (previousTimeout === undefined) delete process.env.WORKTODO_BODY_TIMEOUT_MS;
+    else process.env.WORKTODO_BODY_TIMEOUT_MS = previousTimeout;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('S4-3：超限请求体先回明确的 413 + 原因再关连接（客户端不再只看到 ECONNRESET）', async () => {
+  const http = await import('node:http');
+  const net = await import('node:net');
+  const dir = mkdtempSync(join(tmpdir(), 'worktodo-host-413-'));
+  let server = null;
+  try {
+    const host = makeCtx();
+    await apply(host.ctx, { storePath: join(dir, 'todos.json') });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const handler = host.routes.get('/worktodo/create').handler;
+    // 真 http.Server + 裸 socket：只有真连接才验证得了「客户端到底看到什么」
+    server = http.createServer((req, res) => { void handler(req, res); });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+
+    const raw = await new Promise((resolve) => {
+      const socket = net.connect(port, '127.0.0.1', () => {
+        socket.write('POST /worktodo/create HTTP/1.1\r\nHost: localhost\r\n'
+          + 'Content-Type: application/json\r\nContent-Length: 900000\r\n\r\n');
+        // 只发 300 KiB（> 256 KiB 上限），然后**不结束**请求：超限必须立刻被挡下
+        socket.write(`{"title":"${'x'.repeat(300 * 1024)}`);
+      });
+      let text = '';
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        try { socket.destroy(); } catch { /* 已关 */ }
+        resolve(text);
+      };
+      socket.on('data', (chunk) => { text += chunk.toString('utf8'); });
+      socket.on('error', (error) => { text += `[ERR ${error.code}]`; finish(); });
+      socket.on('close', finish);
+      setTimeout(finish, 3000);
+    });
+
+    eq(raw.includes('413'), true, `客户端必须拿到明确的 413（改前只有 ECONNRESET socket hang up）：${raw.split('\r\n')[0] ?? raw}`);
+    eq(raw.includes('body-too-large'), true, `响应体要带稳定的原因码：${raw.slice(-160)}`);
+    eq(raw.includes('ECONNRESET'), false, `不该是连接被掐断：${raw.slice(-160)}`);
+  } finally {
+    try { server?.close(); } catch { /* 已关 */ }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('S4-3：超限（同一 chunk 就超）在假 request 流上同样回 413，而不是 200/internal', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'worktodo-host-413b-'));
+  try {
+    const host = makeCtx();
+    await apply(host.ctx, { storePath: join(dir, 'todos.json') });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const response = await call(host.routes.get('/worktodo/create').handler, {
+      method: 'POST',
+      url: '/worktodo/create',
+      body: `{"title":"${'x'.repeat(300 * 1024)}"}`, // 一次就超过 256 KiB
+    });
+    eq(response.statusCode, 413, `超限必须回 413（实际 ${response.statusCode}）：`);
+    eq(response.json().reason, 'body-too-large');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+console.log('S6-2：重复注册只能降级那一条（补断言钉住宿主/插件已有的兜底）');
+
+await test('S6-2：同名工具重复注册 → apply 不崩、面板照常，health 明确报 tools.status=failed（不静默）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'worktodo-host-duptool-'));
+  try {
+    const host = makeCtx();
+    let registered = 0;
+    // 复刻官方 tools.register 对重名工具抛错的语义（S6-2）
+    host.ctx.tools = {
+      register() {
+        registered += 1;
+        if (registered === 2) throw new Error('tool "worktodo_add_many" already has a registration');
+        return () => {};
+      },
+    };
+
+    let applyError = null;
+    try {
+      await apply(host.ctx, { storePath: join(dir, 'todos.json') });
+    } catch (error) {
+      applyError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    eq(applyError, null, '工具注册抛错不能冒到 apply（面板与路由必须照常挂上）：');
+    eq(host.routes.size, 8, `工具失败时 8 条路由照常在（实际 ${host.routes.size}）：`);
+    const health = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json();
+    eq(health.ok, true);
+    eq(health.tools.status, 'failed', '工具注册失败必须显式报出来（不静默）：');
+    eq(String(health.tools.error).includes('already has a registration'), true, `要带原始原因：${health.tools.error}`);
+    eq(health.tools.registered, 0, '当前实现下一条失败会整批不算数（已记进报告的未修项）：');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 console.log(`\n${passed} 通过，${failures.length} 失败`);
 if (failures.length) {
   for (const f of failures) console.error(`- ${f.label}: ${f.error?.stack ?? f.error}`);

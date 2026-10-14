@@ -35,14 +35,37 @@ const LOCALE_NS = SHORT_NAME;
 const ROUTE_LIST = `${ROUTE_BASE}/list`;
 
 /**
+ * 拿不到宿主注入的 t 时的兜底字典。
+ * 必须是**模块级常量**：写成组件里的箭头函数会让每次渲染都换一个函数身份，
+ * 面板传给每一行的 `t` 就不再浅相等 —— `React.memo` 会因此永远不生效（S3-3）。
+ */
+const FALLBACK_T = (key) => zh[key] ?? key;
+
+/**
  * 面板自动刷新间隔：agent 通过 worktodo_* 工具改了列表时宿主不会推送，
  * 面板只能自己定期拉一次（以及窗口重新获得焦点时拉一次），否则用户得手点刷新才看得到。
  *
  * 复审 R4：从 10 秒放宽到 30 秒 —— 每次轮询都是一次全量 `load()`（domain 路径要遍历整张表），
  * 10 秒一次在待办多起来时是纯浪费；用户重新聚焦窗口时那条路径会立刻补上新鲜度。
  * 卸载时定时器与监听都会被清掉。
+ *
+ * S3-3（第四轮审计，客户端侧）：窗口不可见（`document.visibilityState === 'hidden'`）时
+ * **一次请求都不打** —— 多窗口/切到后台的场景下，原来的定时器每 30 秒仍然全量拉一次。
+ * 重新可见时由 `visibilitychange` 那条路径立刻补一次新鲜度。
  */
 export const CHANGE_POLL_MS = 30000;
+
+/**
+ * 窗口是否不可见。
+ *
+ * 抽成纯函数有两个原因：SSR/无 document 环境（测试）里要安全；以及行为可以直接单测。
+ * `document` 缺失时按「可见」处理：没有浏览器上下文就没有「后台窗口」这回事。
+ * @param {Document|undefined} [doc]
+ * @returns {boolean}
+ */
+export function isWindowHidden(doc = typeof document !== 'undefined' ? document : undefined) {
+  return Boolean(doc && doc.visibilityState === 'hidden');
+}
 
 /**
  * 编辑表单的优先级档位。`none` 必须在里面：它代表「不设优先级」这个真实状态，
@@ -605,7 +628,12 @@ async function postJson(path, body) {
     credentials: 'same-origin',
     body: JSON.stringify(body ?? {}),
   });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  if (!response.ok) {
+    // S4-3：宿主对请求体超时/超限回的是 4xx + `{reason, error}`（以前直接掐断连接，
+    // 客户端只能看到 ECONNRESET）。这里优先把宿主的原文取出来，用户才看得到「请求体过大」。
+    const detail = await response.json().catch(() => null);
+    throw new Error(detail?.error ?? detail?.reason ?? `HTTP ${response.status}`);
+  }
   const parsed = await response.json().catch(() => null);
   if (!parsed) throw new Error('响应不是 JSON');
   if (!parsed.ok) throw new Error(parsed.error ?? parsed.reason ?? '未知错误');
@@ -618,15 +646,21 @@ async function postJson(path, body) {
 /**
  * 模块级缓存：面板被切走再切回来时 React 会重新挂载，有上次结果就先渲染、后台再刷新
  * （stale-while-revalidate）。侧栏来回点的时候不该每次都转圈。
+ *
+ * S3-3：缓存必须**按形状分开**。面板现在只请求当前视图需要的那一种形状（见 shapesForView），
+ * 如果还共用一份缓存，切到「按项目」时会先拿「按截止」的旧载荷去渲染 → 短暂显示空列表。
  */
-let lastList = null;
+const lastListByShapes = new Map();
 // 排序模式跨「切走再切回」保持；manual = 尊重拖动顺序
 let lastSort = 'manual';
 
-function useList(sort) {
-  const [state, setState] = React.useState(() => (lastList
-    ? { status: 'ready', data: lastList, error: null }
-    : { status: 'loading', data: null, error: null }));
+function useList(sort, shapes) {
+  const [state, setState] = React.useState(() => {
+    const cached = lastListByShapes.get(shapes);
+    return cached
+      ? { status: 'ready', data: cached, error: null }
+      : { status: 'loading', data: null, error: null };
+  });
   const [tick, setTick] = React.useState(0);
 
   React.useEffect(() => {
@@ -635,13 +669,16 @@ function useList(sort) {
      * filter=all 而不是 open：面板是「按分组展示」的，宿主的分组是在**筛选后的子集**上算的，
      * 用 open 时 groups.completed 恒为空，「已完成」那一组就永远出不来（也就没法折叠/展开）。
      * 统计 stats 不受 filter 影响（宿主按全量算），所以顶部数字仍然是全局口径。
+     *
+     * S3-3：shapes 明确只取当前视图需要的一种 —— 缺省（不发 shapes）宿主会回三份同样大小的数据
+     *（5000 条 = 4.28 MiB/次），而面板一次只用得上其中一份。
      */
-    fetch(`${ROUTE_LIST}?filter=all&sort=${encodeURIComponent(sort || 'manual')}`, { cache: 'no-store', credentials: 'same-origin' })
+    fetch(`${ROUTE_LIST}?filter=all&sort=${encodeURIComponent(sort || 'manual')}&shapes=${encodeURIComponent(shapes)}`, { cache: 'no-store', credentials: 'same-origin' })
       .then(async (response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const body = await response.json().catch(() => null);
         if (!body?.ok) throw new Error(body?.error ?? body?.reason ?? '未知错误');
-        lastList = body.data;
+        lastListByShapes.set(shapes, body.data);
         if (alive) setState({ status: 'ready', data: body.data, error: null });
       })
       .catch((error) => {
@@ -655,7 +692,7 @@ function useList(sort) {
         }
       });
     return () => { alive = false; };
-  }, [tick, sort]);
+  }, [tick, sort, shapes]);
 
   const refresh = React.useCallback(() => setTick((n) => n + 1), []);
   return { ...state, refresh };
@@ -884,8 +921,17 @@ function QuickAdd({ t, onAdd, busy }) {
 /* ------------------------------------------------------------------ *
  * 单行：查看 / 行内编辑 / 二次确认删除
  * 状态都留在这一行内部，所以在别的行上敲字、或者列表刷新，都不会把正在编辑的内容冲掉。
+ *
+ * S3-3（客户端侧）：外面包一层 `React.memo`（默认浅比较）。5000 条时每一次
+ * 「与数据无关」的父级重渲染（折叠分组、错误条、pending 计数、拖动开始/结束…）
+ * 都会把整张列表 reconcile 一遍；memo 让只有 props 真的变了的那些行重渲染。
+ * 为了让浅比较真的起作用，父级传下来的必须是稳定引用：
+ *   - `t`：拿不到宿主注入时用模块级 FALLBACK_T，不再是每次渲染新建的箭头函数；
+ *   - `onToggle/onRemove/onSave`：useCallback（面板里已保证）；
+ *   - `drag`：共享的 dragHandlers 对象（useMemo），每一行不再各造一个新对象；
+ *     每一行与拖动相关的差异只有布尔 `dragging`。
  * ------------------------------------------------------------------ */
-function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
+const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag, dragging }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(null);
   const [notesOpen, setNotesOpen] = React.useState(false);
@@ -1071,7 +1117,7 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
       onDrop: (event) => { event.preventDefault(); drag.onDrop?.(row.id); },
       onDragEnd: () => drag.onEnd?.(),
       title: drag.hint,
-      style: drag.dragging ? { opacity: 0.45 } : undefined,
+      style: dragging ? { opacity: 0.45 } : undefined,
     }
     : {};
   return React.createElement('div', { className: 'wt-row', ...dragAttrs, style: row.priority === 'high' ? { borderLeft: `2px solid ${C.error}`, paddingLeft: 8 } : undefined }, [
@@ -1124,7 +1170,7 @@ function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag }) {
       },
     }, confirming ? t('confirmDelete') : React.createElement(IconTrash, { key: 'i' })),
   ]);
-}
+});
 
 /* ------------------------------------------------------------------ *
  * 分组：空组整块不渲染，避免五个空标题堆在面板上
@@ -1155,14 +1201,10 @@ function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTod
       onToggle: onToggleTodo,
       onRemove,
       onSave,
-        drag: drag ? {
-          dragging: drag.dragId === todo?.id,
-          hint: drag.hint,
-          onStart: drag.onStart,
-          onOver: drag.onOver,
-          onDrop: drag.onDrop,
-          onEnd: drag.onEnd,
-        } : undefined,
+      // S3-3：共享同一个 drag 对象（引用稳定），每行只有布尔 dragging 不同 ——
+      // 否则每一行每次父级重渲染都会收到一个新的 drag 对象，memo 的浅比较必然失效
+      drag,
+      dragging: Boolean(drag) && drag.dragId === todo?.id,
     }))),
   ]);
 }
@@ -1222,6 +1264,60 @@ const GROUPS = [
   { key: 'later', label: 'groupLater' },
   { key: 'completed', label: 'groupCompleted' },
 ];
+
+/**
+ * 视图 → 需要向宿主索取的数据形状（S3-3 客户端侧）。
+ *
+ * 宿主 `/list` 支持 `shapes=todos|groups|projectGroups`，但面板原来**完全没用**：
+ * 每次轮询都拿三份同样大小的数据（5000 条 = 4.28 MiB/次），而面板一次只用得上其中一份。
+ *   - 「按截止」渲染 `groups`；
+ *   - 「按项目」渲染 `projectGroups`；
+ *   - `todos`（平铺顺序）只在没有分组时的兼容路径上用得到，见 payloadRecordIds()。
+ * 缺省（不带 shapes）仍然合法 —— 这是宿主侧的兼容合同，别的地方照旧能用。
+ */
+export const VIEW_SHAPES = { due: 'groups', project: 'projectGroups' };
+
+/** 某个视图需要哪一份形状（未知视图按默认的「按截止」处理）。 */
+export function shapesForView(view) {
+  return VIEW_SHAPES[view] ?? VIEW_SHAPES.due;
+}
+
+/**
+ * 当前载荷里有这个视图渲染所需的形状吗？
+ *
+ * 切视图时会立刻按新形状重新请求，但数据要等一个 RTT 才到；这期间如果沿用旧载荷，
+ * `groups`（或 `projectGroups`）缺失会被当成「一条都没有」而闪一下空列表。
+ * 有数据但缺形状时按「还在加载」渲染，等新载荷落地。
+ * @param {object|null} data
+ * @param {string} view
+ */
+export function hasViewShape(data, view) {
+  if (!data) return false;
+  return shapesForView(view) === 'projectGroups'
+    ? Array.isArray(data.projectGroups)
+    : Boolean(data.groups && typeof data.groups === 'object');
+}
+
+/**
+ * 从当前载荷里取出一份「完整且有序」的记录 id 列表 —— 拖拽重排用它算新顺序。
+ *
+ * 优先用 `todos`（真·全局顺序）；只取了分组形状时把当前视图的桶摊平：用户看到的就是
+ * 这个顺序，桶内顺序由宿主按当前 sort 排好，所以拖拽结果与屏幕上看到的一致。
+ * 只取了 `groups` 时不再为拖拽多发一次请求（拖拽是低频的用户动作，多一次全量拉并不划算）。
+ * @param {object|null} data
+ * @returns {string[]}
+ */
+export function payloadRecordIds(data) {
+  const flat = asArray(data?.todos).map((todo) => todo?.id).filter(Boolean);
+  if (flat.length) return flat;
+  const merged = [];
+  const groups = data?.groups;
+  if (groups && typeof groups === 'object') {
+    for (const group of GROUPS) merged.push(...asArray(groups[group.key]));
+  }
+  for (const bucket of asArray(data?.projectGroups)) merged.push(...asArray(bucket?.todos));
+  return merged.map((todo) => todo?.id).filter(Boolean);
+}
 
 /** 极简占位符替换：`{name}` → vars[name]（面板文案的少量插值，不引第三方库）。 */
 function fillTemplate(text, vars) {
@@ -1323,26 +1419,33 @@ export function storeLocationLabel(store, t) {
 }
 
 function WorkTodoPanel(props) {
-  // t 由 locale 服务通过 slot props 注入；拿不到时退回中文，至少不显示裸 key
-  const t = typeof props?.t === 'function' ? props.t : (key) => zh[key] ?? key;
-  // 排序：manual（默认，尊重拖动）/ priority / created；必须在 useList(sort) 之前声明
+  // t 由 locale 服务通过 slot props 注入；拿不到时退回中文，至少不显示裸 key。
+  // 兜底必须是模块级常量（FALLBACK_T）：每次渲染新建箭头函数会让 TodoRow 的 memo 永远失效。
+  const t = typeof props?.t === 'function' ? props.t : FALLBACK_T;
+  // 排序：manual（默认，尊重拖动）/ priority / created
   const [sort, setSortState] = React.useState(lastSort);
   const setSort = React.useCallback((next) => { lastSort = next; setSortState(next); }, []);
   const [dragId, setDragId] = React.useState(null);
-  const { status, data, error, refresh } = useList(sort);
+  // 视图：按截止（默认）或按项目。必须在 useList 之前声明 —— 视图决定要请求哪种形状（S3-3）。
+  const [view, setView] = React.useState('due');
+  const shapes = shapesForView(view);
+  const { status, data, error, refresh } = useList(sort, shapes);
 
   /**
    * 跟随外部改动刷新（审计 F7：宿主的 onChanged/onChange 原来是死代码，面板只在
    * 挂载 / 切排序 / 点刷新 / 自己写操作后才拉数据，agent 用工具加了一条用户看不到）。
    * 这里定期 + 窗口重新聚焦 / 重新可见时拉一次；清理函数里清掉定时器与监听，卸载后不留活动引用。
-   * 复审 R4：轮询已放宽到 CHANGE_POLL_MS（30s），「重新聚焦」那条路径负责补新鲜度；
-   * `visibilitychange` 只在**变成可见**时刷新（隐藏时也刷等于白打一次宿主）。
+   * 复审 R4：轮询已放宽到 CHANGE_POLL_MS（30s），「重新聚焦」那条路径负责补新鲜度。
+   * S3-3（客户端侧）：窗口隐藏时**停轮询**（一次都不打宿主）；重新可见时立刻补一次。
    */
   React.useEffect(() => {
-    const timer = setInterval(() => refresh(), CHANGE_POLL_MS);
+    const timer = setInterval(() => {
+      if (isWindowHidden()) return; // 后台/最小化的窗口不再每 30 秒白打一次宿主
+      refresh();
+    }, CHANGE_POLL_MS);
     timer?.unref?.(); // Node（测试环境）里不要因为这个定时器挂住事件循环
     const onActive = () => refresh();
-    const onVisible = () => { if (document.visibilityState !== 'hidden') refresh(); };
+    const onVisible = () => { if (!isWindowHidden()) refresh(); };
     window?.addEventListener?.('focus', onActive);
     if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', onVisible);
     return () => {
@@ -1362,8 +1465,6 @@ function WorkTodoPanel(props) {
   const [pending, setPending] = React.useState(0);
   // 「已完成」默认折叠（做完的事不用占满屏幕），其余默认展开
   const [closed, setClosed] = React.useState({ completed: true });
-  // 视图：按截止（默认）或按项目
-  const [view, setView] = React.useState('due');
 
   /**
    * 所有写操作的统一外壳：成功清掉错误条，失败把宿主的 error 原文放上去，
@@ -1416,7 +1517,9 @@ function WorkTodoPanel(props) {
 
     if (!dragging || !targetId || dragging === targetId) return Promise.resolve(false);
 
-    const ids = asArray(data?.todos).map((todo) => todo?.id).filter(Boolean);
+    // S3-3：面板现在只取当前视图需要的形状（按截止=groups、按项目=projectGroups），
+    // 载荷里不一定有 todos —— 从当前视图的桶摊平出完整顺序（见 payloadRecordIds）。
+    const ids = payloadRecordIds(data);
 
     const from = ids.indexOf(dragging);
 
@@ -1500,6 +1603,19 @@ function WorkTodoPanel(props) {
       React.createElement('button', {
         key: 'r', type: 'button', className: 'wt-btn', style: { marginTop: 10 }, onClick: refresh,
       }, t('retry')),
+    ]);
+  }
+
+  // S3-3：切视图会按新形状立刻重新请求，但新载荷要等一个 RTT。这期间若沿用旧载荷，
+  // 缺少的形状会被当成「一条都没有」而闪一下空列表；按「还在加载」渲染，等数据落地。
+  if (data && !hasViewShape(data, view)) {
+    return React.createElement('div', {
+      className: 'wt-root',
+      style: { ...rootStyle, display: 'flex', alignItems: 'center', gap: 8, color: C.label3, padding: 28 },
+    }, [
+      React.createElement('style', { key: 'css' }, STYLE_TEXT),
+      React.createElement('span', { key: 'sp', className: 'wt-spin' }),
+      React.createElement('span', { key: 't' }, t('loading')),
     ]);
   }
 
@@ -1718,23 +1834,51 @@ function WorkTodoPanel(props) {
  * ------------------------------------------------------------------ */
 export const inject = ['slots', 'locale'];
 
+/**
+ * 幂等注册（S6-2）。
+ *
+ * 官方 `slots.register` / `locale.register` 对重复注册是**抛错**而不是幂等
+ *（`single slot "…" already has a registration` / `locale namespace "…" already has locale "…"`）。
+ * 而客户端 `apply()` 里这两处原来都没有兜底：同一 ctx 上第二次 apply（或与别的插件撞了 slot id）
+ * 会一路抛到客户端 apply → **面板整体消失**，用户只能刷新页面。
+ * 这里把「注册失败」降级成「丢这一条 + 控制台一行 warn」：面板的主入口（main slot）继续注册，
+ * 最坏情况只是少了侧栏入口或某个语言字典 —— 绝不整块挂不上。
+ *
+ * 与宿主半侧同一条策略：`lib/index.js` 的路由注册（S1-1）与工具注册都是「单条失败只降级」。
+ * @param {string} label 给日志用的一句话
+ * @param {() => any} run
+ * @returns {any} 注册结果（失败时给一个空 disposer）
+ */
+function safeRegister(label, run) {
+  try {
+    return run();
+  } catch (error) {
+    // 不吞错：原始原因照原样打出来（排查「面板为什么没出现」时第一眼要看这个）
+    console.warn(`[${SHORT_NAME}] ${label}失败（跳过这一条，其余照常）：${error?.message ?? error}`);
+    return () => {};
+  }
+}
+
 export function apply(ctx) {
-  ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh, en }), `${LOCALE_NS}: dictionaries`);
+  ctx.effect(
+    () => safeRegister('locale 字典注册', () => ctx.locale.register(LOCALE_NS, { zh, en })),
+    `${LOCALE_NS}: dictionaries`,
+  );
 
   // 侧栏入口（id 必须与 main 面板的 key 同名，sidebar 用它去选中面板）
   // 同样包错误边界：图标渲染抛错也不该把整个 sidebar 入口打崩
-  ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+  ctx.slots.inject('sidebar.panellist', () => safeRegister('sidebar.panellist 注册', () => ctx.slots.register({
     name: 'sidebar.panellist',
     id: SLOT_ID,
     order: 88,
     label: () => '待办',
     locale: LOCALE_NS,
-  }, withErrorBoundary((props) => React.createElement(WorkTodoIcon, { size: props?.size ?? 16, active: props?.active }))));
+  }, withErrorBoundary((props) => React.createElement(WorkTodoIcon, { size: props?.size ?? 16, active: props?.active })))));
 
   // 中栏独立面板（外面包一层错误边界：渲染抛错时给中文兜底 + 重试，而不是整块白屏）
-  ctx.slots.inject('main', () => ctx.slots.register({
+  ctx.slots.inject('main', () => safeRegister('main 面板注册', () => ctx.slots.register({
     name: 'main',
     key: SLOT_ID,
     locale: LOCALE_NS,
-  }, withErrorBoundary(WorkTodoPanel)));
+  }, withErrorBoundary(WorkTodoPanel))));
 }

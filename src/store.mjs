@@ -34,8 +34,37 @@ import { repairRecord, repairStoreDocument } from './schema.mjs';
 const DOMAIN_NAME = 'worktodo';
 const TABLE_NAME = 'todos';
 
-/** 后端升级失败后的重试节流（同一个服务对象）：避免每个请求都重试 + 刷日志。 */
+/**
+ * 后端升级失败后的重试节流（同一个服务对象）：避免每个请求都重试 + 刷日志。
+ *
+ * S2-2（第四轮审计）：固定 5 秒节流下，一场持续性故障会**永远**按 5 秒一轮重试
+ *（读整文件 + 合并 + warn 各一轮，见审计的 1214 MiB/小时读、1440 条 warn/小时）。
+ * 改成指数退避：5s → 10s → 20s → 40s → 80s → 160s → 封顶 5 分钟；任何一次升级**成功**后立刻复位。
+ * 第一次重试仍是 5 秒 —— 偶发失败（服务晚注册、临时占用）的恢复速度不变。
+ * 测试可用 `WORKTODO_UPGRADE_RETRY_MS` 覆盖基数（同一类测试缝）。
+ */
 const UPGRADE_RETRY_MS = 5000;
+
+/** 指数退避的上限：一场持续故障最多每 5 分钟重试一轮。 */
+const UPGRADE_RETRY_MAX_MS = 5 * 60 * 1000;
+
+/** 实际生效的退避基数（测试可注入更短的值；非法值一律回落到默认）。 */
+function upgradeRetryBaseMs() {
+  const injected = Number(process.env.WORKTODO_UPGRADE_RETRY_MS);
+  return Number.isFinite(injected) && injected > 0 ? injected : UPGRADE_RETRY_MS;
+}
+
+/**
+ * 第 `failures` 次失败之后要等多久（failures 从 1 起：5s→10s→20s…封顶 5 分钟）。
+ * 纯函数，测试直接验序列，不依赖真实等待。
+ * @param {number} failures
+ * @returns {number} 毫秒
+ */
+export function upgradeRetryDelayMs(failures) {
+  const step = Math.max(1, Math.trunc(Number(failures) || 0));
+  const grown = upgradeRetryBaseMs() * (2 ** (step - 1));
+  return Math.min(grown, UPGRADE_RETRY_MAX_MS);
+}
 
 /**
  * 挂载路径上等待官方 storage 打开的上限（S1-2，第四轮审计）：
@@ -202,6 +231,11 @@ function writeDroppedBackup(path, dropped, logger) {
  * 文件的原子写：先写同目录临时文件，再 rename 覆盖。
  * 直接 writeFileSync 到目标路径时，进程被杀或磁盘满会留下半个 JSON，
  * 用户的待办就全丢了；rename 在同一文件系统上是原子的。
+ *
+ * S4-4（第四轮审计）：写失败（尤其 ENOSPC）时**必须清掉自己刚写的临时文件**。
+ * 临时文件名固定为 `.tmp-<pid>`，旧实现写失败就把它留在原处 —— 磁盘满的场景下，
+ * 它恰好占着最需要腾出来的那点空间，下一次写入还会覆盖同一个名字（残留一份脏数据）。
+ * 注入点 `WORKTODO_TEST_FAULT=write-atomic-fail` 用来在真实磁盘上复现 ENOSPC（只在该值下生效）。
  * @param {string} path
  * @param {string} text
  */
@@ -209,8 +243,21 @@ function writeAtomic(path, text) {
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, text, 'utf8');
-  renameSync(tmp, path);
+  try {
+    writeFileSync(tmp, text, 'utf8');
+    if (process.env.WORKTODO_TEST_FAULT === 'write-atomic-fail') {
+      // 模拟「临时文件已经写出一部分，然后磁盘满」：此时 tmp 真实存在于磁盘上
+      const error = new Error(`ENOSPC: no space left on device, write '${tmp}'（注入）`);
+      error.code = 'ENOSPC';
+      throw error;
+    }
+    renameSync(tmp, path);
+  } catch (error) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch { /* 清理失败不能盖掉原始错误（调用方要靠它判断原因） */ }
+    throw error;
+  }
 }
 
 /** 落盘格式固定为「给人看」的形状：只写 version/updatedAt/todos，不把内部字段写进文件。 */
@@ -785,7 +832,8 @@ function createResilientStore({ ctx, logger }) {
   let ownedFile = null;
   let domainEntry = null;
   let domainUnsubscribe = null;
-  let lastAttempt = { service: undefined, at: 0 };
+  // 升级重试的指数退避状态（S2-2）：service 换了就重新计数；成功后复位
+  let lastAttempt = { service: undefined, at: 0, failures: 0, nextAt: 0 };
   let upgrading = null;
   let homePromise = null;
   let closed = false;
@@ -1046,6 +1094,23 @@ function createResilientStore({ ctx, logger }) {
   }
 
   /**
+   * 记一次升级失败，并算出下一次允许尝试的时间（S2-2 指数退避）：
+   * 5s → 10s → 20s → … 封顶 5 分钟；换了 storageDomain 服务就重新从 5 秒开始。
+   * @param {object} service
+   */
+  function noteUpgradeFailure(service) {
+    const failures = (lastAttempt.service === service ? lastAttempt.failures : 0) + 1;
+    const delay = upgradeRetryDelayMs(failures);
+    lastAttempt = { service, at: Date.now(), failures, nextAt: Date.now() + delay };
+    logger?.info?.(`待办存储升级将在 ${Math.round(delay / 1000)} 秒后重试（连续第 ${failures} 次失败）`);
+  }
+
+  /** 升级成功：退避状态复位（下一次独立故障仍从 5 秒开始）。 */
+  function noteUpgradeSuccess() {
+    if (lastAttempt.failures) lastAttempt = { service: undefined, at: 0, failures: 0, nextAt: 0 };
+  }
+
+  /**
    * 升级到官方 storage，并把两处记录合并过去。任何一步失败都只记录不一致状态，
    * **不改变当前后端**（继续用回退文件活着，但 health/日志里明确报出来）。
    */
@@ -1059,8 +1124,9 @@ function createResilientStore({ ctx, logger }) {
       state.mismatch = null;
       return false;
     }
-    if (!force && lastAttempt.service === service && Date.now() - lastAttempt.at < UPGRADE_RETRY_MS) return false;
-    lastAttempt = { service, at: Date.now() };
+    // S2-2：固定 5 秒 → 指数退避。持续故障下第 N 次重试间隔为 5s·2^(N-1)，封顶 5 分钟。
+    if (!force && lastAttempt.service === service && Date.now() < lastAttempt.nextAt) return false;
+    lastAttempt = { ...lastAttempt, service, at: Date.now() };
 
     let entry;
     try {
@@ -1077,6 +1143,7 @@ function createResilientStore({ ctx, logger }) {
             ? `当前仍在使用 JSON 文件 ${ownedFile?.location ?? '?'}`
             : `回退文件已退役/不存在，本次列表为空（官方 storage 里仍有数据，打开失败原因见上）`);
       logger?.warn?.(`⚠️ ${state.mismatch}`);
+      noteUpgradeFailure(service);
       return false;
     }
 
@@ -1091,6 +1158,7 @@ function createResilientStore({ ctx, logger }) {
           : `回退文件已退役/不存在，本次列表为空`);
       logger?.warn?.(`⚠️ ${state.mismatch}`);
       await releaseDomain(entry);
+      noteUpgradeFailure(service);
       return false;
     }
 
@@ -1100,6 +1168,8 @@ function createResilientStore({ ctx, logger }) {
     // 合并成功 = 数据已经在 domain 里了：退役回退文件，让 domain 成为唯一真源（复审 R1）
     const sourceWasFile = current?.kind === 'file';
     adopt(entry.backend);
+    // S2-2：升级成功 → 退避复位，下一次独立故障仍从 5 秒开始
+    noteUpgradeSuccess();
     if (sourceWasFile) {
       const retired = retireFallbackFile();
       if (retired && state.merge) state.merge.fallbackRetiredTo = retired.movedTo ?? null;

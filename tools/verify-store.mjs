@@ -17,7 +17,7 @@ import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openWorkTodoStore, unionById } from '../src/store.mjs';
+import { openWorkTodoStore, unionById, upgradeRetryDelayMs } from '../src/store.mjs';
 import { MISSING_TITLE_PLACEHOLDER, repairRecord, todoRecordSchema } from '../src/schema.mjs';
 import { createRecord } from '../src/records.mjs';
 
@@ -1007,6 +1007,98 @@ await test('S1-2：超时后那个 open 才成功 → 晚到的句柄会被归�
       else process.env.WORKTODO_UPGRADE_TIMEOUT_MS = previous;
     }
   });
+});
+
+console.log('S4-4 / S2-2（第四轮审计残留项）');
+
+await test('S4-4：写失败（ENOSPC）不留 *.tmp-<pid> 残留，原始错误照原样抛出，恢复后照常写', async () => {
+  await withTempHome(async (home) => {
+    const store = await openWorkTodoStore({ ctx: serviceHolder(null).ctx, config: {}, logger: silent });
+    await store.put(createRecord({ title: '先写一条' }, { now: NOW, id: 'wt-ok' }));
+    const dir = join(home, 'worktodo');
+    const tmps = () => readdirSync(dir).filter((name) => name.includes('.tmp-'));
+    eq(tmps().length, 0, '正常写入不该留下临时文件：');
+
+    // 注入点：临时文件已经写出来，然后磁盘满（模拟真实 ENOSPC —— tmp 真实存在于磁盘上）
+    const previousFault = process.env.WORKTODO_TEST_FAULT;
+    process.env.WORKTODO_TEST_FAULT = 'write-atomic-fail';
+    let error = null;
+    try {
+      await store.put(createRecord({ title: '写不进去' }, { now: NOW, id: 'wt-fail' }));
+    } catch (failure) {
+      error = failure;
+    } finally {
+      if (previousFault === undefined) delete process.env.WORKTODO_TEST_FAULT;
+      else process.env.WORKTODO_TEST_FAULT = previousFault;
+    }
+
+    eq(String(error?.message).includes('ENOSPC'), true,
+      `原始错误必须照原样抛出（调用方靠它判断原因）：${error?.message}`);
+    eq(tmps(), [],
+      `写失败后不许留下 *.tmp-*（改前会留下 todos.json.tmp-<pid>，满盘时正好占着最需要的那点空间）：${JSON.stringify(readdirSync(dir))}`);
+    // 盘上文件仍是完整合法的 JSON，只有一条
+    const doc = JSON.parse(readFileSync(join(dir, 'todos.json'), 'utf8'));
+    eq(doc.todos.map((t) => t.id), ['wt-ok'], '失败的写入不能污染已有数据：');
+
+    // 故障消失 → 照常写入，且不留残留
+    await store.put(createRecord({ title: '恢复后能写' }, { now: NOW, id: 'wt-back' }));
+    eq(tmps(), []);
+    eq(JSON.parse(readFileSync(join(dir, 'todos.json'), 'utf8')).todos.map((t) => t.id).sort(), ['wt-back', 'wt-ok']);
+    await store.close();
+  });
+});
+
+await test('S2-2：重试节流按指数退避（5s→10s→20s…封顶 5 分钟），基数可注入', () => {
+  const previousBase = process.env.WORKTODO_UPGRADE_RETRY_MS;
+  delete process.env.WORKTODO_UPGRADE_RETRY_MS;
+  try {
+    eq([1, 2, 3, 4, 5, 6, 7, 8, 20].map((n) => upgradeRetryDelayMs(n)),
+      [5000, 10000, 20000, 40000, 80000, 160000, 300000, 300000, 300000],
+      '退避序列必须是 5s→10s→20s…封顶 5 分钟（改前恒为 5 秒）：');
+    process.env.WORKTODO_UPGRADE_RETRY_MS = '50';
+    eq([1, 2, 3, 4].map((n) => upgradeRetryDelayMs(n)), [50, 100, 200, 400], '测试缝：基数可注入：');
+  } finally {
+    if (previousBase === undefined) delete process.env.WORKTODO_UPGRADE_RETRY_MS;
+    else process.env.WORKTODO_UPGRADE_RETRY_MS = previousBase;
+  }
+});
+
+await test('S2-2：持续失败时真的越试越慢（同一时间窗内尝试次数远少于固定节流）', async () => {
+  const previousBase = process.env.WORKTODO_UPGRADE_RETRY_MS;
+  process.env.WORKTODO_UPGRADE_RETRY_MS = '50'; // 5s/10s/20s… 缩到 50ms/100ms/200ms…
+  try {
+    await withTempHome(async () => {
+      const attempts = [];
+      const failing = {
+        async open() {
+          attempts.push(Date.now());
+          throw new Error('官方存储打不开（注入）');
+        },
+      };
+      const store = await openWorkTodoStore({ ctx: serviceHolder(failing).ctx, config: {}, logger: silent });
+      // 挂载时已经 force 试过一次；此后反复驱动 refreshBackend（= 每次请求/服务就绪时都会走的那条路）
+      const deadline = Date.now() + 800;
+      while (Date.now() < deadline) {
+        await store.refreshBackend();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const gaps = attempts.slice(1).map((at, index) => at - attempts[index]);
+      eq(attempts.length >= 3, true, `退避之后仍然要重试（实际 ${attempts.length} 次）：`);
+      eq(attempts.length <= 6, true,
+        `800ms 内不许像固定 50ms 节流那样重试十几次（改前约 15 次，实际 ${attempts.length} 次）：`);
+      for (let i = 1; i < gaps.length; i += 1) {
+        eq(gaps[i] >= gaps[i - 1] * 1.3, true,
+          `第 ${i + 1} 个间隔必须明显大于前一个（实际间隔 ${JSON.stringify(gaps)}）：`);
+      }
+      console.log(`      [backoff] 800ms 内 ${attempts.length} 次尝试｜间隔 ${gaps.map((g) => `${g}ms`).join(' → ')}`);
+      // 退避不能用「永远不再试」换安静
+      eq(Number.isFinite(upgradeRetryDelayMs(50)), true);
+      await store.close();
+    });
+  } finally {
+    if (previousBase === undefined) delete process.env.WORKTODO_UPGRADE_RETRY_MS;
+    else process.env.WORKTODO_UPGRADE_RETRY_MS = previousBase;
+  }
 });
 
 // 清理所有临时目录

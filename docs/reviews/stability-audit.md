@@ -531,3 +531,138 @@ $ WORKTODO_NO_UPDATE_CHECK=1 node tools/verify-all.mjs
   **S1-3/S2-3/S5/S6-3**（信息项）本轮**未动**：不在必修清单里。
 - S2-2 的修法是「同一次故障只备份一次」而不是指数退避：升级重试节流仍是固定 5 秒
   （持续故障仍会每 5 秒重试一轮，只是不再复制备份、不再刷 warn）。若要进一步收敛，需按 S2-2 建议做指数退避。
+
+---
+
+## 12. 残留项收口（第五轮：S3-3 客户端侧 / S4-2 / S4-3 / S4-4 / S2-2 / S6-2）
+
+§11 留下的是中/低级别的残留项（两条高优先级 S3-1、S1-1 上一轮已修完）。本轮把它们收口。
+
+**写域与边界**：只改了 `src/client/index.js`、`src/store.mjs`、`lib/index.js`、`tools/*`
+（`tools/smoke-client.mjs`、`tools/smoke-host.mjs`、`tools/verify-store.mjs`）与本报告；
+`lib/client.js` / `lib/client.js.map` 是 `verify-all` 会重建的产物。
+**没有**改 `.github/`、版本号、CHANGELOG 版本段，**没有** git commit/push；
+测试套件仍是 **9 个**（新用例全部加进既有套件）；所有实验都在 `/tmp` 的临时 `DSH_HOME`/临时目录里，
+没有读写 `~/.dsh/storages/worktodo.json` 与 `~/.dsh/worktodo/*`。
+
+收口后的文件哈希（sha256 前 16 位）：
+`src/client/index.js = d280f544ceecb1b5`、`src/store.mjs = d6e73792eb7f4ad1`、
+`lib/index.js = 3abae1a63470971c`、`lib/client.js = cc1a591bc3d7de6b`。
+
+### 12.1 逐条修法
+
+| 编号 | 修法（文件） | 覆盖测试 |
+| --- | --- | --- |
+| **S3-3 客户端侧** | `src/client/index.js`：① 新增 `VIEW_SHAPES = {due:'groups', project:'projectGroups'}` 与 `shapesForView()`，`useList(sort, shapes)` 把 `shapes` 拼进**唯一**那个列表 GET（`/list?filter=all&sort=…&shapes=…`，前缀合同不变），并按形状分开缓存（`lastListByShapes`），切视图不会先拿另一种形状的旧载荷渲染；② `hasViewShape()`：切视图后新载荷还没到时按「加载中」渲染，不闪一下空列表；③ `isWindowHidden()` + 定时器守卫：`document.visibilityState === 'hidden'` 时轮询直接 return（一次都不打宿主），`visibilitychange` 只在变可见时补一次；④ `TodoRow` 用 `React.memo` 包住；为让**浅比较真的生效**：兜底 `t` 从「每次渲染新建的箭头函数」改成模块级常量 `FALLBACK_T`、`Group` 传**共享**的 `drag` 对象 + 布尔 `dragging`（不再每行每次渲染各造一个 drag 对象）、`onToggle/onRemove/onSave` 保持 `useCallback`；⑤ 拖拽顺序改用 `payloadRecordIds(data)`（有 `todos` 用 `todos`，只有分组形状时按面板展示的桶顺序摊平），所以「按截止」只取 `groups` 也能正常拖动；⑥ `postJson` 在 HTTP 非 200 时先读宿主的 `{reason,error}`（配合 S4-3，用户看得到「请求体过大」而不是「HTTP 413」）。<br>兼容：宿主缺省（不带 `shapes`）仍是三份；旧宿主会忽略这个参数（多给一份而不是少给），旧面板不传参数也照常。 | `tools/smoke-client.mjs` 新增 4 条：按视图只取一种形状（含切换后重新请求）、隐藏停轮询 / 重新可见补一次、`React.memo` 行重渲染计数、`payloadRecordIds` 纯函数（含只有 groups/projectGroups 与脏数据）。为量出「父级重渲染」给迷你渲染器补了 memo 语义：**按元素位置浅比较 props、相等就跳过整棵子树**，并加了「实例级稳定 hook」（`useState/useCallback/useMemo` 一个窗口内按位置保留）——只有新用例打开，既有用例行为不变 |
+| **S4-2** | `lib/index.js`：`readJsonBody` 改成幂等 settle + 清定时器/摘监听的收口结构；加**时间上限**（默认 `5000ms`，`WORKTODO_BODY_TIMEOUT_MS` 可注入）+ 监听 `close`。超时/未读完时 `request.pause()` 后 reject 带 `statusCode`/`reason` 的错误；`method()` 的 catch 对带状态码的错误回 **408/413/400 + JSON 原因**（没有状态码的仍走既有「200 + `{ok:false,reason:'internal'}`」合同）。 | `tools/smoke-host.mjs`：半包/不结束的请求（`Readable` 只 push 不 end）在注入 120ms 超时后必须 settle 且回 408 + `body-timeout` + 中文原因，之后 `/list` 照常；用例自带 2 秒安全网（改前是「一直不 settle」，安全网把它变成明确红灯而不是挂死） |
+| **S4-3** | `lib/index.js`：超限不再 `request.destroy()`（那会让调用方只看到 ECONNRESET）。改成 `pause()` 停止读 + 回 **413 `{reason:'body-too-large'}`**，未读完的请求由 Node 在响应结束后收掉。客户端 `postJson` 优先显示宿主给的原文。 | `tools/smoke-host.mjs` 两条：真 `http.Server` + 裸 socket（发 300 KiB 后**不结束**请求）断言客户端读到 `HTTP/1.1 413` 且响应体含 `body-too-large`、不含 `ECONNRESET`；另一条用假 request 流断言同一 chunk 就超时也回 413（不是 200/internal） |
+| **S4-4** | `src/store.mjs`：`writeAtomic` 的「写临时文件 → rename」整段包进 try/catch，失败先 `rmSync(tmp,{force:true})` 再**原样抛出**（绝不盖掉原始错误）。新增注入点 `WORKTODO_TEST_FAULT=write-atomic-fail`：临时文件真实写出来后抛 `ENOSPC`（复刻满盘）。 | `tools/verify-store.mjs`：注入失败 → 目录里**不再有** `*.tmp-*`、错误里仍是 `ENOSPC`、盘上文件仍是完整合法 JSON（只有失败前那一条）、故障消失后照常写入且仍无残留 |
+| **S2-2** | `src/store.mjs`：新增纯函数 `upgradeRetryDelayMs(failures) = min(基数 × 2^(n-1), 300000)`（基数默认 `5000ms`，`WORKTODO_UPGRADE_RETRY_MS` 可注入），导出以便直接验序列。`tryUpgrade` 的节流状态从 `{service, at}` 换成 `{service, failures, nextAt}`：失败时 `failures+1` 并算出下一次允许时间（连续失败 5s→10s→20s→40s→80s→160s→**封顶 5 分钟**），换 `storageDomain` 服务重新计数，**升级成功后复位**。「同一次故障只备份一次」（`backupFault`）原样保留。 | `tools/verify-store.mjs` 两条：退避序列（含封顶与基数注入）；把基数缩到 50ms 后开一个 800ms 窗口反复驱动 `refreshBackend()`，断言尝试次数远少于固定节流、且相邻间隔必须明显递增（改前 16 次） |
+| **S6-2** | **客户端侧补兜底**（`src/client/index.js`）：新增 `safeRegister(label, run)`，包住 `locale.register` 与两个 `slots.register`。官方对重复注册是抛错（`already has a registration`），改前会一路抛到客户端 `apply` → **面板整体消失、只能刷新页面**；现在只丢这一条 + 一行 `console.warn`（带原始原因），main 面板照常注册。**宿主侧只补断言**（`src/tools.mjs` 不在本轮写域）。 | `tools/smoke-client.mjs` 两条：两个 slot 都被占用 + locale 重复 → `apply` 不抛、两个 slot 注入回调都被调用、3 条 warn 带原始原因；侧栏 slot 失败时 main 面板照常注册。`tools/smoke-host.mjs` 一条：同名工具重复注册 → `apply` 不 reject、8 条路由照常、`/health` 明确报 `tools.status='failed'` + 原始错误 |
+
+### 12.2 实测数字（改前 / 改后）
+
+**S3-3 载荷**（`/tmp/wt-shapes-measure.mjs`：5000 条、文件 1393 KiB，走**真实路由 handler**，量响应文本字节）
+
+| 请求 | 响应体 | 说明 |
+| --- | --- | --- |
+| 改前（面板旧行为，不带 `shapes`） | **4181.1 KiB**（≈4.08 MiB） | `todos` + `groups` + `projectGroups` 三份同样大的数据 |
+| 改后「按截止」`shapes=groups` | **1393.9 KiB** | **÷3.00**（−66.7%） |
+| 改后「按项目」`shapes=projectGroups` | **1394.1 KiB** | **÷3.00** |
+| 参考 `shapes=todos` | 1393.8 KiB | 单份形状的大小 |
+
+一次轮询的载荷 ÷3；4 个窗口同时开时每 30 秒从 **16.3 MiB 降到 5.4 MiB**；窗口隐藏时**整段为 0**。
+
+**S3-3 隐藏窗口 60 秒内的请求次数**（`tools/smoke-client.mjs` 实测打印 `[poll]`）
+
+```
+[poll] 60 秒窗口：隐藏 0 次刷新 / 可见 2 次；重新可见 +1 次
+```
+
+改前：隐藏与可见都是 2 次（不可见时白打宿主，多窗口线性翻倍）。
+
+**S3-3 `React.memo` 渲染次数**（6 行 × 3 次父级渲染；同一台机器、同一个渲染替身）
+
+```
+改后：[memo] 6 行 × 3 次父级渲染：行 body 实际渲染 6 次（第一遍 6）、被 memo 跳过 12 次
+改前：行 body 实际渲染 18 次（每次父级重渲染都 6 行全跑；`WORKTODO_TEST_MEMO=off` 复现改前语义）
+```
+
+**S4-2 / S4-3**
+
+| 场景 | 改前 | 改后 |
+| --- | --- | --- |
+| 半包 + 不关 socket（`Content-Length: 5000` 只发 9 字节） | handler **永不 settle**（测试等到 2001ms 仍在挂，实际靠 Node 300s `requestTimeout` 兜底） | 注入 120ms 超时 → **约 130ms** 返回 `408 {reason:'body-timeout'}`（生产默认 5s） |
+| 请求体 300 KiB（上限 256 KiB）后不结束 | 客户端拿到**空响应**（socket 被 RST；fetch 侧表现为 `ECONNRESET socket hang up`） | **`HTTP/1.1 413` + `body-too-large`**，连接由 Node 在响应结束后收掉 |
+
+**S4-4 满盘残留**（注入 `WORKTODO_TEST_FAULT=write-atomic-fail`）
+
+```
+改前：写失败后目录 = ["todos.json","todos.json.tmp-15910"]   ← 残留自己刚写的临时文件
+改后：写失败后目录 = ["todos.json"]                          ← 无 *.tmp-*，文件仍是完整 JSON
+```
+
+**S2-2 退避**（verify-store 实测打印 `[backoff]`；把基数缩到 50ms 以便在 800ms 窗口内观察）
+
+```
+退避序列（failures=1..8,20）：5000 → 10000 → 20000 → 40000 → 80000 → 160000 → 300000（封顶）→ 300000 → 300000 ms
+改后：[backoff] 800ms 内 5 次尝试｜间隔 52ms → 104ms → 204ms → 403ms
+改前：[backoff] 同样条件 800ms 内 16 次尝试（固定 5 秒节流缩到 50ms 后就是固定 50ms 一轮）
+```
+
+即：持续故障下重试频率从「每 5 秒一轮、永不收敛」变成「5s→10s→20s…封顶 5 分钟」，第一次重试仍是 5 秒
+（偶发失败/服务晚注册的恢复速度不变），成功后复位。
+
+### 12.3 反向验证（回退修复 → 对应测试必须变红）
+
+做法：备份源文件 → 用字面替换精确回退该处修复 → （客户端改动先 `build-client.mjs` 重建）→ 跑对应套件 →
+还原并核对 sha256 与回退前一致。8 条全部变红：
+
+| 反向验证 | 回退内容 | 结果 |
+| --- | --- | --- |
+| S3-3 形状 | `src/client/index.js`：列表 URL 去掉 `&shapes=…`（改回「一次拿三份」） | ✗ 红：`「按截止」必须只取 groups：/worktodo/list?filter=all&sort=manual 期望 true，实际 false`（30/1） |
+| S3-3 停轮询 | `src/client/index.js`：定时器回调去掉 `isWindowHidden()` 守卫 | ✗ 红：`隐藏 60 秒内必须 0 次刷新（改前是 2 次）：实际 2`（30/1） |
+| S3-3 memo | `src/client/index.js`：`TodoRow` 去掉 `React.memo(...)` 包装 | ✗ 红：`面板的列表行必须用 React.memo 包住…期望 true，实际 false`（30/1）；另用 `WORKTODO_TEST_MEMO=off` 复现改前比较语义 → `期望 6，实际 18` |
+| S4-2 超时 | `lib/index.js`：`readJsonBody` 去掉 `setTimeout` 超时（改回只监听 data/end/error） | ✗ 红：`handler 必须在超时后 settle（改前会挂住不返回；已等 2001ms）：期望 true，实际 false`（41/1） |
+| S4-3 状态码 | `lib/index.js`：超限改回 `reject(...); request.destroy();` | ✗ 红两条：真 socket 用例 `客户端必须拿到明确的 413…期望 true，实际 false`（客户端实测拿到空响应）；假流用例 `超限必须回 413（实际 200）`（40/2） |
+| S4-4 残留 | `src/store.mjs`：`writeAtomic` 的 catch 去掉 `rmSync(tmp)` | ✗ 红：`写失败后不许留下 *.tmp-*…["todos.json.tmp-15910"] 期望 []`（36/1） |
+| S2-2 退避 | `src/store.mjs`：`upgradeRetryDelayMs` 改回恒返回基数（= 固定节流） | ✗ 红两条：序列实际 `[5000,5000,…]`；`800ms 内不许像固定 50ms 节流那样重试十几次（改前约 15 次，实际 16 次）`（35/2） |
+| S6-2 幂等 | `src/client/index.js`：main slot 与 locale 改回直接 `register` | ✗ 红：`重复注册不能让客户端 apply 抛错…期望 null，实际 {}`（30/1） |
+
+还原后四个被改源码文件的 sha256 全部回到回退前值（见 12 开头哈希），随后全量门禁重跑 10/10。
+
+### 12.4 全量门禁（含构建）
+
+```
+$ WORKTODO_NO_UPDATE_CHECK=1 node tools/verify-all.mjs
+  ✓ 客户端 bundle 构建  (build-client.mjs)
+  ✓ 数据模型 / 服务层 / 存储层 / 宿主接线与工具 / 客户端↔宿主契约 /
+    客户端 bundle / CI workflow 契约 / 发布面审计 / 收录提交门禁
+10/10 个步骤通过（含构建）
+```
+
+套件内逐条的用例数（本轮新增后）：`verify-store` 37、`smoke-host` 42、`smoke-client` 32，
+其余套件未改动、照常全绿。测试套件数仍是 **9 个**。
+
+### 12.5 未做项与原因
+
+- **S3-2 残留（同步 IO）**：文件后端仍是 `writeFileSync`/`renameSync`。本轮只做到「一次拖拽 = 一次整文件写」
+  （§11.2 的 ÷1000），要把那 ~6–25ms 的同步段也消掉得把后端换成 `fs/promises` + 写队列（F11 的完整形态）。
+  不在本轮清单里，且改动面比其余残留项大一个量级。
+- **S6-2 宿主侧工具注册仍是「一条失败 → 整批不算数」**：`src/tools.mjs` 里 7 次 `ctx.tools.register` 是
+  顺序调用 + 一个 `disposers` 数组，第 N 条抛错会让 `registerWorkTodoTools` 整体 reject（`lib/index.js`
+  捕获后 `tools.status='failed'`、`registered=0`）。**`src/tools.mjs` 不在本轮写域**，所以只补了断言把现状钉住
+  （`smoke-host` 那条明确断言 `health.tools.registered === 0`）。要修的话与 §11 的 S1-1 同一手法（逐条注册、
+  逐条降级），是下一轮最小的一处改动。
+- **S6-1（面板错误边界）**：复核后**本来就有**——面板与侧栏入口都包在 `WorkTodoErrorBoundary` 里
+  （中文兜底 + `error.message` 摘要 + 「重试」换 key 重挂载 + 原始 error 进 console），`smoke-client` 已有
+  4 条断言覆盖（含「堆栈绝不进 DOM」）。本轮没有新增改动，只把它与 S4 的状态码路径串起来：
+  现在 4xx 的具体原因也会经 `postJson` 显示在面板错误条上。
+- **宿主侧按 session 节流未做**：`/list` 是无状态路由、请求里没有 session 身份，按时间窗缓存会返回陈旧数据、
+  按 IP 节流会误伤同机多窗口（§11.5 的取舍不变）。本轮把「多窗口/不可见」的成本从**客户端**这一侧收掉了
+  （隐藏即 0、每次只取 1/3），比在宿主侧猜来源更安全。
+- **S1-3 / S2-3 / S5 / S6-3**（信息项）与 **多窗口节流**未动：不在清单里。
+- 一处**行为说明**（不是缺陷）：「按截止」视图只取 `groups` 后，拖拽顺序改由 `payloadRecordIds()` 从当前
+  展示的桶摊平得到。面板本来就是分组展示，桶内顺序由宿主按当前 sort 排好，所以拖拽结果与用户看到的一致；
+  代价是「跨组的全局位次」不再来自 `todos`（分组视图下这个位次本来就不可见）。`smoke-client` 的
+  `payloadRecordIds` 用例把这条语义钉住了。

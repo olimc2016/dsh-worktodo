@@ -122,6 +122,42 @@ globalThis.document = {
 /** 记录组件树里出现过的元素类型，方便断言「渲染确实发生了」。 */
 const rendered = [];
 
+/**
+ * 用 `React.memo` 包过的组件类型（替身 memo 会把它们登记在这里）。
+ *
+ * S3-3 的「行组件在父级重渲染时不重渲染」要能真的量出来，所以替身 memo 必须
+ * 复刻真 React 的两件事：**浅比较 props**、**跳过整个子树**。
+ * 缓存的粒度是「元素在树里的位置」（真 React 是按 fiber，位置/key 决定身份）。
+ */
+const memoizedTypes = [];
+
+/**
+ * 打开后 useState/useCallback/useMemo 按「同一位置的同一个组件」跨渲染保留
+ *（= 真 React 的实例级状态）。默认关闭：既有用例依赖「每次 render 都是一次全新挂载」。
+ */
+let stableHooks = false;
+/** 关掉 memo 的浅比较 = **改前**的行为（只用于量「改前/改后」的渲染次数）。 */
+const memoBailoutOff = process.env.WORKTODO_TEST_MEMO === 'off';
+const hookCache = new Map();
+const memoStores = new Map();
+let hookPath = 'root';
+let hookIndex = 0;
+
+/** 当前 hook 调用点的稳定 id（路径 + 组件内序号）。 */
+function hookSlotId() {
+  return `${hookPath}#${hookIndex++}`;
+}
+
+/** 真 React 的浅比较（`React.memo` 默认的比较函数）。 */
+function shallowEqualProps(a, b) {
+  const left = a ?? {};
+  const right = b ?? {};
+  const ka = Object.keys(left);
+  const kb = Object.keys(right);
+  if (ka.length !== kb.length) return false;
+  return ka.every((key) => Object.is(left[key], right[key]));
+}
+
 /** 首屏渲染时真正执行的 effect 数量（React 里首次数据请求通常在 useEffect 里发起）。 */
 const effectRuns = [];
 /** effect 返回的清理函数，收起来验证面板确实做了回收。 */
@@ -155,7 +191,7 @@ class StubComponent {
   forceUpdate() {}
 }
 
-/** 极简 React 替身：让首屏渲染与首次请求真的跑起来，但不做重渲染。 */
+/** 极简 React 替身：让首屏渲染与首次请求真的跑起来；memo/浅比较由迷你渲染器实现。 */
 const stubReact = {
   createElement(type, props, ...children) {
     rendered.push(typeof type === 'string' ? type : (type?.name ?? 'component'));
@@ -166,28 +202,83 @@ const stubReact = {
   },
   Component: StubComponent,
   Fragment: 'Fragment',
-  memo: (c) => c,
+  /**
+   * memo 替身：真 React 的语义在迷你渲染器里实现（按位置浅比较 + 跳过子树）。
+   * 这里只登记元数据，供测试量「body 真的跑了几次 / 跳过几次」。
+   */
+  memo: (component, compare) => {
+    const wrapped = function MemoWrapper(props) { return component(props); };
+    wrapped.__isMemo = true;
+    wrapped.__memoComponent = component;
+    wrapped.__memoCompare = compare;
+    wrapped.__meta = { renders: 0, bailouts: 0, lastNode: null };
+    memoizedTypes.push(wrapped);
+    return wrapped;
+  },
   forwardRef: (c) => c,
-  useState: (init) => [typeof init === 'function' ? init() : init, (next) => { stateUpdates.push(next); }],
-  useReducer: (reducer, init) => [typeof init === 'function' ? init() : init, (next) => { stateUpdates.push(next); }],
+  useState: (init) => {
+    const id = hookSlotId();
+    if (stableHooks) {
+      if (!hookCache.has(id)) hookCache.set(id, { value: typeof init === 'function' ? init() : init });
+      const slot = hookCache.get(id);
+      return [slot.value, (next) => {
+        stateUpdates.push(next);
+        slot.value = typeof next === 'function' ? next(slot.value) : next;
+      }];
+    }
+    return [typeof init === 'function' ? init() : init, (next) => { stateUpdates.push(next); }];
+  },
+  useReducer: (reducer, init) => {
+    hookSlotId();
+    return [typeof init === 'function' ? init() : init, (next) => { stateUpdates.push(next); }];
+  },
   // 真的执行 effect：否则「组件挂载后去拉列表」这条最关键的路径根本不会被测到
   useEffect(fn) {
+    hookSlotId();
     effectRuns.push('useEffect');
     const cleanup = fn();
     if (typeof cleanup === 'function') effectCleanups.push(cleanup);
   },
   useLayoutEffect(fn) {
+    hookSlotId();
     effectRuns.push('useLayoutEffect');
     const cleanup = fn();
     if (typeof cleanup === 'function') effectCleanups.push(cleanup);
   },
-  useMemo: (fn) => fn(),
-  useCallback: (fn) => fn,
-  useRef: (value) => ({ current: value }),
+  useMemo: (fn) => {
+    const id = hookSlotId();
+    if (!stableHooks) return fn();
+    if (!hookCache.has(id)) hookCache.set(id, { value: fn() });
+    return hookCache.get(id).value;
+  },
+  useCallback: (fn) => {
+    const id = hookSlotId();
+    if (!stableHooks) return fn;
+    if (!hookCache.has(id)) hookCache.set(id, { value: fn });
+    return hookCache.get(id).value;
+  },
+  useRef: (value) => { hookSlotId(); return { current: value }; },
   useSyncExternalStore: (_subscribe, getSnapshot) => (typeof getSnapshot === 'function' ? getSnapshot() : undefined),
   useTransition: () => [false, (fn) => fn?.()],
   useId: () => 'stub-id',
 };
+
+/** 开一段「同一实例被反复渲染」的窗口：状态/回调/memo 缓存按位置保留，计数从 0 起。 */
+function withStableHooks(run) {
+  hookCache.clear();
+  memoStores.clear();
+  for (const type of memoizedTypes) {
+    type.__meta.renders = 0;
+    type.__meta.bailouts = 0;
+    type.__meta.lastNode = null;
+  }
+  stableHooks = true;
+  try {
+    return run();
+  } finally {
+    stableHooks = false;
+  }
+}
 
 /* ------------------------------------------------------------------ *
  * 迷你渲染器
@@ -198,31 +289,63 @@ const stubReact = {
  * 调 render；子渲染抛错时按 React 的语义走 getDerivedStateFromError →
  * componentDidCatch → 用兜底 UI 重渲染。它只服务测试，不进 bundle。
  * ------------------------------------------------------------------ */
-function renderInstance(instance) {
+function renderInstance(instance, path = 'root') {
   const type = instance.constructor;
   try {
-    return renderNode(instance.render());
+    return renderNode(instance.render(), path);
   } catch (error) {
     if (typeof type.getDerivedStateFromError !== 'function') throw error;
     instance.state = { ...(instance.state ?? {}), ...(type.getDerivedStateFromError(error) ?? {}) };
     if (typeof instance.componentDidCatch === 'function') {
       instance.componentDidCatch(error, { componentStack: 'stub-component-stack' });
     }
-    return renderNode(instance.render());
+    return renderNode(instance.render(), path);
   }
 }
 
-function renderNode(node) {
-  if (Array.isArray(node)) return node.map(renderNode);
+/**
+ * 迷你渲染器。
+ *
+ * `path` 是元素在树里的位置（`root>0>2` 这样），它替代真 React 的 fiber：
+ *   - memo 的缓存与「props 浅比较后跳过整个子树」按位置生效；
+ *   - hook 的稳定 id 也是「位置 + 组件内序号」，供 useCallback/useMemo/useState 的稳定模式用。
+ * 字符串/number 子节点不参与路径（它们不可能是组件）。
+ */
+function renderNode(node, path = 'root') {
+  if (Array.isArray(node)) return node.map((child, index) => renderNode(child, `${path}>${index}`));
   if (!node || typeof node !== 'object') return node;
   const type = node.type;
   const props = node.props ?? {};
   if (typeof type === 'function') {
     const isClass = Boolean(type.prototype && typeof type.prototype.render === 'function');
-    return isClass ? renderInstance(new type(props)) : renderNode(type(props));
+    if (isClass) return renderInstance(new type(props), path);
+    if (type.__isMemo) {
+      const store = memoStores.get(path);
+      const compare = type.__memoCompare ?? shallowEqualProps;
+      const canBail = Boolean(store) && !memoBailoutOff && compare(store.props, props);
+      if (canBail) {
+        // 真 React 语义：props 浅相等 → 连子树一起跳过（下面的子组件不会再跑一次）
+        type.__meta.bailouts += 1;
+        return store.rendered;
+      }
+      type.__meta.renders += 1;
+      hookPath = path;
+      hookIndex = 0;
+      const produced = type.__memoComponent(props);
+      type.__meta.lastNode = produced;
+      const renderedNode = renderNode(produced, path);
+      memoStores.set(path, { props, rendered: renderedNode });
+      return renderedNode;
+    }
+    hookPath = path;
+    hookIndex = 0;
+    return renderNode(type(props), path);
   }
   // 宿主元素 / Fragment：继续往下渲染子节点（子级里的组件元素也要真的渲染出来）
-  return { ...node, children: renderNode(node.children) };
+  const children = Array.isArray(node.children)
+    ? node.children.map((child, index) => renderNode(child, `${path}>${index}`))
+    : renderNode(node.children, `${path}>c`);
+  return { ...node, children };
 }
 
 /**
@@ -283,6 +406,17 @@ const fakeListPayload = {
     today: '2026-10-14',
     store: { kind: 'domain', location: 'storage:worktodo/todos' },
     projects: ['dsh-worktodo'],
+    // 「按项目」视图的形状：面板切成按项目时会用 shapes=projectGroups 单独取它
+    projectGroups: [
+      {
+        project: 'dsh-worktodo', key: 'dsh-worktodo', total: 1, open: 1, overdue: 0,
+        todos: [{
+          id: 'wt-1', title: '写 README', notes: '', status: 'pending', priority: 'high',
+          due: '2026-10-20', project: 'dsh-worktodo', source: 'human',
+          createdAt: 1, updatedAt: 1, completedAt: null,
+        }],
+      },
+    ],
   },
 };
 
@@ -778,6 +912,207 @@ test('边界优先用注入的 t()；拿不到 t 时退回中文 + 一行英文'
 
 test('错误信息只走文本子节点：bundle 里不存在 innerHTML', () => {
   eq(code.includes('innerHTML'), false, '绝不能把 error.message 拼进 innerHTML：');
+});
+
+/* ------------------------------------------------------------------ *
+ * S3-3（客户端侧，第四轮审计残留项）
+ *
+ * 宿主侧上一轮已经支持 `/list?shapes=todos|groups|projectGroups`，但面板**完全没用**：
+ * 每次 30 秒轮询都拿三份同样大小的数据（5000 条 = 4.28 MiB/次）。
+ * 这里补三件事：按视图只取所需形状、窗口隐藏时停轮询、行组件 memo。
+ * ------------------------------------------------------------------ */
+
+console.log('S3-3 客户端：形状收敛 / 隐藏停轮询 / 行组件 memo');
+
+await testAsync('S3-3 客户端：面板按当前视图只请求所需形状（按截止=groups、按项目=projectGroups）', async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0)); // 先让此前所有在飞的 fetch 落地，计数才干净
+
+  eq(mod.shapesForView('due'), 'groups');
+  eq(mod.shapesForView('project'), 'projectGroups');
+  eq(mod.shapesForView('未定义视图'), 'groups', '未知视图必须回落到默认视图的形状：');
+
+  document.visibilityState = 'visible';
+  const t = (key) => `[${key}]`;
+  const fetchFrom = fetchCalls.length;
+  let dueUrl = '';
+  let projectUrl = '';
+  let projectApplied = false;
+
+  withStableHooks(() => {
+    // 第一遍：「按截止」视图
+    const tree = renderPanel({ t });
+    dueUrl = fetchCalls[fetchCalls.length - 1]?.url ?? '';
+    // 点「按项目」：稳定 hook 模式下 setState 会真的改状态，再渲染一次就是切视图后的请求
+    const button = flattenTree(tree).find((n) => n.type === 'button' && n.props?.title === '[viewProject]');
+    eq(Boolean(button), true, '面板上必须有「按项目」切换按钮：');
+    button.props.onClick();
+    renderPanel({ t });
+    projectUrl = fetchCalls[fetchCalls.length - 1]?.url ?? '';
+    projectApplied = true;
+  });
+
+  eq(dueUrl.includes('/worktodo/list?filter=all'), true, `列表路径前缀不能变（旧契约）：${dueUrl}`);
+  eq(dueUrl.includes('shapes=groups'), true, `「按截止」必须只取 groups：${dueUrl}`);
+  eq(/shapes=projectGroups/.test(dueUrl), false, '「按截止」不该顺带取 projectGroups：');
+  eq(projectApplied, true);
+  eq(projectUrl.includes('shapes=projectGroups'), true, `切到「按项目」必须只取 projectGroups：${projectUrl}`);
+  eq(/[?&]shapes=groups(&|$)/.test(projectUrl), false, '「按项目」不该再取 groups：');
+  eq(fetchCalls.length - fetchFrom >= 2, true, '两种视图各请求一次：');
+  console.log(`      [shapes] 按截止 → ${dueUrl.split('&').pop()} ｜ 按项目 → ${projectUrl.split('&').pop()}`);
+});
+
+await test('S3-3 客户端：行组件用 React.memo —— 父级重渲染时 6 行不再整列表重渲染', () => {
+  // 让这一组真的有 6 行（原来 later 组只有 1 行，量不出「整列表」的效果）
+  const bucket = fakeListPayload.data.groups.later;
+  const added = [];
+  for (let i = 0; i < 5; i += 1) {
+    const row = { ...bucket[0], id: `wt-memo-${i}`, title: `memo 行 ${i}` };
+    bucket.push(row);
+    added.push(row);
+  }
+
+  try {
+    document.visibilityState = 'visible';
+    const t = (key) => `[${key}]`;
+    const report = withStableHooks(() => {
+      renderPanel({ t }); // 第一遍：把 6 行渲染出来
+      const rowType = memoizedTypes.find((type) => type.__meta.renders > 0
+        && flattenTree(type.__meta.lastNode).some((n) => String(n.props?.className ?? '').includes('wt-row')));
+      eq(Boolean(rowType), true,
+        '面板的列表行必须用 React.memo 包住（否则每次父级重渲染都会 reconcile 整张列表）：');
+      const first = { renders: rowType.__meta.renders, bailouts: rowType.__meta.bailouts };
+      // 再渲染两次（= 父级因为折叠分组/错误条/计数等与数据无关的原因重渲染）
+      renderPanel({ t });
+      renderPanel({ t });
+      return { first, now: { renders: rowType.__meta.renders, bailouts: rowType.__meta.bailouts } };
+    });
+
+    console.log(`      [memo] 6 行 × 3 次父级渲染：行 body 实际渲染 ${report.now.renders} 次`
+      + `（第一遍 ${report.first.renders}）、被 memo 跳过 ${report.now.bailouts} 次`);
+    eq(report.first.renders >= 6, true, `第一遍必须真的渲染出每一行（实际 ${report.first.renders}）：`);
+    eq(report.now.renders, report.first.renders,
+      `父级重渲染时行 body 不许再跑（memo 失效会变成 ${report.first.renders * 3} 次）：`);
+    eq(report.now.bailouts - report.first.bailouts >= 12, true,
+      `两次父级重渲染 × 6 行都要走 memo 跳过：${report.now.bailouts - report.first.bailouts}`);
+  } finally {
+    for (const row of added) {
+      const index = bucket.indexOf(row);
+      if (index !== -1) bucket.splice(index, 1);
+    }
+  }
+});
+
+await testAsync('S3-3 客户端：窗口隐藏时停轮询，重新可见时恰好补一次', async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0)); // 先让在飞的 fetch 落地，避免污染计数
+  document.visibilityState = 'visible';
+  const listenersBefore = new Set(documentListeners.get('visibilitychange') ?? []);
+  renderPanel({});
+  const poll = intervals[intervals.length - 1];
+  eq(Boolean(poll), true, '最近一次渲染必须注册轮询定时器：');
+  eq(poll.ms, mod.CHANGE_POLL_MS, '轮询间隔仍是 30 秒：');
+
+  // 隐藏 60 秒 = 两个轮询周期：一次宿主都不打
+  document.visibilityState = 'hidden';
+  const hiddenFrom = stateUpdates.length;
+  const fetchFrom = fetchCalls.length;
+  poll.fn();
+  poll.fn();
+  const hiddenRefreshes = stateUpdates.length - hiddenFrom;
+  eq(hiddenRefreshes, 0, `隐藏 60 秒内必须 0 次刷新（改前是 2 次）：实际 ${hiddenRefreshes}`);
+  eq(fetchCalls.length - fetchFrom, 0, '隐藏时一次请求都不该发出：');
+
+  // 可见：同样两个周期 → 2 次（证明守卫只挡隐藏，不是把轮询关死了）
+  document.visibilityState = 'visible';
+  const visibleFrom = stateUpdates.length;
+  poll.fn();
+  poll.fn();
+  const visibleRefreshes = stateUpdates.length - visibleFrom;
+  eq(visibleRefreshes, 2, `可见时两个周期必须各刷一次：实际 ${visibleRefreshes}`);
+
+  // 重新可见：恰好补一次新鲜度
+  document.visibilityState = 'hidden';
+  const backFrom = stateUpdates.length;
+  document.visibilityState = 'visible';
+  const fresh = [...(documentListeners.get('visibilitychange') ?? [])].filter((h) => !listenersBefore.has(h));
+  eq(fresh.length > 0, true, '当前面板必须注册 visibilitychange：');
+  for (const handler of fresh) handler();
+  eq(stateUpdates.length - backFrom, 1, `重新可见必须恰好补一次（实际 ${stateUpdates.length - backFrom}）：`);
+
+  console.log(`      [poll] 60 秒窗口：隐藏 ${hiddenRefreshes} 次刷新 / 可见 ${visibleRefreshes} 次；重新可见 +1 次`);
+  document.visibilityState = 'visible';
+});
+
+test('S3-3 客户端：只取分组形状时，拖拽仍能算出完整顺序（payloadRecordIds）', () => {
+  eq(typeof mod.payloadRecordIds, 'function', '面板应当导出载荷 → id 顺序的纯函数：');
+  // 有 todos 就用 todos（真·全局顺序）
+  eq(mod.payloadRecordIds({ todos: [{ id: 'a' }, { id: 'b' }], groups: { later: [{ id: 'z' }] } }),
+    ['a', 'b'], '有 todos 时以 todos 为准：');
+  // 只取了 groups：按面板展示的桶顺序摊平（overdue → today → week → later → completed）
+  eq(mod.payloadRecordIds({
+    groups: {
+      overdue: [{ id: 'x' }], today: [], week: [{ id: 'w' }], later: [{ id: 'y' }], completed: [{ id: 'z' }],
+    },
+  }), ['x', 'w', 'y', 'z'], '只有 groups 时必须按展示顺序摊平：');
+  // 只取了 projectGroups
+  eq(mod.payloadRecordIds({ projectGroups: [{ todos: [{ id: 'p1' }] }, { todos: [{ id: 'p2' }] }] }),
+    ['p1', 'p2'], '只有 projectGroups 时按桶顺序摊平：');
+  // 脏数据不能抛
+  eq(mod.payloadRecordIds(null), []);
+  eq(mod.payloadRecordIds({ groups: { later: [null, {}, { id: 'ok' }] } }), ['ok'], '坏行只跳过自己：');
+});
+
+test('S6-2：客户端重复注册只降级那一条，不能让 apply 把面板整体带崩', () => {
+  // 官方 slots.register / locale.register 对重复注册是**抛错**（S6-2 引用的宿主语义）
+  const injected = [];
+  const registeredSpecs = [];
+  const dupCtx = {
+    slots: {
+      inject(key, callback) { injected.push(key); callback(); return () => {}; },
+      register(spec) { registeredSpecs.push(spec); throw new Error(`single slot "${spec?.id ?? spec?.key}" already has a registration`); },
+    },
+    locale: { register() { throw new Error('locale namespace "worktodo" already has locale "zh"'); } },
+    effect(callback, label) { const dispose = callback(); return { dispose: dispose ?? (() => {}) }; },
+  };
+
+  const logged = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => logged.push(args.join(' '));
+  let error = null;
+  try {
+    mod.apply(dupCtx);
+  } catch (applyError) {
+    error = applyError;
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  eq(error, null, '重复注册不能让客户端 apply 抛错（改前会抛，面板整体消失、只能刷新页面）：');
+  eq(injected.sort(), ['main', 'sidebar.panellist'], '两个 slot 的注入回调都必须被调用到：');
+  eq(registeredSpecs.length, 2, '两条注册都要被尝试：');
+  eq(logged.length >= 3, true, `重复注册必须留下可排查的 warn（locale + 两个 slot）：实际 ${logged.length} 条`);
+  eq(logged.some((line) => line.includes('already has')), true, `warn 要带原始原因：${JSON.stringify(logged)}`);
+
+  // 单条失败不影响另一条：侧栏 slot 被占用时，main 面板照常注册
+  const mainOnly = [];
+  const partialCtx = {
+    slots: {
+      inject(key, callback) { callback(); return () => {}; },
+      register(spec) {
+        if (spec.name === 'sidebar.panellist') throw new Error('single slot "worktodo" already has a registration');
+        mainOnly.push(spec);
+        return () => {};
+      },
+    },
+    locale: { register: () => () => {} },
+    effect(callback) { const dispose = callback(); return { dispose: dispose ?? (() => {}) }; },
+  };
+  console.warn = () => {};
+  try {
+    mod.apply(partialCtx);
+  } finally {
+    console.warn = originalWarn;
+  }
+  eq(mainOnly.map((spec) => spec.key), ['worktodo'], '侧栏被占用时 main 面板必须照常注册：');
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);
