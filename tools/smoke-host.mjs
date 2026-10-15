@@ -272,6 +272,21 @@ await test('TOOL_NAMES 报告清单与实际注册的工具一致（防漂移）
   eq([...TOOL_NAMES].sort(), tools.map((t) => t.name).sort());
 });
 
+await test('B2：登记/修改项目的工具描述必须提醒「复用已有项目名」（防止以后被删）', () => {
+  const add = tools.find((t) => t.name === 'worktodo_add');
+  eq(/复用|既有|保持一致/.test(add.parameters.properties.project.description), true,
+    `worktodo_add 的 project 描述要提醒复用已有项目名：${add.parameters.properties.project.description}`);
+  eq(add.parameters.properties.project.description.includes('worktodo_list'), true, '要给出自查方式（先看 projects 清单）：');
+
+  const many = tools.find((t) => t.name === 'worktodo_add_many');
+  eq(/复用|既有|保持一致/.test(many.parameters.properties.items.items.properties.project.description), true,
+    `worktodo_add_many 的 project 描述要提醒复用已有项目名：${many.parameters.properties.items.items.properties.project.description}`);
+
+  const update = tools.find((t) => t.name === 'worktodo_update');
+  eq(/复用|既有|保持一致/.test(update.parameters.properties.project.description), true,
+    `worktodo_update 的 project 描述要提醒复用已有项目名：${update.parameters.properties.project.description}`);
+});
+
 console.log('路由与准入');
 
 await test('health 自检报告存储位置、版本与工具注册结果', async () => {
@@ -608,6 +623,101 @@ await test('S3-3：/list?shapes=todos 只回一份（不再是同一批数据的
   eq([['todos' in fullData, 'groups' in fullData, 'projectGroups' in fullData]], [[true, true, true]],
     '缺省必须保持旧面板读到三个字段：');
   eq(fullData.shapes, ['todos', 'groups', 'projectGroups']);
+});
+
+// ---- 面板第二行的「项目」选择器（/list 提供清单，/create 落库） ----
+
+await test('GET /list 在任何 shapes 下都带 projects / projectsTruncated（面板项目选择器的数据来源）', async () => {
+  // 前面的用例已经建过 project='alpha' 的记录；这里只验「字段在不在、内容对不对」
+  for (const shapes of [null, 'todos', 'groups', 'projectGroups', 'todos,groups']) {
+    const suffix = shapes ? `&shapes=${shapes}` : '';
+    const response = await call(routes.get('/worktodo/list').handler, {
+      method: 'GET', url: `/worktodo/list?filter=all${suffix}`,
+    });
+    eq(response.statusCode, 200);
+    const data = response.json()?.data;
+    eq(Array.isArray(data.projects), true, `shapes=${shapes} 时 projects 必须是数组：`);
+    eq(typeof data.projectsTruncated, 'boolean', `shapes=${shapes} 时 projectsTruncated 必须是布尔：`);
+    eq(data.projects.includes('alpha'), true, `shapes=${shapes} 时清单要含 alpha：`);
+    // 小字段不受 shapes 影响：只要 todos 时也不能把它们一起省掉（面板任何视图都要用）
+    eq(typeof data.stats.total, 'number', `shapes=${shapes} 时 stats 不能丢：`);
+  }
+});
+
+await test('GET /list 的 projects 按出现次数降序（不是字典序），次数相同按名称升序', async () => {
+  const create = (title, project) => call(routes.get('/worktodo/create').handler, {
+    method: 'POST', url: '/worktodo/create', body: { title, project },
+  });
+  // zzz-sort 造 3 次、aaa-sort 造 1 次：字典序会把 aaa-sort 排前面，次数降序不会
+  for (let i = 0; i < 3; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    await create(`排序用例 z${i}`, 'zzz-sort');
+  }
+  await create('排序用例 a', 'aaa-sort');
+
+  const data = (await call(routes.get('/worktodo/list').handler, {
+    method: 'GET', url: '/worktodo/list?filter=all&shapes=groups',
+  })).json().data;
+  const z = data.projects.indexOf('zzz-sort');
+  const a = data.projects.indexOf('aaa-sort');
+  eq(z !== -1 && a !== -1, true, `两个项目都要在清单里：${JSON.stringify(data.projects)}`);
+  eq(z < a, true, `常用的（3 次）必须排在只用过 1 次的前面：${JSON.stringify(data.projects)}`);
+
+  // 次数相同 → 名称升序：aaa-tie / bbb-tie 各 1 次
+  await create('平局 a', 'aaa-tie');
+  await create('平局 b', 'bbb-tie');
+  const tie = (await call(routes.get('/worktodo/list').handler, {
+    method: 'GET', url: '/worktodo/list?filter=all&shapes=todos',
+  })).json().data.projects;
+  eq(tie.indexOf('aaa-tie') < tie.indexOf('bbb-tie'), true, `次数相同按名称升序：${JSON.stringify(tie)}`);
+});
+
+await test('POST /create 带 project 落库并被 /list 的 projects 反映；POST /update 可改可清空（project:null）', async () => {
+  const created = await call(routes.get('/worktodo/create').handler, {
+    method: 'POST', url: '/worktodo/create',
+    body: { title: '项目选择器落库', project: 'picker-proj' },
+  });
+  eq(created.json().data.todo.project, 'picker-proj');
+  const afterCreate = (await call(routes.get('/worktodo/list').handler, {
+    method: 'GET', url: '/worktodo/list?filter=all&shapes=groups',
+  })).json().data;
+  eq(afterCreate.projects.includes('picker-proj'), true, 'create 的项目要进 /list 的 projects：');
+
+  const id = created.json().data.todo.id;
+  const changed = await call(routes.get('/worktodo/update').handler, {
+    method: 'POST', url: '/worktodo/update', body: { ref: id, project: 'picker-proj-2' },
+  });
+  eq(changed.json().data.todo.project, 'picker-proj-2');
+  const afterUpdate = (await call(routes.get('/worktodo/list').handler, {
+    method: 'GET', url: '/worktodo/list?filter=all&shapes=todos',
+  })).json().data;
+  eq(afterUpdate.projects.includes('picker-proj-2'), true, 'update 改过的项目要进清单：');
+  eq(afterUpdate.projects.includes('picker-proj'), false, '旧项目名不该继续留在清单里（除非还有别条在用）：');
+
+  // 面板的「未归类」= project: null（空串也走同一条清空语义）
+  const cleared = await call(routes.get('/worktodo/update').handler, {
+    method: 'POST', url: '/worktodo/update', body: { ref: id, project: null },
+  });
+  eq(cleared.json().data.todo.project, null, 'project:null 必须清空：');
+  const afterClear = (await call(routes.get('/worktodo/list').handler, {
+    method: 'GET', url: '/worktodo/list?filter=all&shapes=projectGroups',
+  })).json().data;
+  eq(afterClear.projects.includes('picker-proj-2'), false, '清空后项目不该再出现在清单里：');
+});
+
+await test('GET /list 的 projects 超过 50 个时截断并置 projectsTruncated=true（面板据此提示「只显示常用项」）', async () => {
+  for (let i = 0; i < 60; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    await call(routes.get('/worktodo/create').handler, {
+      method: 'POST', url: '/worktodo/create',
+      body: { title: `截断用例 ${i}`, project: `bulk-${String(i).padStart(2, '0')}` },
+    });
+  }
+  const data = (await call(routes.get('/worktodo/list').handler, {
+    method: 'GET', url: '/worktodo/list?filter=all&shapes=projectGroups',
+  })).json().data;
+  eq(data.projects.length, 50, '只回前 50 个：');
+  eq(data.projectsTruncated, true, '截断时必须显式置 true：');
 });
 
 // ---- AI 友好：批量登记 + 给模型的用法指引 ----

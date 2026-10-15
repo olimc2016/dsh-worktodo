@@ -92,7 +92,8 @@ function extractClientPosts() {
           if (depth === 0) { end = i; break; }
         }
       }
-      out.push({ path: pathMatch[1], keys: topLevelKeys(clientSource.slice(bodyStart + 1, end)) });
+      // start = 对象字面量开括号的位置（C3 的 extractArgExpression 从这里往后找键）
+      out.push({ path: pathMatch[1], keys: topLevelKeys(clientSource.slice(bodyStart + 1, end)), start: bodyStart });
     }
     index = clientSource.indexOf(marker, index + marker.length);
   }
@@ -128,6 +129,100 @@ function extractPatchFields() {
   return [...found].sort();
 }
 
+/**
+ * 剥掉 JS 源码里的行注释（保留换行、**不碰字符串里的 `//`**，例如 `'https://…'`）。
+ * @param {string} text
+ * @returns {string}
+ */
+function stripLineComments(text) {
+  let out = '';
+  let quote = null;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      out += ch;
+      if (ch === '\\') { out += text[i + 1] ?? ''; i += 1; }
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === '`') { quote = ch; out += ch; continue; }
+    if (ch === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i += 1;
+      out += '\n'; // 保留换行：键与逗号之间的注释被删掉后，定位仍然跨行
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * 客户端传给 `/create` 的某个字段值是怎么算出来的（用于「空值必须显式 null」这类结构+行为断言）。
+ *
+ * C3：`extractArgExpression` 抽出表达式的**原文**；这里只管两种输入下的实际值：
+ *   （a）没给值（undefined）→ 必须是 null（缺键/undefined 会被宿主当成「没有这个键」）；
+ *   （b）给了值 → 必须等于给定的期望值（顺带证明表达式不是恒 null）。
+ * 抽出来的表达式只依赖 `input` 与 `String`，在独立作用域里求值是安全的；
+ * 顺序断言（先判空）让「条件写反」这种逻辑错误在（a）里就暴露。
+ * @param {{path: string, keys: string[], start: number}} post
+ * @param {string} key
+ * @param {unknown} givenValue 表单里给的值（模拟 QuickAdd 传来的 input）
+ * @param {unknown} expectedGiven 期望的报文字段值
+ * @returns {unknown} undefined 输入时该字段的值
+ */
+function evaluateCreateArg(post, key, givenValue, expectedGiven) {
+  const expr = extractArgExpression(post, key);
+  // eslint-disable-next-line no-new-func
+  const evaluate = new Function('input', `return (${expr});`);
+  const empty = evaluate(undefined);
+  eq(empty, null, `${key}：未给值时必须发 null（undefined 会被宿主当成缺键），实际 ${JSON.stringify(empty)}，表达式 ${expr}`);
+  const given = evaluate({ [key]: givenValue });
+  eq(given, expectedGiven, `${key}：给了 ${JSON.stringify(givenValue)} 时应当发 ${JSON.stringify(expectedGiven)}，实际 ${JSON.stringify(given)}，表达式 ${expr}`);
+  return { expr, empty, given };
+}
+
+/**
+ * 从 `/create` 的字面报文里取某个键的表达式原文（深度感知，换成别的写法也不会假红）。
+ *
+ * C3：原先用整串正则匹配 `project:\s*input\?\.project\s*\?\s*String\(…\)\.trim\(\)\s*:\s*null`，
+ * 把变量名/抽取方式绑死在源码文本上——等价重构成
+ * `project: (() => { const raw = input?.project; return typeof raw === 'string' ? raw.trim() : null; })()`
+ * 会假红（已实测），而把条件写成 `!input?.project ? … : null`（逻辑反了）它照样通过（也实测过）。
+ * 这里只抽**表达式**，交给 `evaluateCreateArg` 用真实输入求值——
+ * 写法变了不红，语义反了/空值分支不是 null 才红。
+ * @param {{path: string, keys: string[], start: number}} post
+ * @param {string} key
+ * @returns {string|null}
+ */
+function extractArgExpression(post, key) {
+  // 先剥掉行注释（保留换行）：注释会挡在 `,` 与键之间，让「键只能跟在 { 或 , 之后」的定位失败
+  //（`project` 与 `dueTime` 前面都有一段说明注释，第一次跑就踩了这个）。
+  const literal = stripLineComments(clientSource.slice(post.start));
+  const marker = new RegExp(`(?:^|[{,])\\s*${key}\\s*:`).exec(literal);
+  if (!marker) return null;
+  const valueStart = marker.index + marker[0].length;
+  const open = '{([';
+  const close = '})]';
+  let depth = 0;
+  let quote = null;
+  let end = literal.length;
+  for (let i = valueStart; i < literal.length; i += 1) {
+    const ch = literal[i];
+    if (quote) {
+      if (ch === '\\') i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === '`') { quote = ch; continue; }
+    if (open.includes(ch)) depth += 1;
+    else if (close.includes(ch)) {
+      if (depth === 0) { end = i; break; }
+      depth -= 1;
+    } else if (ch === ',' && depth === 0) { end = i; break; }
+  }
+  return literal.slice(valueStart, end).trim();
+}
+
 const clientPosts = extractClientPosts();
 const patchFields = extractPatchFields();
 
@@ -156,12 +251,22 @@ await test('客户端新建待办必须把 dueTime 一起发出去（否则用�
   eq(Boolean(create), true, '没有从客户端源码抽出 /create 的报文：');
   eq(create.keys.includes('dueTime'), true, `/create 报文缺 dueTime：${JSON.stringify(create.keys)}`);
   // 空值必须是 null（不是 undefined）：undefined 会被宿主当成「没有这个键」，
-  // 而 QuickAdd 已经把时间词从标题里摘掉了，丢了就找不回来
-  eq(
-    /dueTime:\s*input\?\.dueTime\s*\?\s*String\(input\.dueTime\)\s*:\s*null/.test(clientSource),
-    true,
-    'dueTime 的空值必须显式给 null：',
-  );
+  // 而 QuickAdd 已经把时间词从标题里摘掉了，丢了就找不回来。
+  // C3：不绑源码文本，直接拿抽出来的表达式求值（未给值 → null；给了值 → 原样发出）。
+  evaluateCreateArg(create, 'dueTime', '15:30', '15:30');
+});
+
+await test('客户端新建待办必须把 project 一起发出去，且空值分支是 null（项目选择器字段）', () => {
+  const create = clientPosts.find((p) => p.path === '/create');
+  eq(Boolean(create), true, '没有从客户端源码抽出 /create 的报文：');
+  eq(create.keys.includes('project'), true, `/create 报文缺 project：${JSON.stringify(create.keys)}`);
+  // undefined 会被宿主当成「没有这个键」（甚至触发无损 JSON 校验失败），
+  // 所以「未归类」必须显式发 null —— 与 due/dueTime 同一条约定。
+  // C3：不绑源码文本，直接拿抽出来的表达式求值：未给值 → null，给了值 → trim 后原样发出。
+  //      条件写反（`!input?.project ? … : null`）会让空值分支变成 `String(undefined)`，这条立刻红。
+  evaluateCreateArg(create, 'project', '  beta  ', 'beta');
+  // 行内编辑那条路径用的是空串清空（/update），两种约定都要保留
+  eq(patchFields.includes('project'), true, '行内编辑仍要能改项目：');
 });
 
 /* ------------------------------------------------------------------ *
@@ -306,6 +411,67 @@ await test('update 的空串约定能清空截止日期与项目（面板就靠�
   eq(cleared.data.todo.project, null, '空串应清空项目：');
 });
 
+await test('create 带 project 的报文能落库，并被 /list 的 projects 反映（任何 shapes 都带清单）', async () => {
+  const body = await hit('/worktodo/create', {
+    method: 'POST',
+    url: '/worktodo/create',
+    // 与 src/client/index.js 的 handleAdd 完全同形（未归类时 project: null）
+    body: { title: '契约测试：选一个项目', due: null, dueTime: null, priority: 'none', project: 'contract-proj' },
+  });
+  eq(body.ok, true);
+  eq(body.data.todo.project, 'contract-proj', '面板选的项目必须真的存下来：');
+
+  // 面板停在「按截止」（shapes=groups）时也会用项目选择器 —— 清单必须在这个形状下就有
+  for (const shapes of ['groups', 'projectGroups', 'todos']) {
+    const list = await hit(`/worktodo/list?filter=all&shapes=${shapes}`);
+    eq(Array.isArray(list.data.projects), true, `shapes=${shapes} 时 projects 必须是数组：`);
+    eq(list.data.projects.includes('contract-proj'), true, `shapes=${shapes} 时清单要含刚建的项目：`);
+    eq(typeof list.data.projectsTruncated, 'boolean', `shapes=${shapes} 时 projectsTruncated 必须是布尔：`);
+  }
+});
+
+await test('update 用 project:null 也能清空（面板的「未归类」走这条）', async () => {
+  const list = await hit('/worktodo/list?filter=all');
+  const target = list.data.todos.find((todo) => todo.project === 'contract-proj');
+  eq(Boolean(target), true, '先得有一条带项目的记录：');
+  const cleared = await hit('/worktodo/update', {
+    method: 'POST', url: '/worktodo/update', body: { ref: target.id, project: null },
+  });
+  eq(cleared.ok, true);
+  eq(cleared.data.todo.project, null, 'project:null 必须清空：');
+  const after = await hit('/worktodo/list?filter=all&shapes=todos');
+  eq(after.data.projects.includes('contract-proj'), false, '清空后清单里不该再有它：');
+});
+
+await test('C3：create/update 两条路径的空值语义（显式 null 与空串）落到宿主都不产生空项目', async () => {
+  // 与 src/client/index.js 的 handleAdd 完全同形（未归类时 project/dueTime 显式给 null）。
+  // 行为断言：报文里键在、值为 null → 宿主落 null，且清单里不会多出一个空项目。
+  const body = await hit('/worktodo/create', {
+    method: 'POST',
+    url: '/worktodo/create',
+    body: { title: '契约测试：未归类（显式 null）', due: null, dueTime: null, priority: 'none', project: null },
+  });
+  eq(body.ok, true);
+  eq(body.data.todo.project, null, 'project:null 必须落成 null：');
+  eq(body.data.todo.dueTime, null, 'dueTime:null 必须落成 null：');
+
+  const list = await hit('/worktodo/list?filter=all&shapes=todos');
+  const stored = list.data.todos.find((todo) => todo.id === body.data.todo.id);
+  eq(Boolean(stored), true, '刚建的记录要能读回来：');
+  eq(Object.prototype.hasOwnProperty.call(stored, 'project'), true, '记录里必须有 project 键：');
+  eq(stored.project, null, '未归类的记录 project 必须是显式 null：');
+  eq(list.data.projects.includes('') === false && list.data.projects.includes(null) === false, true,
+    `未归类不该进项目清单：${JSON.stringify(list.data.projects)}`);
+
+  // 行内编辑那条路径（/update + project:null）同样不能留下空项目
+  const set = await hit('/worktodo/update', { method: 'POST', url: '/worktodo/update', body: { ref: body.data.todo.id, project: 'c3-proj' } });
+  eq(set.data.todo.project, 'c3-proj');
+  const back = await hit('/worktodo/update', { method: 'POST', url: '/worktodo/update', body: { ref: body.data.todo.id, project: null } });
+  eq(back.data.todo.project, null, 'update 的 project:null 必须清空：');
+  const after = await hit('/worktodo/list?filter=all&shapes=todos');
+  eq(after.data.projects.includes('c3-proj'), false, '清空后不该留在清单里：');
+});
+
 await test('status 的 toggle 约定（勾选框）可用', async () => {
   const list = await hit('/worktodo/list?filter=all');
   const id = list.data.todos[0].id;
@@ -339,7 +505,7 @@ await test('remove 的报文（ref）可用', async () => {
 await test('list 返回面板首屏需要的全部字段与五个分组', async () => {
   const body = await hit('/worktodo/list?filter=all');
   eq(body.ok, true);
-  for (const key of ['todos', 'groups', 'stats', 'today', 'store', 'projects']) {
+  for (const key of ['todos', 'groups', 'stats', 'today', 'store', 'projects', 'projectsTruncated']) {
     eq(key in body.data, true, `面板需要的字段 ${key} 缺失：`);
   }
   eq(Object.keys(body.data.groups).sort(), ['completed', 'later', 'overdue', 'today', 'week']);

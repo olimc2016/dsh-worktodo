@@ -196,6 +196,9 @@ const zh = {
   'cancel': '取消',
   'projectLabel': '项目',
   'projectPlaceholder': '项目名（可选）',
+  'projectNew': '新建',
+  'projectNewPlaceholder': '新项目名',
+  'projectListTruncated': '项目较多，只显示最常用的 {count} 个',
   'titlePlaceholder': '待办标题',
   'notesLabel': '备注',
   'notesPlaceholder': '备注（可选）',
@@ -297,6 +300,9 @@ const en = {
   'cancel': 'Cancel',
   'projectLabel': 'Project',
   'projectPlaceholder': 'project (optional)',
+  'projectNew': 'Create',
+  'projectNewPlaceholder': 'New project name',
+  'projectListTruncated': 'Many projects — showing the {count} most used',
   'titlePlaceholder': 'To-do title',
   'notesLabel': 'Notes',
   'notesPlaceholder': 'Notes (optional)',
@@ -793,6 +799,28 @@ const IconClock = () => React.createElement('svg', { width: 13, height: 13, view
   React.createElement('circle', { key: 'c', cx: 8, cy: 8, r: 5.8 }),
   React.createElement('path', { key: 'p', d: 'M8 4.9V8l2.2 1.4' }),
 ]);
+/** 文件夹：第二行「项目」那一项的前缀图标（与日期/时间/优先级同一种画法）。 */
+const IconFolder = () => React.createElement('svg', { width: 13, height: 13, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, 'aria-hidden': 'true' }, [
+  React.createElement('path', { key: 'f', d: 'M1.8 4.4a1.4 1.4 0 0 1 1.4-1.4h2.6l1.4 1.7h5a1.4 1.4 0 0 1 1.4 1.4v5.5a1.4 1.4 0 0 1-1.4 1.4H3.2a1.4 1.4 0 0 1-1.4-1.4z' }),
+]);
+
+/**
+ * 「项目」选择器弹层里的查重：把用户输入对齐到已有项目。
+ *
+ * 重名不能报错、也不能造一个只差大小写/首尾空白的第二份（那会让「按项目」视图
+ * 立刻裂成两个桶）。命中已有项目时返回**它在清单里的原名**，否则返回 null。
+ * @param {string[]} options 已知项目（宿主 /list 的 projects）
+ * @param {string} input 用户输入
+ * @returns {string|null}
+ */
+export function matchExistingProject(options, input) {
+  const name = String(input ?? '').trim();
+  if (!name) return null;
+  const key = name.toLowerCase();
+  const found = asArray(options).find((option) => typeof option === 'string' && option.trim().toLowerCase() === key);
+  return found ? found.trim() : null;
+}
+
 
 /**
  * 快速添加：两行布局（设计稿 v5）。
@@ -801,14 +829,19 @@ const IconClock = () => React.createElement('svg', { width: 13, height: 13, view
  * 标题里写了「明天下午3点」这类说法会被实时解析：第二行自动点亮并标"· 识别"，
  * 且日期词会从标题里摘掉。**手动改过就不再被自动覆盖**（手动优先）。
  */
-function QuickAdd({ t, onAdd, busy }) {
+function QuickAdd({ t, onAdd, busy, projects, projectsTruncated }) {
   const [title, setTitle] = React.useState('');
   const [due, setDue] = React.useState('');
   const [dueTime, setDueTime] = React.useState('');
   const [priority, setPriority] = React.useState('none');
+  // 项目：null = 未归类。它是**纯手动**字段（标题里没有"项目词"可解析），
+  // 所以不存在"自动识别覆盖手动选择"的问题，只要求改标题不动它。
+  const [project, setProject] = React.useState(null);
   const [parsed, setParsed] = React.useState(null);
   const [manual, setManual] = React.useState(false); // 用户手动改过日期/时间
   const [flagOpen, setFlagOpen] = React.useState(false);
+  const [projectOpen, setProjectOpen] = React.useState(false);
+  const [projectDraft, setProjectDraft] = React.useState('');
   // 点"整块胶囊"都要弹出选择器：Safari 里带值的 date/time 输入光靠点击只会聚焦，
   // 所以统一主动调 showPicker()（不可用时退回 focus+click）
   const dateRef = React.useRef(null);
@@ -853,13 +886,17 @@ function QuickAdd({ t, onAdd, busy }) {
       due: due || null,
       dueTime: dueTime || null,
       priority,
+      // 空值显式给 null（不是 undefined）：宿主对请求体做「无损 JSON」校验，
+      // undefined 会被当成缺键，甚至让整次调用被拒（与 due/dueTime 同一条约定）。
+      project: project ?? null,
     })).then((ok) => {
       if (ok !== false) {
         setTitle('');
         setParsed(null);
         setManual(false);
         setFlagOpen(false);
-        // 日期/时间/优先级保留：连着录同一天的几件事不用重设
+        setProjectOpen(false);
+        // 日期/时间/优先级/项目保留：连着录同一批事（同项目、同一天）不用重设
       }
     }).catch(() => { /* onAdd 内部已显示错误 */ });
   };
@@ -891,6 +928,29 @@ function QuickAdd({ t, onAdd, busy }) {
     setDueTime(value);
   };
 
+  /** 已知项目（宿主 /list 的 projects 字段，任何 shapes 下都有）。 */
+  const projectOptions = asArray(projects)
+    .map((name) => (typeof name === 'string' ? name.trim() : ''))
+    .filter(Boolean);
+
+  /** Esc 关闭项目弹层（chip 与弹层都挂，键盘从哪儿进来都能关）。 */
+  const closeProjectOnEscape = (event) => {
+    if (event?.key === 'Escape') setProjectOpen(false);
+  };
+
+  /**
+   * 弹层里的「新建」（点按钮或输入框回车）：
+   * 重名（忽略大小写与首尾空白）时**直接选中已有项目**——不报错，也不造一份近重复项
+   * （那会让「按项目」视图立刻裂成两个桶）；否则就用输入的名字。
+   */
+  const createProject = () => {
+    const name = String(projectDraft ?? '').trim();
+    if (!name) return; // 空输入：什么都不做（不建空项目，也不关弹层）
+    setProject(matchExistingProject(projectOptions, name) ?? name);
+    setProjectDraft('');
+    setProjectOpen(false);
+  };
+
   return React.createElement('div', { key: 'qa', style: { marginBottom: 12 } }, [
     // ---- 第一行：内容 + 添加 ----
     React.createElement('div', { key: 'l1', style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
@@ -915,12 +975,13 @@ function QuickAdd({ t, onAdd, busy }) {
       }, t('add')),
     ]),
 
-    // ---- 第二行（更小）：日期 / 时间 / 优先级 ----
+    // ---- 第二行（更小）：日期 / 时间 / 优先级 / 项目 ----
     React.createElement('div', { key: 'l2', style: { display: 'flex', alignItems: 'center', gap: 10, marginTop: 8, fontSize: 11.5, flexWrap: 'wrap' } }, [
       // 日期：label 里套一个透明的原生 date 输入，点它即弹系统日历
       React.createElement('label', {
         key: 'due',
         className: `wt-chip${parsed && parsed.due ? ' is-parsed' : ''}`,
+        'data-wt-field': 'due',
         title: t('dueLabel'),
         onClick: (event) => { event.preventDefault(); openPicker(dateRef); },
         style: { position: 'relative', cursor: 'pointer', color: due ? C.label : C.label3, borderColor: parsed && parsed.due ? C.brand : undefined },
@@ -937,6 +998,7 @@ function QuickAdd({ t, onAdd, busy }) {
       React.createElement('label', {
         key: 'time',
         className: `wt-chip${parsed && parsed.dueTime ? ' is-parsed' : ''}`,
+        'data-wt-field': 'time',
         title: t('dueTimeLabel'),
         onClick: (event) => { event.preventDefault(); openPicker(timeRef); },
         style: { position: 'relative', cursor: 'pointer', color: dueTime ? C.label : C.label3, borderColor: parsed && parsed.dueTime ? C.brand : undefined },
@@ -952,8 +1014,9 @@ function QuickAdd({ t, onAdd, busy }) {
       // 优先级：点开四个小旗
       React.createElement('span', { key: 'prio', style: { position: 'relative' } }, [
         React.createElement('button', {
-          key: 'btn', type: 'button', className: 'wt-chip', style: { color: prioColor, cursor: 'pointer', font: 'inherit', fontSize: 11.5 },
-          title: t('priorityLabel'), 'aria-expanded': flagOpen,
+          key: 'btn', type: 'button', className: 'wt-chip', 'data-wt-field': 'priority',
+          style: { color: prioColor, cursor: 'pointer', font: 'inherit', fontSize: 11.5 },
+          title: t('priorityLabel'), 'aria-label': t('priorityLabel'), 'aria-expanded': flagOpen,
           onClick: () => setFlagOpen((open) => !open),
         }, [
           React.createElement(IconFlag, { key: 'f', dashed: priority === 'none', filled: priority !== 'none' }),
@@ -974,6 +1037,83 @@ function QuickAdd({ t, onAdd, busy }) {
           React.createElement(IconFlag, { key: 'f', filled: priority === flag.value, dashed: flag.value === 'none' }),
           React.createElement('span', { key: 'v' }, flag.label),
         ]))) : null,
+      ]),
+      // 项目：**排在优先级之后**（顺序：日期 → 时间 → 优先级 → 项目）。
+      // 点开一个与优先级同风格的小弹层：已有项目（点选）→ 新建（输入 + 新建）→ 未归类（清除）。
+      React.createElement('span', { key: 'project', style: { position: 'relative' } }, [
+        React.createElement('button', {
+          key: 'btn', type: 'button', className: 'wt-chip', 'data-wt-field': 'project',
+          style: { color: project ? C.label : C.label3, cursor: 'pointer', font: 'inherit', fontSize: 11.5 },
+          title: t('projectLabel'),
+          'aria-label': t('projectLabel'),
+          'aria-expanded': projectOpen,
+          'aria-haspopup': 'true',
+          onClick: () => setProjectOpen((open) => !open),
+          onKeyDown: closeProjectOnEscape,
+        }, [
+          React.createElement(IconFolder, { key: 'i' }),
+          React.createElement('span', { key: 'v' }, project ? project : `${t('projectLabel')} · ${t('noProject')}`),
+        ]),
+        projectOpen ? React.createElement('div', {
+          key: 'pop',
+          role: 'group',
+          'aria-label': t('projectLabel'),
+          onKeyDown: closeProjectOnEscape,
+          style: {
+            position: 'absolute', top: '100%', left: 0, zIndex: 5, marginTop: 4, padding: 6,
+            display: 'flex', flexDirection: 'column', gap: 4, minWidth: 176, maxWidth: 260,
+            background: C.layer1, border: `1px solid ${C.border}`, borderRadius: 10,
+            boxShadow: '0 8px 24px rgba(0,0,0,.12)',
+          },
+        }, [
+          // 已有项目：一行一个，当前选中的高亮（aria-pressed 供读屏与测试识别）
+          ...projectOptions.map((name) => React.createElement('button', {
+            key: `p:${name}`, type: 'button', className: 'wt-chip', 'data-wt-project': name,
+            title: name, 'aria-pressed': project === name,
+            style: {
+              color: project === name ? C.label : C.label2, font: 'inherit', fontSize: 11.5,
+              cursor: 'pointer', justifyContent: 'flex-start',
+              borderColor: project === name ? C.brand : undefined,
+            },
+            onClick: () => { setProject(name); setProjectOpen(false); },
+          }, React.createElement('span', { key: 'v' }, name))),
+          // 未归类：一键清除（等价 project = null）
+          React.createElement('button', {
+            key: 'none', type: 'button', className: 'wt-chip', 'data-wt-project-clear': 'true',
+            title: t('noProject'), 'aria-pressed': project === null,
+            style: {
+              color: project === null ? C.label : C.label3, font: 'inherit', fontSize: 11.5,
+              cursor: 'pointer', justifyContent: 'flex-start',
+              borderColor: project === null ? C.brand : undefined,
+            },
+            onClick: () => { setProject(null); setProjectOpen(false); },
+          }, React.createElement('span', { key: 'v' }, t('noProject'))),
+          // 新建：文本输入 + 「新建」（回车即新建）
+          React.createElement('div', {
+            key: 'new', style: { display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 },
+          }, [
+            React.createElement('input', {
+              key: 'in', className: 'wt-input', value: projectDraft,
+              placeholder: t('projectNewPlaceholder'),
+              'aria-label': t('projectNewPlaceholder'),
+              onChange: (event) => setProjectDraft(event.target.value),
+              onKeyDown: (event) => {
+                if (event.key === 'Enter') createProject();
+                else if (event.key === 'Escape') setProjectOpen(false);
+              },
+              style: { flex: '1 1 auto', minWidth: 0, fontSize: 11.5 },
+            }),
+            React.createElement('button', {
+              key: 'go', type: 'button', className: 'wt-btn', 'data-wt-project-create': 'true',
+              title: t('projectNew'), onClick: createProject,
+            }, t('projectNew')),
+          ]),
+          projectsTruncated
+            ? React.createElement('div', {
+              key: 'more', style: { fontSize: 10.5, color: C.label3 },
+            }, fillTemplate(t('projectListTruncated'), { count: projectOptions.length }))
+            : null,
+        ]) : null,
       ]),
     ]),
   ]);
@@ -1688,6 +1828,9 @@ function WorkTodoPanel(props) {
       // 这里漏掉就等于用户输入的时间被永久丢弃（审计 F5）。空值统一给 null，别给 undefined。
       dueTime: input?.dueTime ? String(input.dueTime) : null,
       priority: input?.priority ?? 'normal',
+      // 项目：来自 QuickAdd 的项目选择器。空值同样必须显式 null——
+      // 宿主对请求体做无损 JSON 校验，undefined 会变成「没有这个键」甚至整次调用被拒。
+      project: input?.project ? String(input.project).trim() : null,
     })).then((result) => result.ok);
   }, [runWrite, t]);
 
@@ -1947,7 +2090,16 @@ function WorkTodoPanel(props) {
       })
       : null,
 
-    React.createElement(QuickAdd, { key: 'quick', t, busy: pending > 0, onAdd: handleAdd }),
+    React.createElement(QuickAdd, {
+      key: 'quick',
+      t,
+      busy: pending > 0,
+      onAdd: handleAdd,
+      // 已知项目：宿主 /list 的 projects 在**任何 shapes 下都有**（见 service.list），
+      // 所以面板无论停在「按截止」还是「按项目」，选择器都能列出已有项目。
+      projects: asArray(data?.projects).filter((name) => typeof name === 'string' && name.trim()),
+      projectsTruncated: Boolean(data?.projectsTruncated),
+    }),
 
     /* 分组列表 */
     totalVisible

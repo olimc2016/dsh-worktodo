@@ -21,6 +21,7 @@ import {
   filterRecords,
   groupByProject,
   groupRecords,
+  listProjects,
   patchRecord,
   resolveRef,
   sortForView,
@@ -84,6 +85,44 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
   const listeners = new Set();
 
   /**
+   * 把刚落库的项目名对齐到**已有项目名**（B2：宿主侧便宜的查重一半）。
+   *
+   * 为什么：项目名是自由文本，面板侧早就用「忽略大小写 + 去首尾空白」查重
+   * （`src/client/index.js` 的 `matchExistingProject`），但 agent 工具与行内编辑
+   * 仍能直接写入 `Beta` / `beta` / `  BEta  ` → `/list.projects` 与「按项目」视图
+   * 立刻裂成多个只差大小写的桶。这里用**完全相同**的规则对齐到已有原名：
+   *   归一化键 = `normalizeProject` 的 trim + `toLowerCase()`；
+   *   命中已有项目时**存已有原名**（与客户端把原名回显给用户一致），否则原样保留
+   *   —— 所以「没有近似重名时的大小写」永远不会被改写。
+   *
+   * 代价（已知取舍）：若用户**特意**要把某条改成只差大小写的另一个名字（`Beta` → `beta`），
+   * 这次会留在已有名上；面板本来也只会给出已有名，属可接受的收敛。
+   *
+   * @param {object[]|null} records 当前全量记录（读失败时传 null，此时不改写）
+   * @param {string|null} normalized `normalizeProject` 的结果
+   * @returns {string|null} 对齐后的项目名
+   */
+  const alignProject = (records, normalized) => {
+    if (!normalized || !Array.isArray(records)) return normalized ?? null;
+    const key = normalized.toLowerCase();
+    for (const record of records) {
+      if (typeof record?.project !== 'string') continue;
+      if (record.project.toLowerCase() === key) return record.project; // 存已有原名
+    }
+    return normalized;
+  };
+
+  /** 读当前全量记录，只用于落库前的项目名对齐；读失败返回 null（不改写，宁可忠实落库）。 */
+  const snapshotForAlign = async () => {
+    try {
+      const records = await store.load();
+      return Array.isArray(records) ? records : [];
+    } catch {
+      return null;
+    }
+  };
+
+  /**
    * 存储自检信息：health 路由、`/list` 载荷（面板页脚要渲染这些告警）与 README 排查都用它。
    * 可纠正的存储句柄会额外报出首选后端、不一致/分裂警告、最近一次合并报告与回退文件退役状态。
    */
@@ -141,8 +180,10 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
     const picked = attempt(() => {
       let subset = records;
       if (project) {
+        // B3：过滤键与 `listProjects` 给出的清单值必须同一口径——两边都 trim 后忽略大小写比较。
+        // 记录侧不 trim 的话，清单里的 `' beta '` 会被 trim 成 `beta` 去比，永远 0 条命中。
         const wanted = String(project).trim().toLowerCase();
-        subset = subset.filter((r) => (r.project ?? '').toLowerCase() === wanted);
+        subset = subset.filter((r) => (r.project ?? '').trim().toLowerCase() === wanted);
       }
       if (query) {
         const needle = String(query).trim().toLowerCase();
@@ -168,6 +209,12 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
       forProjects = computed.value;
     }
 
+    // 已知项目清单（面板第二行的「项目」选择器 + 新建时的查重都靠它）。
+    // **不受 shapes 影响**：它是个小数组，而「按截止」视图（shapes=groups）下
+    // 面板同样要能点开项目选择器；只有 projectGroups 才带项目信息是不够的。
+    // 来源是全部记录（不是筛选后的子集）：切到「已完成」也不该丢掉可选项目。
+    const projectInventory = listProjects(records);
+
     const payload = {
       ok: true,
       // 回显实际给出的形状，调用方/测试能一眼看出这次拿了几份
@@ -181,7 +228,9 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
       // 只给 {kind, location} 的话，mismatch/split/backendError/retired/merge 这些告警
       // 永远到不了面板页脚（「数据不一致必须让用户看得见」就是断在这里的）。
       store: describe(),
-      projects: [...new Set(records.map((r) => r.project).filter(Boolean))].sort(),
+      // 排序：出现次数降序 → 次数相同按名称升序；超过上限只回前 N 个并置 projectsTruncated
+      projects: projectInventory.projects,
+      projectsTruncated: projectInventory.truncated,
     };
     // filterRecords 内部按优先级排过序；这里按当前模式再排一次，
     // 否则「平铺列表」会和「分组」用两套顺序（sort=created/manual 时最明显）
@@ -208,6 +257,9 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
     const now = clock();
     const built = attempt(() => createRecord(input ?? {}, { now, source }));
     if (!built.ok) return built;
+    // B2：落库前把近似重名的项目名对齐到已有原名（与客户端 matchExistingProject 同一规则）
+    const aligned = alignProject(await snapshotForAlign(), built.value.project);
+    if (aligned !== built.value.project) built.value.project = aligned;
     try {
       await store.put(built.value);
     } catch (error) {
@@ -286,6 +338,19 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
     }
     const next = attempt(() => patchRecord(target, patch ?? {}, now));
     if (!next.ok) return next;
+    // B2：换项目时同样对齐到已有原名。
+    // 候选池 = 除自己外的全部记录 + 自己**当前**的那条记录（target）：
+    //   - 「改到别的项目的大小写变体」要命中**别人**已有的原名（`Ops` → `beta` 命中 `Beta`）；
+    //   - 「只是改了自己项目的大小写」要留在自己的原名上（`Ops` → `oPS` 仍是 `Ops`），
+    //     但仍要排除自己原本的**旧名**——否则改名时会匹配到自己、白白放过真正的重名。
+    if (Object.prototype.hasOwnProperty.call(patch ?? {}, 'project')) {
+      const inventory = await snapshotForAlign();
+      const candidates = Array.isArray(inventory)
+        ? [...inventory.filter((record) => record?.id !== target.id), target]
+        : null;
+      const aligned = alignProject(candidates, next.value.project);
+      if (aligned !== next.value.project) next.value.project = aligned;
+    }
     try {
       await store.put(next.value);
     } catch (error) {

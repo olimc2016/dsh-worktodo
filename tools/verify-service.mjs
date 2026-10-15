@@ -8,6 +8,7 @@
  * 所以这里的行为错了，两条路径会一起错。
  */
 import { createWorkTodoService } from '../src/service.mjs';
+import { PROJECT_LIST_LIMIT } from '../src/records.mjs';
 
 let passed = 0;
 const failures = [];
@@ -298,6 +299,149 @@ await test('S3-3：记录多且未指定 shapes 时给出体量提示；指定 s
   const picked = await s.list({ filter: 'all', shapes: 'todos' });
   eq('payloadWarning' in picked, false, '显式挑了形状就不该再提示：');
   eq(picked.todos.length, 2001);
+});
+
+console.log('已知项目清单（/list 的 projects：面板「项目」选择器的数据来源）');
+
+await test('/list 在任何 shapes 下都带 projects / projectsTruncated（空清单时是 [] / false）', async () => {
+  const s = makeService();
+  for (const shapes of [undefined, 'todos', 'groups', 'projectGroups', 'todos,groups']) {
+    const view = await s.list({ filter: 'all', shapes });
+    eq(Array.isArray(view.projects), true, `shapes=${shapes} 时 projects 必须是数组：`);
+    eq(view.projects, [], `shapes=${shapes} 时的空清单：`);
+    // 面板要靠它决定「是否提示只显示常用项目」，所以任何形状下都必须是布尔
+    eq(view.projectsTruncated, false, `shapes=${shapes} 时 projectsTruncated：`);
+  }
+});
+
+await test('/list 的 projects：按出现次数降序 → 名称升序；来自全量而非当前筛选（去掉空值）', async () => {
+  const s = makeService();
+  await s.create({ title: 'z1', project: 'zeta' });
+  await s.create({ title: 'z2', project: 'zeta' });
+  await s.create({ title: 'a1', project: 'alpha' });
+  await s.create({ title: 'b1', project: 'beta' });
+  await s.create({ title: '未归类' });
+
+  const all = await s.list({ filter: 'all' });
+  // 次数 zeta 2 > beta 1 = alpha 1 → 次数相同时按名称升序（alpha 在 beta 前）
+  // 旧的 `[...new Set(...)].sort()` 会给出 ['alpha','beta','zeta'] —— 这条断言正是那个靶子
+  eq(all.projects, ['zeta', 'alpha', 'beta']);
+
+  // 清单来自**全部**记录：切到「已完成」（这里一条都没有）也不能把可选项目清空
+  const completedOnly = await s.list({ filter: 'completed' });
+  eq(completedOnly.projects, ['zeta', 'alpha', 'beta'], '筛选不该影响项目清单：');
+
+  // 按项目收窄时也一样：否则面板切进某个项目后就再也列不出别的项目
+  const scoped = await s.list({ filter: 'open', project: 'alpha' });
+  eq(scoped.todos.map((t) => t.title), ['a1']);
+  eq(scoped.projects, ['zeta', 'alpha', 'beta'], 'project 收窄不该影响项目清单：');
+});
+
+await test('/list 的 projects 超过上限时只回前 50 个并置 projectsTruncated（任何 shapes 都截断）', async () => {
+  const s = makeService();
+  for (let i = 0; i < 60; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    await s.create({ title: `项目条目 ${i}`, project: `p${String(i).padStart(2, '0')}` });
+  }
+  for (const shapes of [undefined, 'groups', 'projectGroups']) {
+    const view = await s.list({ filter: 'all', shapes });
+    eq(view.projects.length, PROJECT_LIST_LIMIT, `shapes=${shapes} 时回前 ${PROJECT_LIST_LIMIT} 个：`);
+    eq(view.projectsTruncated, true, `shapes=${shapes} 时 projectsTruncated：`);
+    eq(view.projects[0], 'p00', '取的必须是排序后的前 N 个：');
+  }
+});
+
+await test('B3：清单里给出的项目名原样拿去 /list?project= 必须命中（口径一致，不 trim 输出）', async () => {
+  // 直改存储 / 迁移才可能产生带首尾空白的项目名（正常写入路径 normalizeProject 会 trim），
+  // 这里就模拟这种存量数据：清单显示什么值，过滤就必须用什么值命中。
+  const seeded = {
+    id: 'legacy-1', title: '带空白的存量项目', status: 'pending', priority: 'normal',
+    due: null, dueTime: null, notes: '', project: ' beta ', source: 'human',
+    createdAt: NOW, updatedAt: NOW, completedAt: null, order: null,
+  };
+  const store = fakeStore();
+  await store.put(seeded);
+  const s = createWorkTodoService({ store, clock: () => NOW, logger: { warn() {}, info() {} } });
+
+  const all = await s.list({ filter: 'all', shapes: 'projectGroups' });
+  // (a) 清单里就是存储里的原名（不 trim），且与「按项目」桶名逐字一致
+  eq(all.projects, [' beta '], '/list 的 projects 必须原样给出：');
+  eq(all.projectGroups.map((bucket) => bucket.project), [' beta '], '桶名与清单名必须是同一个字符串：');
+  // (b) 核心断言：拿清单里给出的值去过滤，必须命中那条记录（以前 trim 后是 0 条）
+  const picked = await s.list({ filter: 'all', project: all.projects[0] });
+  eq(picked.todos.map((t) => t.id), ['legacy-1'], '用清单里的值过滤必须命中该记录：');
+  // 选择器已经把值 trim 过（面板显示 beta）：去掉首尾空白的形态同样要命中同一条
+  const trimmed = await s.list({ filter: 'all', project: 'beta' });
+  eq(trimmed.todos.map((t) => t.id), ['legacy-1'], 'trim 过的选择器值也要命中同一条：');
+
+  // 逐项校验每一条清单值都能命中（面板点谁就筛谁）；两种存量写法（带空白 / 不带空白）算同一个项目
+  const store2 = fakeStore();
+  await store2.put(seeded);
+  await store2.put({ ...seeded, id: 'legacy-2', title: '同项目的另一种写法', project: 'beta' });
+  const s2 = createWorkTodoService({ store: store2, clock: () => NOW, logger: { warn() {}, info() {} } });
+  const both = await s2.list({ filter: 'all', project: 'beta' });
+  eq([...both.todos.map((t) => t.id)].sort(), ['legacy-1', 'legacy-2'], '忽略首尾空白：两种写法是同一条目：');
+  // 已知遗留：清单本身只按「逐字」去重（大小写/首尾空白仍是两个条目）——这本轮不动，
+  // 但每个条目都能命中（下面逐条验证），所以「选了却 0 条」不会发生。
+  const names = (await s2.list({ filter: 'all' })).projects;
+  eq([...names].sort(), [' beta ', 'beta'], '清单逐字去重（已知遗留，与 groupByProject 一致）：');
+  for (const name of names) {
+    const hit = await s2.list({ filter: 'all', project: name });
+    eq(hit.todos.length > 0, true, `清单值 ${JSON.stringify(name)} 命中 0 条：`);
+  }
+});
+
+await test('B2：宿主侧把近似重名归一到已有项目名（忽略大小写 + 去首尾空白）', async () => {
+  const s = makeService();
+  await s.create({ title: '第一条', project: 'Beta' });
+  // agent / 行内编辑直接写大小写变体：必须归一到已有名，否则「按项目」视图裂成三个桶
+  const lower = await s.create({ title: '第二条', project: 'beta' });
+  eq(lower.todo.project, 'Beta', 'create 的近似重名要归一到已有原名：');
+  const messy = await s.create({ title: '第三条', project: '  BEta  ' });
+  eq(messy.todo.project, 'Beta', '首尾空白 + 大小写都要归一：');
+
+  const view = await s.list({ filter: 'all', shapes: 'projectGroups' });
+  eq(view.projects, ['Beta'], '清单只能有一个项目：');
+  eq(view.projectGroups.map((bucket) => bucket.project), ['Beta'], '「按项目」只能有一个桶：');
+
+  // update 同样归一（换项目也要沿用已有名）
+  const other = await s.create({ title: '第四条', project: 'Ops' });
+  const otherId = other.todo.id;
+  const renamed = await s.update(otherId, { project: 'oPS' });
+  eq(renamed.todo.project, 'Ops', 'update 的近似重名要归一到已有原名：');
+  eq((await s.list({ filter: 'all' })).projects.sort(), ['Beta', 'Ops'], '归一后不该多出第三个项目：');
+
+  // 全新项目名（没有近似重名）必须是**原样保留**，不能被乱改大小写
+  const fresh = await s.create({ title: '第五条', project: 'NewThing' });
+  eq(fresh.todo.project, 'NewThing', '没有近似重名时原样保留：');
+
+  // 排除自己：把「第四条」从 Ops 改名到 Beta 的变体时要命中 **Beta**（不是留在自己身上）
+  const moved = await s.update(otherId, { project: 'betA' });
+  eq(moved.todo.project, 'Beta', '改名要命中别的项目，不能匹配到自己：');
+  eq((await s.list({ filter: 'all' })).projects.sort(), ['Beta', 'NewThing'], '旧项目名不该被自己留住：');
+});
+
+await test('create / update 带 project 能落库，并被 /list 的 projects 反映（含 project:null 清空）', async () => {
+  const s = makeService();
+  const made = await s.create({ title: '选择器新建的项目', project: 'picker-a' });
+  eq(made.ok, true);
+  eq(made.todo.project, 'picker-a');
+  eq((await s.list({ filter: 'all' })).projects, ['picker-a'], 'create 的项目要进清单：');
+
+  const renamed = await s.update(made.todo.id, { project: 'picker-b' });
+  eq(renamed.ok, true);
+  eq(renamed.todo.project, 'picker-b');
+  eq((await s.list({ filter: 'all' })).projects, ['picker-b'], '改名后旧名不该留在清单里：');
+
+  const cleared = await s.update(made.todo.id, { project: null });
+  eq(cleared.ok, true);
+  eq(cleared.todo.project, null, 'project: null 必须清空：');
+  eq((await s.list({ filter: 'all' })).projects, [], '清空后清单里不该再有它：');
+
+  // 面板的「未归类」是 project=null；把「空白串」也当清空（宿主已在路由层做，服务层同样成立）
+  await s.update(made.todo.id, { project: 'picker-c' });
+  const blank = await s.update(made.todo.id, { project: '   ' });
+  eq(blank.todo.project, null, '空白串等于未归类：');
 });
 
 console.log('拖动排序（S3-1 / S3-2 / S4-1）');

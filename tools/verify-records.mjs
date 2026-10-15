@@ -7,6 +7,7 @@
  */
 import {
   PRIORITIES,
+  PROJECT_LIST_LIMIT,
   STATUSES,
   WorkTodoError,
   adoptSessionTodos,
@@ -18,6 +19,7 @@ import {
   filterRecords,
   formatLine,
   groupRecords,
+  listProjects,
   normalizeDue,
   normalizePriority,
   normalizeStatus,
@@ -241,6 +243,81 @@ test('排序：高优先级在前，同优先级按截止日期，无日期垫�
     mk({ title: 'z', due: '2026-10-16' }, 'z'),
   ]).map((r) => r.id);
   eq(ordered, ['y', 'z', 'x']);
+});
+
+console.log('已知项目清单（面板第二行的「项目」选择器）');
+
+test('listProjects：空清单 / 去重 / 忽略空值与脏数据，且不凭空造项目', () => {
+  eq(listProjects([]), { projects: [], truncated: false }, '空清单：');
+  eq(
+    listProjects([mk({ title: '无项目' }, 'n1'), mk({ title: '空串', project: '' }, 'n2'), mk({ title: '空白', project: '   ' }, 'n3')]),
+    { projects: [], truncated: false },
+    '未归类不是项目：',
+  );
+  // 非文本 / null 记录只跳过自己，不能抛
+  eq(listProjects([{ id: 'x', project: 42 }, { id: 'y', project: 'dev' }, null]).projects, ['dev']);
+  eq(listProjects(undefined).projects, [], '非数组输入也不能抛：');
+  // B3：项目名**原样返回**（不 trim）——与 groupByProject 的桶名、与 /list?project= 的过滤同一口径。
+  // 选择器给什么值，过滤就用什么值命中；这里若 trim，手改数据里的 ' beta ' 会显示成 beta 却 0 条命中。
+  // 注意：mk() 走 createRecord → normalizeProject 会 trim，所以这里必须直接造**原始记录**
+  //（带空白的项目名只有直改存储 / 迁移才可能出现）。
+  const raw = { id: 'w1', title: 'x', project: ' beta ' };
+  eq(listProjects([raw]).projects, [' beta '], '清单必须原样给出存储里的项目名：');
+  eq(groupByProject([raw]).map((b) => b.project), [' beta '], '清单名与「按项目」桶名必须是同一个字符串：');
+});
+
+test('listProjects：忽略全空白名（未归类），但保留带首尾空白的真实项目名', () => {
+  const rows = [
+    { id: 's1', title: 'a', project: '   ' },
+    { id: 's2', title: 'b', project: '\t' },
+    { id: 's3', title: 'c', project: ' beta ' },
+    { id: 's4', title: 'd', project: 'dev' },
+    { id: 's5', title: 'e', project: 'dev' },
+  ];
+  eq(listProjects(rows), { projects: ['dev', ' beta '], truncated: false },
+    '全空白跳过；出现次数降序（dev×2 > " beta "×1）：');
+});
+
+test('listProjects：出现次数降序 → 次数相同按名称升序（不是纯字典序）', () => {
+  const rows = [
+    mk({ title: 'z1', project: 'zeta' }, 'r1'),
+    mk({ title: 'a1', project: 'alpha' }, 'r2'),
+    mk({ title: 'b1', project: 'beta' }, 'r3'),
+    mk({ title: 'z2', project: 'zeta' }, 'r4'),
+    mk({ title: 'z3', project: 'zeta' }, 'r5'),
+    mk({ title: 'b2', project: 'beta' }, 'r6'),
+  ];
+  // zeta×3 > beta×2 > alpha×1（纯字典序会得到 alpha, beta, zeta —— 这条正是反向验证的靶子）
+  eq(listProjects(rows).projects, ['zeta', 'beta', 'alpha']);
+  // 次数相同 → 名称升序
+  eq(listProjects([mk({ title: 'b', project: 'beta' }, 't1'), mk({ title: 'a', project: 'alpha' }, 't2')]).projects,
+    ['alpha', 'beta']);
+});
+
+test('listProjects：超过上限只回前 N 个并置 truncated；恰好等于上限不算截断', () => {
+  eq(PROJECT_LIST_LIMIT, 50, '面板选择器的上限（改大改小都要有意识）：');
+  const many = Array.from({ length: 60 }, (_, i) => mk({ title: `t${i}`, project: `p${String(i).padStart(2, '0')}` }, `m${i}`));
+  const cut = listProjects(many);
+  eq(cut.projects.length, PROJECT_LIST_LIMIT);
+  eq(cut.truncated, true);
+  eq(cut.projects[0], 'p00', '取前 N 个前要先按同一套规则排序：');
+  eq(listProjects(many.slice(0, PROJECT_LIST_LIMIT)).truncated, false, '恰好等于上限不算截断：');
+  eq(listProjects(many, 2), { projects: ['p00', 'p01'], truncated: true }, '上限可注入（测试/未来面板用）：');
+  eq(listProjects(many, 0), { projects: [], truncated: true });
+});
+
+test('listProjects：非法 limit 明确回落默认 50；数字字符串可用；Infinity/负值不能绕过截断', () => {
+  const many = Array.from({ length: 60 }, (_, i) => mk({ title: `t${i}`, project: `p${String(i).padStart(2, '0')}` }, `m${i}`));
+  // B6：以前 -1 / "2" / NaN 都静默回落 50（字符串数字不认），Infinity 反而绕过截断
+  eq(listProjects(many, -1).projects.length, PROJECT_LIST_LIMIT, '负值回落默认：');
+  eq(listProjects(many, -1).truncated, true);
+  eq(listProjects(many, '2'), { projects: ['p00', 'p01'], truncated: true }, '数字字符串当数字用：');
+  eq(listProjects(many, NaN).projects.length, PROJECT_LIST_LIMIT, 'NaN 回落默认：');
+  eq(listProjects(many, Infinity).projects.length, PROJECT_LIST_LIMIT, 'Infinity 不能绕过截断：');
+  eq(listProjects(many, '乱写').projects.length, PROJECT_LIST_LIMIT, '乱码回落默认：');
+  eq(listProjects(many, undefined).projects.length, PROJECT_LIST_LIMIT, '不传 = 默认：');
+  eq(listProjects(many, 2.7).projects.length, 2, '小数向下取整：');
+  eq(listProjects(many, '2.9').projects.length, 2, '字符串小数同样向下取整：');
 });
 
 console.log('持久化校验');

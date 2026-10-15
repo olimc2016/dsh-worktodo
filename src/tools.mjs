@@ -94,7 +94,12 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
       due: { type: 'string', description: '截止日期：YYYY-MM-DD / today / tomorrow / +3d。省略表示没有截止日期。' },
       dueTime: { type: 'string', description: '截止时间 HH:MM（可选，只有给了 due 才有意义；例如 14:30）。' },
       priority: { type: 'string', enum: ['high', 'normal', 'low'], description: '优先级，默认 normal。真正卡住别人的事才给 high。' },
-      project: { type: 'string', description: '项目或领域标签，例如 dsh-worktodo。省略表示不归类。' },
+      project: {
+        type: 'string',
+        description: '项目或领域标签，例如 dsh-worktodo。省略表示不归类。'
+          + '项目名请与既有项目保持一致（复用一个已有名，别写只差大小写/空白的变体，否则「按项目」视图会裂成多个桶）；'
+          + '不确定就先调 worktodo_list 看 projects 清单，从里面挑。',
+      },
       notes: { type: 'string', description: '补充说明：背景、链接、验收标准。默认空。' },
       status: { type: 'string', enum: ['pending', 'in_progress', 'completed'], description: '初始状态，默认 pending。' },
     },
@@ -152,7 +157,10 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
             due: { type: 'string', description: '截止日期：YYYY-MM-DD / today / tomorrow / +3d。' },
             dueTime: { type: 'string', description: '截止时间 HH:MM（可选）。' },
             priority: { type: 'string', enum: ['high', 'normal', 'low'], description: '默认 normal。' },
-            project: { type: 'string', description: '项目或领域标签。' },
+            project: {
+              type: 'string',
+              description: '项目或领域标签。项目名请复用已有项目名（不确定先调 worktodo_list 看 projects 清单），别写只差大小写/空白的变体。',
+            },
             notes: { type: 'string', description: '背景、链接、验收标准。' },
             status: { type: 'string', enum: ['pending', 'in_progress', 'completed'], description: '默认 pending。' },
           },
@@ -293,7 +301,11 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
       due: { type: 'string', description: '新截止日期；传 none 清空（清空日期会一并清掉时间）。' },
       dueTime: { type: 'string', description: '新截止时间 HH:MM；传 none 清空。' },
       priority: { type: 'string', enum: ['high', 'normal', 'low'] },
-      project: { type: 'string', description: '新项目标签；传 none 清空。' },
+      project: {
+        type: 'string',
+        description: '新项目标签；传 none 清空。换项目时请复用已有项目名'
+          + '（不确定先调 worktodo_list 看 projects 清单），别写只差大小写/空白的变体。',
+      },
       notes: { type: 'string', description: '新备注。' },
       status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
     },

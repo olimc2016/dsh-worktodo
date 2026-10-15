@@ -474,6 +474,51 @@ export function groupByProject(records, now = Date.now(), mode = 'priority') {
   });
 }
 
+/**
+ * 面板「项目」选择器要显示的**已知项目清单**上限。
+ *
+ * 为什么要有上限：项目是自由文本，理论上可以无限多；下拉里放几百个既点不动，
+ * 每次轮询也要白带一份长数组。取前 50 个最常用的（面板另用 `projectsTruncated`
+ * 告诉用户「只展示了常用的这些」）。
+ */
+export const PROJECT_LIST_LIMIT = 50;
+
+/**
+ * 从**全部记录**里汇总项目清单（面板第二行的「项目」选择器用）。
+ *
+ * 规则：
+ *   - 去重、忽略空值/空白/非文本（未归类不是项目）；
+ *   - **项目名原样返回，不做 trim**（B3 口径一致）：清单里给出的值必须能原样拿去
+ *     `/list?project=<值>` 命中 —— 过滤侧是「trim 后忽略大小写比较」，`groupByProject`
+ *     的桶名也是原样字符串。这里若输出 trim 过的名字，存储里手改出来的 `' beta '`
+ *     会显示成 `beta`、点选却 0 条命中（选择器给什么值，过滤就用什么值）；
+ *   - 排序：**出现次数降序**（常用的靠前）→ 次数相同按名称升序；
+ *   - 超过 `limit` 时只回前 `limit` 个，并把 `truncated` 置 true。
+ *
+ * 抽成纯函数：它同时被 `/list` 载荷与单测使用，不是「测试里再抄一遍排序」。
+ * @param {object[]} records 全量记录
+ * @param {number|string} [limit] 上限（默认 PROJECT_LIST_LIMIT）；数字字符串可用，非法/负值回落默认
+ * @returns {{projects: string[], truncated: boolean}}
+ */
+export function listProjects(records, limit = PROJECT_LIST_LIMIT) {
+  const counts = new Map();
+  for (const record of Array.isArray(records) ? records : []) {
+    // 原样保留，只用 trim 判断「是不是空」：与 groupByProject / ?project= 过滤同一口径
+    const name = typeof record?.project === 'string' ? record.project : '';
+    if (!name.trim()) continue;
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  const all = [...counts.entries()]
+    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+    .map(([name]) => name);
+  // B6：`-1` / `NaN` / 乱码回落默认 50；数字字符串（"2"）当数字用；`Infinity` 也回落默认
+  // （否则它绕过截断，属防御性缺口）
+  const wanted = Number(limit);
+  const cap = Number.isFinite(wanted) && wanted >= 0 ? Math.floor(wanted) : PROJECT_LIST_LIMIT;
+  const projects = all.slice(0, cap);
+  return { projects, truncated: projects.length < all.length };
+}
+
 export function statsOf(records, now = Date.now()) {
   const today = dayKey(now);
   const stats = { total: records.length, open: 0, overdue: 0, today: 0, doing: 0, completed: 0, completedToday: 0 };

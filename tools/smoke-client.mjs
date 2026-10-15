@@ -1175,6 +1175,331 @@ test('页脚：有新版时渲染成可点的按钮（不是只读 span），进
   }
 });
 
+/* ------------------------------------------------------------------ *
+ * 项目选择器（快速添加第二行的第四项）
+ *
+ * 面板此前**没有任何项目选择 UI**，第二行只有 日期 / 时间 / 优先级。
+ * 这里补的四件事：项目项排在优先级之后、弹层能列已有项目、能新建（重名自动选中已有）、
+ * 「未归类」把 project 清成显式 null（undefined 会被宿主的无损 JSON 校验拒掉）。
+ * ------------------------------------------------------------------ */
+
+console.log('项目选择器（快速添加第二行：日期 → 时间 → 优先级 → 项目）');
+
+/** 等一次宏任务：让面板首屏 fetch 落地（列表缓存写好）之后，QuickAdd 才会被渲染。 */
+const settleList = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/**
+ * 统一的取节点列表：传渲染树（对象）就摊平，传已经摊平过的数组就原样用。
+ * 直接用 flattenTree(array) 会把每个节点连同它的后代再数一遍（深度重复），踩过一次。
+ */
+const allNodes = (value) => (Array.isArray(value) ? value : flattenTree(value));
+
+/** 在渲染树/节点列表里按 data-wt-field 找第二行的某个 chip。 */
+const chipOf = (tree, field) => allNodes(tree).find((n) => n.props?.['data-wt-field'] === field);
+
+/** 弹层里的「已有项目」按钮（按宿主给的顺序）。 */
+const projectOptionNames = (tree) => allNodes(tree)
+  .filter((n) => typeof n.props?.['data-wt-project'] === 'string')
+  .map((n) => n.props['data-wt-project']);
+
+/** 找第一行标题输入框 / 「添加」按钮（提交路径与手动操作完全一致）。 */
+const titleInputOf = (tree) => allNodes(tree)
+  .find((n) => n.type === 'input' && n.props?.placeholder === '[addPlaceholder]');
+const addButtonOf = (tree) => allNodes(tree)
+  .find((n) => n.type === 'button' && textOf(n) === '[add]');
+
+/** 填标题 → 点添加 → 取出这次同步发出的 /create 报文。 */
+function submitAndReadCreate(t) {
+  const input = titleInputOf(renderPanel({ t }));
+  input.props.onChange({ target: { value: '写周报' } });
+  const add = addButtonOf(renderPanel({ t }));
+  const before = fetchCalls.length;
+  add.props.onClick();
+  const post = fetchCalls.slice(before).find((call) => call.url.includes('/create'));
+  return post ? JSON.parse(post.options.body) : null;
+}
+
+await testAsync('第二行的四个 chip 顺序是 日期→时间→优先级→项目，且项目项显示「项目 · 未归类」', async () => {
+  document.visibilityState = 'visible';
+  const t = (key) => `[${key}]`;
+  renderPanel({ t });
+  await settleList(); // 第一次渲染只是发起请求；缓存落地后 QuickAdd 才在树里
+  const tree = renderPanel({ t });
+
+  const fields = flattenTree(tree)
+    .map((n) => n.props?.['data-wt-field'])
+    .filter((value) => typeof value === 'string');
+  eq(fields, ['due', 'time', 'priority', 'project'], `第二行四个 chip 的顺序：${JSON.stringify(fields)}`);
+
+  const chip = chipOf(tree, 'project');
+  eq(Boolean(chip), true, '第二行必须有「项目」chip：');
+  eq(textOf(chip), '[projectLabel] · [noProject]', '未设置时的文案：');
+  eq(chip.props.style?.color, 'var(--dsw-alias-label-tertiary)', '未设置时用灰色（label3）：');
+  // 无障碍：可读名称 + 折叠态
+  eq(chip.props['aria-label'], '[projectLabel]', 'chip 要有 aria-label：');
+  eq(chip.props['aria-expanded'], false, '关闭时 aria-expanded=false：');
+  eq(chip.props['aria-haspopup'], 'true');
+});
+
+await testAsync('项目弹层列出已有项目；点选后 chip 变项目名、当前项高亮，提交报文带该项目名', async () => {
+  document.visibilityState = 'visible';
+  const t = (key) => `[${key}]`;
+  const saved = fakeListPayload.data.projects;
+  fakeListPayload.data.projects = ['dsh-worktodo', 'alpha', 'beta'];
+  try {
+    renderPanel({ t });
+    await settleList();
+    const body = withStableHooks(() => {
+      const chip = chipOf(renderPanel({ t }), 'project');
+      eq(Boolean(chip), true, '必须有「项目」chip：');
+      chip.props.onClick();
+
+      const opened = flattenTree(renderPanel({ t }));
+      eq(projectOptionNames(opened), ['dsh-worktodo', 'alpha', 'beta'], '已有项目要按宿主的顺序一行一个：');
+      eq(Boolean(opened.find((n) => n.props?.['data-wt-project-clear'] === 'true')), true, '要有「未归类」一键清除：');
+      eq(Boolean(opened.find((n) => n.props?.['data-wt-project-create'] === 'true')), true, '要有「新建」按钮：');
+      eq(Boolean(opened.find((n) => n.type === 'input' && n.props?.placeholder === '[projectNewPlaceholder]')), true,
+        '要有「新项目名」输入框：');
+      eq(chipOf(opened, 'project').props['aria-expanded'], true, '打开后 aria-expanded=true：');
+
+      // 点选 alpha：当前项要高亮（aria-pressed 给读屏与测试同一个信号）
+      const alpha = opened.find((n) => n.props?.['data-wt-project'] === 'alpha');
+      alpha.props.onClick();
+      const picked = flattenTree(renderPanel({ t }));
+      const chip2 = chipOf(picked, 'project');
+      eq(textOf(chip2), 'alpha', '选完 chip 要显示项目名：');
+      eq(chip2.props.style?.color, 'var(--dsw-alias-label-primary)', '已设置用正常色（label）：');
+      eq(chip2.props['aria-expanded'], false, '选完要收起弹层：');
+
+      // 重新打开：被选中的那一项必须是高亮态，其余不是
+      chip2.props.onClick();
+      const reopened = flattenTree(renderPanel({ t }));
+      const pressed = reopened
+        .filter((n) => typeof n.props?.['data-wt-project'] === 'string')
+        .map((n) => [n.props['data-wt-project'], n.props['aria-pressed']]);
+      eq(pressed, [['dsh-worktodo', false], ['alpha', true], ['beta', false]], '当前选中的项目要高亮：');
+      // 收起弹层后填标题提交（点 chip 收起，避免弹层挡住按钮的语义）
+      chipOf(renderPanel({ t }), 'project').props.onClick();
+
+      return submitAndReadCreate(t);
+    });
+    eq(body !== null, true, '必须真的发出 /create：');
+    eq(body.project, 'alpha', '提交报文要带所选项目名：');
+    eq(body.title, '写周报');
+  } finally {
+    fakeListPayload.data.projects = saved;
+  }
+});
+
+await testAsync('B7：清单被截断（projectsTruncated）时弹层出现提示文案，且 {count} 已替换成实际条数', async () => {
+  document.visibilityState = 'visible';
+  const saved = fakeListPayload.data.projects;
+  const savedFlag = fakeListPayload.data.projectsTruncated;
+  fakeListPayload.data.projects = ['dsh-worktodo', 'alpha', 'beta'];
+  fakeListPayload.data.projectsTruncated = true;
+  try {
+    // 不注入 t：走模块级 FALLBACK_T（中文表），这样断言的是真实文案而不是 [key] 占位
+    renderPanel();
+    await settleList();
+
+    // 先验正例：宿主说「还有更多」，面板必须告诉用户，且把 {count} 填成实际展示条数
+    const hintText = withStableHooks(() => {
+      chipOf(renderPanel(), 'project').props.onClick();
+      const opened = flattenTree(renderPanel());
+      // 只认「文本就是这句提示」的那个节点（父容器/样式节点会把更多文本拼进来）
+      const hint = opened.find((n) => textOf(n).includes('项目较多') && !textOf(n).includes('dsh-worktodo'));
+      eq(Boolean(hint), true, '截断时必须出现提示文案：');
+      // 断言模板已展开成真实文案、{count} 不再是裸占位符
+      eq(textOf(hint).includes('{count}'), false, '提示里的 {count} 必须被替换（不能留裸模板）：');
+      eq(textOf(hint), `项目较多，只显示最常用的 ${projectOptionNames(opened).length} 个`, '提示要带上实际展示条数：');
+      chipOf(opened, 'project').props.onClick(); // 收起
+      return textOf(hint);
+    });
+    eq(hintText.includes('3'), true, '这里是 3 个项目：');
+
+    // 反例（证明断言不是恒真）：宿主说没截断时不应出现这句提示
+    fakeListPayload.data.projectsTruncated = false;
+    renderPanel();
+    await settleList();
+    withStableHooks(() => {
+      chipOf(renderPanel(), 'project').props.onClick();
+      const opened = flattenTree(renderPanel());
+      eq(opened.some((n) => textOf(n).includes('项目较多') && !textOf(n).includes('dsh-worktodo')), false,
+        '未截断时不该出现截断提示：');
+      chipOf(opened, 'project').props.onClick(); // 收起
+    });
+  } finally {
+    fakeListPayload.data.projects = saved;
+    fakeListPayload.data.projectsTruncated = savedFlag;
+  }
+});
+
+await testAsync('新建项目：输入新名字回车 → chip 变新名字，提交报文带新名字（且不由本地塞进「已有」清单）', async () => {  document.visibilityState = 'visible';
+  const t = (key) => `[${key}]`;
+  const saved = fakeListPayload.data.projects;
+  fakeListPayload.data.projects = ['dsh-worktodo', 'beta'];
+  try {
+    renderPanel({ t });
+    await settleList();
+    const body = withStableHooks(() => {
+      chipOf(renderPanel({ t }), 'project').props.onClick();
+      const opened = flattenTree(renderPanel({ t }));
+      const input = opened.find((n) => n.type === 'input' && n.props?.placeholder === '[projectNewPlaceholder]');
+      eq(Boolean(input), true, '弹层里要有「新项目名」输入框：');
+      eq(input.props.value, '', '输入框初始为空：');
+      input.props.onChange({ target: { value: 'gamma' } });
+      const typed = flattenTree(renderPanel({ t }));
+      const input2 = typed.find((n) => n.type === 'input' && n.props?.placeholder === '[projectNewPlaceholder]');
+      eq(input2.props.value, 'gamma', '输入框受控：');
+      input2.props.onKeyDown({ key: 'Enter' }); // 回车即新建
+      const afterCreate = flattenTree(renderPanel({ t }));
+      const chipNew = chipOf(afterCreate, 'project');
+      eq(textOf(chipNew), 'gamma', '新建后 chip 要显示新项目名：');
+      eq(chipNew.props['aria-expanded'], false, '新建后收起弹层：');
+      // 清单来自宿主：本地新建不会凭空多出一行"已有项目"
+      chipNew.props.onClick(); // 重新打开看一眼清单
+      const listed = flattenTree(renderPanel({ t }));
+      eq(projectOptionNames(listed), ['dsh-worktodo', 'beta'], '新建的项目不由本地塞进「已有」清单：');
+      chipOf(listed, 'project').props.onClick(); // 收起，回到干净状态
+
+      const created = submitAndReadCreate(t);
+      return created;
+    });
+    eq(body !== null, true, '必须真的发出 /create：');
+    eq(body.project, 'gamma', '提交报文要带新项目名：');
+  } finally {
+    fakeListPayload.data.projects = saved;
+  }
+});
+
+await testAsync('新建项目重名（大小写/首尾空白不同）→ 选中已有项目的原名，不产生第二份', async () => {
+  document.visibilityState = 'visible';
+  const t = (key) => `[${key}]`;
+  const saved = fakeListPayload.data.projects;
+  fakeListPayload.data.projects = ['dsh-worktodo', 'beta'];
+  try {
+    renderPanel({ t });
+    await settleList();
+    const body = withStableHooks(() => {
+      chipOf(renderPanel({ t }), 'project').props.onClick();
+      const opened = flattenTree(renderPanel({ t }));
+      const input = opened.find((n) => n.type === 'input' && n.props?.placeholder === '[projectNewPlaceholder]');
+      input.props.onChange({ target: { value: '  BETA  ' } });
+      const typed = flattenTree(renderPanel({ t }));
+      const createBtn = typed.find((n) => n.props?.['data-wt-project-create'] === 'true');
+      eq(Boolean(createBtn), true, '「新建」按钮要在：');
+      createBtn.props.onClick();
+      const afterDup = flattenTree(renderPanel({ t }));
+      const chipDup = chipOf(afterDup, 'project');
+      eq(textOf(chipDup), 'beta', '重名（忽略大小写/首尾空白）要选中已有项目的原名：');
+      eq(chipDup.props['aria-expanded'], false, '选中后收起弹层：');
+      // 重新打开：清单里仍然只有两条，没有因为重名多出一行
+      chipDup.props.onClick();
+      const listedDup = flattenTree(renderPanel({ t }));
+      eq(projectOptionNames(listedDup), ['dsh-worktodo', 'beta'], '重名不能让「已有项目」多出一行：');
+      chipOf(listedDup, 'project').props.onClick(); // 收起
+
+      return submitAndReadCreate(t);
+    });
+    eq(body !== null, true, '必须真的发出 /create：');
+    eq(body.project, 'beta', '重名时提交的是已有项目的原名（不是一个只差大小写的新项目）：');
+  } finally {
+    fakeListPayload.data.projects = saved;
+  }
+});
+
+await testAsync('选「未归类」→ chip 回到未归类，提交报文的 project 是显式 null（不是缺键 / undefined）', async () => {
+  document.visibilityState = 'visible';
+  const t = (key) => `[${key}]`;
+  const saved = fakeListPayload.data.projects;
+  fakeListPayload.data.projects = ['alpha'];
+  try {
+    renderPanel({ t });
+    await settleList();
+    const body = withStableHooks(() => {
+      // 先选上 alpha，证明「未归类」是一次真实的状态变化（不是初始态）
+      chipOf(renderPanel({ t }), 'project').props.onClick();
+      const opened = flattenTree(renderPanel({ t }));
+      opened.find((n) => n.props?.['data-wt-project'] === 'alpha').props.onClick();
+      const picked = flattenTree(renderPanel({ t }));
+      eq(textOf(chipOf(picked, 'project')), 'alpha', '先选中一个项目：');
+
+      chipOf(picked, 'project').props.onClick();
+      const reopened = flattenTree(renderPanel({ t }));
+      const clear = reopened.find((n) => n.props?.['data-wt-project-clear'] === 'true');
+      eq(Boolean(clear), true, '「未归类」按钮要在：');
+      clear.props.onClick();
+      const cleared = flattenTree(renderPanel({ t }));
+      eq(textOf(chipOf(cleared, 'project')), '[projectLabel] · [noProject]', '清除后回到「项目 · 未归类」：');
+
+      return submitAndReadCreate(t);
+    });
+    eq(body !== null, true, '必须真的发出 /create：');
+    eq(Object.prototype.hasOwnProperty.call(body, 'project'), true,
+      'project 键必须存在 —— 缺键会让宿主以为「不改项目」，显式 null 才是清空：');
+    eq(body.project, null, '未归类必须是显式 null：');
+  } finally {
+    fakeListPayload.data.projects = saved;
+  }
+});
+
+await testAsync('项目弹层的键盘可达性：Esc 关闭（chip 与弹层都能关）、Enter 新建、未归类在弹层里', async () => {
+  document.visibilityState = 'visible';
+  const t = (key) => `[${key}]`;
+  const saved = fakeListPayload.data.projects;
+  fakeListPayload.data.projects = ['alpha'];
+  try {
+    renderPanel({ t });
+    await settleList();
+    const report = withStableHooks(() => {
+      const chip = chipOf(renderPanel({ t }), 'project');
+      chip.props.onClick();
+      const opened = flattenTree(renderPanel({ t }));
+      const pop = opened.find((n) => n.props?.role === 'group' && n.props?.['aria-label'] === '[projectLabel]');
+      eq(Boolean(pop), true, '弹层要有 role=group + aria-label（读屏能认出这是一组选择）：');
+      eq(typeof pop.props.onKeyDown, 'function', '弹层要能接键盘事件（子元素冒泡进来的 Esc）：');
+
+      // Esc 从弹层冒泡上来 → 关闭
+      pop.props.onKeyDown({ key: 'Escape' });
+      let closed = flattenTree(renderPanel({ t }));
+      eq(chipOf(closed, 'project').props['aria-expanded'], false, 'Esc 要能关闭弹层：');
+      eq(Boolean(closed.find((n) => n.props?.['data-wt-project-clear'])), false, '关闭后弹层内容不该再渲染：');
+
+      // Esc 从 chip 上按（焦点停在 chip 时）
+      const chip2 = chipOf(renderPanel({ t }), 'project');
+      chip2.props.onClick();
+      const reopened = flattenTree(renderPanel({ t }));
+      const pop2 = reopened.find((n) => n.props?.role === 'group' && n.props?.['aria-label'] === '[projectLabel]');
+      eq(typeof chipOf(reopened, 'project').props.onKeyDown, 'function', 'chip 自己也要能接 Esc：');
+      pop2.props.onKeyDown({ key: 'Escape' });
+      const closed2 = flattenTree(renderPanel({ t }));
+      eq(Boolean(closed2.find((n) => n.props?.['data-wt-project'])), false, 'Esc 之后弹层要关掉：');
+
+      // 输入框里按 Esc 也关；按 Enter 则新建
+      chipOf(closed2, 'project').props.onClick();
+      const opened3 = flattenTree(renderPanel({ t }));
+      const input = opened3.find((n) => n.type === 'input' && n.props?.placeholder === '[projectNewPlaceholder]');
+      eq(typeof input.props.onKeyDown, 'function', '输入框要能接键盘：');
+      input.props.onKeyDown({ key: 'Escape' });
+      eq(Boolean(flattenTree(renderPanel({ t })).find((n) => n.props?.['data-wt-project'])), false,
+        '输入框里的 Esc 也要关闭弹层：');
+
+      chipOf(renderPanel({ t }), 'project').props.onClick();
+      const opened4 = flattenTree(renderPanel({ t }));
+      const input4 = opened4.find((n) => n.type === 'input' && n.props?.placeholder === '[projectNewPlaceholder]');
+      input4.props.onChange({ target: { value: 'delta' } });
+      const typed = flattenTree(renderPanel({ t }));
+      typed.find((n) => n.type === 'input' && n.props?.placeholder === '[projectNewPlaceholder]')
+        .props.onKeyDown({ key: 'Enter' });
+      const done = flattenTree(renderPanel({ t }));
+      return { field: textOf(chipOf(done, 'project')) };
+    });
+    eq(report.field, 'delta', 'Enter 要能新建：');
+  } finally {
+    fakeListPayload.data.projects = saved;
+  }
+});
+
 console.log(`\n${passed} 通过，${failures.length} 失败`);
 if (failures.length) {
   for (const f of failures) console.error(`- ${f.label}: ${f.error?.stack ?? f.error}`);
