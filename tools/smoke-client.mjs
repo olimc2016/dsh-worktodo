@@ -1500,6 +1500,444 @@ await testAsync('项目弹层的键盘可达性：Esc 关闭（chip 与弹层都
   }
 });
 
+/* ------------------------------------------------------------------ *
+ * 行内四旗优先级 / 勾选完成动效 / 更大的勾选框
+ *
+ * 三件事的验收标准都在这里：旗子是可点的按钮且「无优先级」时靠组件状态才现身、
+ * 点选后发出准确的 /worktodo/update 报文、勾选完成挂动效而取消完成不挂、
+ * 勾选框的视觉尺寸与实际可点区域都达标记。
+ * ------------------------------------------------------------------ */
+
+console.log('行内旗子 / 勾选动效 / 勾选框尺寸');
+
+/**
+ * 每次渲染换一个 `t` 身份。
+ *
+ * 真 React 里「行内 setState」会让被 memo 包住的行自己重渲染；替身渲染器只按键位做
+ * props 浅比较，props 没变就整棵子树跳过。换成新身份等价于告诉它「这一轮必须重跑行 body」，
+ * 于是 hover / 展开 / 勾选这些行内状态才量得出来。
+ */
+const mkT = () => (key) => `[${key}]`;
+
+/** 按 data-wt-row 找一行。 */
+const rowNode = (tree, id) => allNodes(tree).find((n) => n.props?.['data-wt-row'] === id);
+
+/** 找一行里的旗子按钮（每行都有：无优先级时是 opacity:0 的 ghost）。 */
+const flagOf = (tree, id) => {
+  const row = rowNode(tree, id);
+  return row ? allNodes(row).find((n) => n.props?.['data-wt-priority-btn'] === 'true') : null;
+};
+
+/** 找一行里的勾选框（用 data 属性定位，避免误命中 wt-check-mark 的 svg）。 */
+const checkOf = (tree, id) => {
+  const row = rowNode(tree, id);
+  return row ? allNodes(row).find((n) => n.props?.['data-wt-check-hit'] !== undefined) : null;
+};
+
+/** 找一行里的子节点（按 className 精确匹配某一个类）。 */
+const inRow = (tree, id, className) => {
+  const row = rowNode(tree, id);
+  return row ? allNodes(row).find((n) => String(n.props?.className ?? '').split(' ').includes(className)) : null;
+};
+
+/** 四旗弹层里的四个按钮值（按渲染顺序）。 */
+const priorityOptionValues = (tree) => allNodes(tree)
+  .filter((n) => typeof n.props?.['data-wt-priority'] === 'string')
+  .map((n) => n.props['data-wt-priority']);
+
+/** 打开某个固定分组的「已完成」组（默认是折叠的，不打开就看不到里面的行）。 */
+function openCompletedGroup(t) {
+  const head = allNodes(renderPanel({ t }))
+    .find((n) => String(n.props?.className ?? '').includes('wt-group-head') && textOf(n).includes('[groupCompleted]'));
+  eq(Boolean(head), true, '面板上必须有「已完成」分组头：');
+  head.props.onClick();
+  return renderPanel({ t });
+}
+
+await test('四旗 UI 只有一份：快速添加与行内旗子共用同一个弹层实现（防两份漂移）', () => {
+  const source = readFileSync(join(here, '..', 'src', 'client', 'index.js'), 'utf8');
+  eq((source.match(/data-wt-priority-pop/g) ?? []).length, 1,
+    '四旗弹层只允许有一处渲染实现（第二处 = 两份 UI 开始漂移）：');
+  eq((source.match(/React\.createElement\(PriorityFlagsPopover/g) ?? []).length, 2,
+    '快速添加 + 行内旗子各一处调用同一个组件：');
+  eq(typeof mod.priorityFlagOptions, 'function', '四旗清单必须是可复用的纯函数：');
+  eq(typeof mod.priorityColor, 'function');
+  const t = mkT();
+  eq(mod.priorityFlagOptions(t).map((f) => f.value), ['none', 'high', 'normal', 'low'], '四档顺序必须是 无/高/中/低：');
+  eq(mod.priorityFlagOptions(t).map((f) => f.label), ['[prioNone]', '[prioHigh]', '[prioNormal]', '[prioLow]']);
+  eq(mod.priorityColor('high') === mod.priorityColor('normal'), false, '高/中必须是两种颜色：');
+  eq(mod.priorityColor('low'), mod.priorityColor('none'), '低/无同色（都是灰）：');
+});
+
+await testAsync('行内旗子：无优先级行默认 ghost，hover/focus 才淡出（组件状态），点开是四旗', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const saved = fakeListPayload.data.groups.later[0].priority;
+  // 把 wt-1 临时降成「无优先级」：这正是要验的那一档（默认不常显旗子）
+  fakeListPayload.data.groups.later[0].priority = 'none';
+  try {
+    withStableHooks(() => {
+      let tree = renderPanel({ t: mkT() });
+      eq(rowNode(tree, 'wt-1')?.props['data-wt-row-priority'], 'none', '这一行现在是无优先级：');
+      const ghost = flagOf(tree, 'wt-1');
+      eq(Boolean(ghost), true, '无优先级的行也必须渲染旗子按钮（否则键盘 Tab 永远够不着它）：');
+      eq(ghost.props['data-wt-ghost'], 'true', '默认是 ghost（不常显）：');
+      eq(ghost.props.style?.opacity, 0, 'ghost 的旗子必须完全透明：');
+      eq(String(ghost.props.className).includes('is-ghost'), true);
+      eq(ghost.props['aria-expanded'], false, '收起时 aria-expanded=false：');
+
+      // 鼠标悬停该行 → 出淡色空心旗（组件状态驱动的可见性）
+      rowNode(tree, 'wt-1').props.onMouseEnter();
+      tree = renderPanel({ t: mkT() });
+      const hovered = flagOf(tree, 'wt-1');
+      eq(hovered.props['data-wt-ghost'], undefined, '悬停该行时旗子必须现身：');
+      eq(hovered.props.style?.opacity > 0 && hovered.props.style?.opacity < 1, true,
+        `悬停现身的是「淡色」空心旗（opacity 应介于 0~1，实际 ${hovered.props.style?.opacity}）：`);
+
+      // 移开 → 收回；纯键盘 focus 该行 → 同样现身（键盘可达）
+      rowNode(tree, 'wt-1').props.onMouseLeave();
+      tree = renderPanel({ t: mkT() });
+      eq(flagOf(tree, 'wt-1').props['data-wt-ghost'], 'true', '鼠标移开后收回：');
+      rowNode(tree, 'wt-1').props.onFocus();
+      tree = renderPanel({ t: mkT() });
+      eq(flagOf(tree, 'wt-1').props['data-wt-ghost'], undefined, 'focus 该行时旗子必须现身（纯键盘够得着）：');
+
+      // 点开四旗
+      flagOf(tree, 'wt-1').props.onClick();
+      tree = renderPanel({ t: mkT() });
+      const pop = allNodes(tree).find((n) => n.props?.['data-wt-priority-pop'] === 'true');
+      eq(Boolean(pop), true, '点旗子必须弹出四旗选择器：');
+      eq(priorityOptionValues(tree), ['none', 'high', 'normal', 'low'], '弹层里就是那四档：');
+      eq(flagOf(tree, 'wt-1').props['aria-expanded'], true, '展开后 aria-expanded=true：');
+      // Esc 关闭：弹层与旗子按钮两条路都要能关
+      pop.props.onKeyDown({ key: 'Escape' });
+      tree = renderPanel({ t: mkT() });
+      eq(flagOf(tree, 'wt-1').props['aria-expanded'], false, '弹层上的 Esc 要能关闭：');
+      eq(Boolean(allNodes(tree).find((n) => n.props?.['data-wt-priority-pop'] === 'true')), false, '关闭后弹层不该再渲染：');
+      flagOf(tree, 'wt-1').props.onClick();
+      tree = renderPanel({ t: mkT() });
+      flagOf(tree, 'wt-1').props.onKeyDown({ key: 'Escape' });
+      tree = renderPanel({ t: mkT() });
+      eq(flagOf(tree, 'wt-1').props['aria-expanded'], false, '旗子按钮上的 Esc 也要能关闭：');
+    });
+  } finally {
+    fakeListPayload.data.groups.later[0].priority = saved;
+  }
+});
+
+await testAsync('行内旗子选「高」/「无」：发出 POST /worktodo/update，body 恰好是 {ref, priority}', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const report = withStableHooks(() => {
+    // 选「高」
+    let tree = renderPanel({ t: mkT() });
+    flagOf(tree, 'wt-1').props.onClick();
+    tree = renderPanel({ t: mkT() });
+    let before = fetchCalls.length;
+    allNodes(tree).find((n) => n.props?.['data-wt-priority'] === 'high').props.onClick();
+    const highPost = fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/update'));
+    // 选完弹层要收起来
+    tree = renderPanel({ t: mkT() });
+    const popoverAfterPick = Boolean(allNodes(tree).find((n) => n.props?.['data-wt-priority-pop'] === 'true'));
+    const expandedAfterPick = flagOf(tree, 'wt-1').props['aria-expanded'];
+
+    // 再选「无」
+    flagOf(tree, 'wt-1').props.onClick();
+    tree = renderPanel({ t: mkT() });
+    before = fetchCalls.length;
+    allNodes(tree).find((n) => n.props?.['data-wt-priority'] === 'none').props.onClick();
+    const nonePost = fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/update'));
+    return {
+      high: highPost.map((c) => JSON.parse(c.options.body)),
+      none: nonePost.map((c) => JSON.parse(c.options.body)),
+      highUrl: highPost[0]?.url ?? '',
+      noneUrl: nonePost[0]?.url ?? '',
+      popoverAfterPick,
+      expandedAfterPick,
+    };
+  });
+  eq(report.highUrl, '/worktodo/update', `必须 POST 到 /worktodo/update（不能整页刷新）：${report.highUrl}`);
+  eq(report.high, [{ ref: 'wt-1', priority: 'high' }], '选「高」的报文：');
+  eq(report.noneUrl, '/worktodo/update');
+  eq(report.none, [{ ref: 'wt-1', priority: 'none' }], '选「无」的报文（none 必须原样发出去）：');
+  eq(report.popoverAfterPick, false, '选中之后弹层必须关闭（不整页刷新，走 refresh 机制）：');
+  eq(report.expandedAfterPick, false, '选中之后 aria-expanded 要回到 false：');
+});
+
+await testAsync('勾选框：视觉 26px、可点区域 ≥40×40、有 aria-label，点击仍走 onToggle（POST /status）', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const report = withStableHooks(() => {
+    const tree = renderPanel({ t: mkT() });
+    const check = checkOf(tree, 'wt-1');
+    eq(Boolean(check), true, '每行必须有勾选框：');
+    const before = fetchCalls.length;
+    check.props.onClick();
+    const posts = fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/status'));
+    return {
+      size: check.props['data-wt-check-size'],
+      hit: check.props['data-wt-check-hit'],
+      label: check.props['aria-label'],
+      type: check.type,
+      posts: posts.map((c) => JSON.parse(c.options.body)),
+      statusUrl: posts[0]?.url ?? '',
+    };
+  });
+  // 尺寸来自同一处常量：渲染出来的属性、导出的常量、样式表三者必须一致
+  eq(mod.CHECK_SIZE_PX, 26, '视觉尺寸应当是 26px：');
+  eq(mod.CHECK_HIT_PX, 40, '可点区域必须 ≥40×40：');
+  eq(report.size, 26, '渲染出来的勾选框尺寸：');
+  eq(report.hit, 40, '渲染出来的可点区域：');
+  eq(report.hit >= 40, true, '可点区域不得小于 40×40：');
+  eq(report.type, 'button', '勾选框仍是原生 button（键盘可达）：');
+  eq(typeof report.label === 'string' && report.label.length > 0, true, `必须有 aria-label：${report.label}`);
+  // 样式表必须真的把这两个数字用上（不是只在节点上挂个属性）
+  eq(mod.STYLE_TEXT.includes('width: 26px') && mod.STYLE_TEXT.includes('height: 26px'), true,
+    '样式表里的勾选框尺寸必须与常量一致：');
+  eq(mod.STYLE_TEXT.includes('inset: -7px'), true, '伪元素必须向外扩 7px（26+7×2=40）以满足可点区域：');
+  eq(mod.STYLE_TEXT.includes('.wt-check:focus-visible'), true, '必须有可见的 focus ring：');
+  eq(report.statusUrl, '/worktodo/status', `点击勾选框仍要触发 onToggle：${report.statusUrl}`);
+  eq(report.posts, [{ ref: 'wt-1', toggle: true }], '勾选报文：');
+});
+
+/**
+ * 从 STYLE_TEXT 里抠出某个选择器的声明块原文（B1 的几何护栏要用**真实 CSS 数值**，不是常量复述）。
+ * @param {string} selector
+ * @returns {string}
+ */
+function cssRule(selector) {
+  const index = mod.STYLE_TEXT.indexOf(`${selector} {`);
+  if (index === -1) throw new Error(`样式表里找不到 ${selector} 规则`);
+  const end = mod.STYLE_TEXT.indexOf('}', index);
+  return mod.STYLE_TEXT.slice(index, end);
+}
+
+/** 从声明块里取一个 px 数值（例如 min-height: 44px → 44）。 */
+function cssPx(block, property) {
+  const match = new RegExp(`${property}\\s*:\\s*(-?[\\d.]+)px`).exec(block);
+  if (!match) throw new Error(`规则里找不到 ${property}: …px`);
+  return Number(match[1]);
+}
+
+await test('B1（护栏）：行高 ≥ 命中盒高度，相邻两行的勾选框命中盒零重叠 —— 数值从**样式表原文**解析', () => {
+  // 审查实跑几何：命中盒 40px、行高 33px → 相邻行命中盒重叠 7px，且下一行在上层 →
+  // 点偏几像素就改错条目。So 这里不比对常量，而是解析 CSS 里的真实数字重算一遍：
+  // 把 .wt-row 的 min-height 改回 33px 会立刻让 overlap > 0 → 用例变红。
+  const rowBlock = cssRule('.wt-row');
+  const checkBlock = cssRule('.wt-check');
+  const beforeBlock = cssRule('.wt-check::before');
+  const minHeight = cssPx(rowBlock, 'min-height');
+  const paddingY = cssPx(rowBlock, 'padding');
+  const marginTop = cssPx(checkBlock, 'margin');
+  const size = cssPx(checkBlock, 'width');
+  const inset = Math.abs(cssPx(beforeBlock, 'inset'));
+  const hitHeight = size + inset * 2;
+  const visualTop = paddingY + marginTop;
+  const hitTop = visualTop - inset;
+  const hitBottom = visualTop + size + inset;
+  const nextHitTop = minHeight + hitTop;
+  const overlap = Math.max(0, hitBottom - nextHitTop);
+  const geometry = mod.checkHitGeometry();
+
+  eq(size, mod.CHECK_SIZE_PX, '视觉尺寸要与常量一致：');
+  eq(hitHeight >= 40, true, `命中盒高度必须 ≥40px（实际 ${hitHeight}）：`);
+  eq(minHeight >= hitHeight, true, `B1：行高（${minHeight}）必须 ≥ 命中盒高度（${hitHeight}）：`);
+  eq(overlap, 0, `B1：相邻两行的命中盒不许重叠（本行命中盒 y=[${hitTop},${hitBottom}]，下一行上沿 ${nextHitTop}）：`);
+  eq(nextHitTop > hitBottom, true, `B1：相邻命中盒之间要有正间隙（实际 ${nextHitTop - hitBottom}px）：`);
+  // 导出的几何助手必须与解析出来的 CSS 数值一致（否则护栏自己会和样式表漂移）
+  eq(geometry.rowHeight, minHeight, 'checkHitGeometry 的行高要与样式表一致：');
+  eq(geometry.hitHeight, hitHeight, 'checkHitGeometry 的命中盒高度要与样式表一致：');
+  eq(geometry.overlap, 0, 'checkHitGeometry 也必须是零重叠：');
+  console.log(`      [B1] 行高 ${minHeight}px / 视觉盒 ${size}px / 命中盒 ${size + inset * 2}×${hitHeight}px（y=[${hitTop},${hitBottom}]）`
+    + ` / 下一行命中盒上沿 ${nextHitTop} / 重叠 ${overlap}px / 间隙 ${nextHitTop - hitBottom}px`);
+});
+
+await testAsync('勾选完成的动效：挂 is-celebrating / wt-check-celebrate / 对勾描边，动画结束自己摘掉', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const report = withStableHooks(() => {
+    let tree = renderPanel({ t: mkT() });
+    const idle = inRow(tree, 'wt-1', 'is-celebrating');
+    eq(Boolean(idle), false, '没勾之前不该有庆祝类：');
+    eq(Boolean(inRow(tree, 'wt-1', 'wt-check-celebrate')), false);
+
+    checkOf(tree, 'wt-1').props.onClick(); // 勾选 → 变为完成
+    tree = renderPanel({ t: mkT() });
+    const row = rowNode(tree, 'wt-1');
+    const marked = inRow(tree, 'wt-1', 'wt-check-celebrate');
+    const markedDone = inRow(tree, 'wt-1', 'wt-check-done');
+    const markSvg = inRow(tree, 'wt-1', 'wt-check-mark');
+    // B3：子元素（勾选框的 wt-check-pop / 描边）动画结束会**冒泡**到行；
+    // 只认 currentTarget 的话，这类事件不得摘掉行的高亮类。
+    const afterChildEnd = (() => {
+      row.props.onAnimationEnd({
+        target: marked ?? row, currentTarget: row, animationName: 'wt-check-pop',
+      });
+      return inRow(renderPanel({ t: mkT() }), 'wt-1', 'is-celebrating');
+    })();
+    // 没有事件对象的裸调用（防御性）同样不许当成「行自己的动画结束」
+    const afterNoEvent = (() => {
+      row.props.onAnimationEnd();
+      return inRow(renderPanel({ t: mkT() }), 'wt-1', 'is-celebrating');
+    })();
+    const afterEnd = (() => {
+      // 行自己的动画结束（还是同一个数据对象 → 乐观态有效）→ 摘类
+      row.props.onAnimationEnd({ target: row, currentTarget: row, animationName: 'wt-row-celebrate' });
+      const next = renderPanel({ t: mkT() });
+      return inRow(next, 'wt-1', 'is-celebrating');
+    })();
+    return {
+      celebrating: String(row.props.className).includes('is-celebrating'),
+      dataFlag: row.props['data-wt-celebrating'],
+      checkClass: marked ? String(marked.props.className) : '',
+      done: Boolean(markedDone),
+      hasMark: Boolean(markSvg),
+      afterChildEnd: Boolean(afterChildEnd),
+      afterNoEvent: Boolean(afterNoEvent),
+      afterEnd: Boolean(afterEnd),
+    };
+  });
+  eq(report.celebrating, true, '勾选完成时行上必须挂 is-celebrating：');
+  eq(report.dataFlag, 'true', '动效状态要能被断言到（data-wt-celebrating）：');
+  eq(report.checkClass.includes('wt-check-celebrate'), true, `勾选框要挂弹跳类：${report.checkClass}`);
+  eq(report.done, true, '勾上时要立刻按已完成渲染（对勾才看得见描边动画）：');
+  eq(report.hasMark, true, '对勾 svg 要带 wt-check-mark（描边动画挂在它上面）：');
+  eq(report.afterChildEnd, true, 'B3：子元素（勾选框/描边）的 animationend 冒泡上来时，行的高亮类绝不能被提前摘掉：');
+  eq(report.afterNoEvent, true, 'B3：没有事件对象的调用也不得摘类：');
+  eq(report.afterEnd, false, '行自己的动画结束后必须自己摘掉类（不靠 JS 定时器）：');
+});
+
+await testAsync('B2：乐观完成态在服务端数据回来后必须回收（引用一变即失效），数据为 pending 时点击方向是「完成」', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const savedLater = fakeListPayload.data.groups.later;
+  try {
+    const report = withStableHooks(() => {
+      let tree = renderPanel({ t: mkT() });
+      eq(checkOf(tree, 'wt-1').props['aria-label'], '[markDone]', '前提：wt-1 初始是 pending（语义 = 标记完成）：');
+
+      checkOf(tree, 'wt-1').props.onClick(); // 勾上 → 乐观完成
+      tree = renderPanel({ t: mkT() });
+      const optimisticDone = Boolean(inRow(tree, 'wt-1', 'wt-check-done'));
+      const optimisticCelebrate = Boolean(inRow(tree, 'wt-1', 'wt-check-celebrate'));
+
+      // refresh/轮询把**新的**数据对象拿回来，而服务端状态仍是 pending
+      fakeListPayload.data.groups.later = [{ ...savedLater[0], status: 'pending', updatedAt: 99, completedAt: null }];
+      tree = renderPanel({ t: mkT() });
+      const stillDone = Boolean(inRow(tree, 'wt-1', 'wt-check-done'));
+      // 动效类与乐观态是两回事：560ms 的短动画可以继续跑完（B3 要求别提前摘），
+      // 但「已完成」这个**状态**必须以服务端数据为准。
+      const stillCelebrating = Boolean(inRow(tree, 'wt-1', 'is-celebrating'));
+      const label = checkOf(tree, 'wt-1')?.props['aria-label'];
+
+      const before = fetchCalls.length;
+      checkOf(tree, 'wt-1').props.onClick();
+      const posts = fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/status'))
+        .map((c) => JSON.parse(c.options.body));
+      // 行自己的动画跑完后，动效类必须自己摘掉（与乐观态无关）
+      rowNode(tree, 'wt-1').props.onAnimationEnd({ target: rowNode(tree, 'wt-1'), currentTarget: rowNode(tree, 'wt-1'), animationName: 'wt-row-celebrate' });
+      const afterAnimation = Boolean(inRow(renderPanel({ t: mkT() }), 'wt-1', 'is-celebrating'));
+      return { optimisticDone, optimisticCelebrate, stillDone, stillCelebrating, label, posts, afterAnimation };
+    });
+    eq(report.optimisticDone, true, '点下去要立刻按已完成渲染（对勾/描边动画才看得到）：');
+    eq(report.optimisticCelebrate, true, '同时也挂弹跳类：');
+    eq(report.stillDone, false, 'B2：数据回来后必须清除乐观态（以服务端 pending 为准），不得一直显示为已完成：');
+    eq(report.stillCelebrating, true, 'B2/B3：短动效可以跑完（不因数据回来被提前摘掉），回收的是「状态」而不是动画：');
+    eq(report.afterAnimation, false, '动效跑完后行要自己摘类：');
+    eq(report.label, '[markDone]', 'B2：显示为 pending 时语义必须是「标记完成」，点击方向才是 completed：');
+    eq(report.posts, [{ ref: 'wt-1', toggle: true }], 'B2：点击发的是 toggle（服务端 pending → completed，方向正确）：');
+  } finally {
+    fakeListPayload.data.groups.later = savedLater;
+  }
+});
+
+await testAsync('取消完成（completed → pending）绝不播庆祝动画', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const report = withStableHooks(() => {
+    let tree = openCompletedGroup(mkT()); // 「已完成」默认折叠，先展开
+    const doneRow = rowNode(tree, 'wt-2');
+    eq(Boolean(doneRow), true, '展开后必须看得到已完成的行：');
+    const before = String(doneRow.props.className);
+    checkOf(tree, 'wt-2').props.onClick(); // 取消完成
+    tree = renderPanel({ t: mkT() });
+    const after = rowNode(tree, 'wt-2');
+    return {
+      before,
+      checking: String(after.props.className).includes('is-celebrating'),
+      dataFlag: after.props['data-wt-celebrating'],
+      checkClass: String(checkOf(tree, 'wt-2')?.props?.className ?? ''),
+    };
+  });
+  eq(report.before.includes('is-celebrating'), false, '取消之前本来就不该有动效类：');
+  eq(report.checking, false, '取消完成时不许挂 is-celebrating：');
+  eq(report.dataFlag, undefined, '取消完成时 data-wt-celebrating 不该出现：');
+  eq(report.checkClass.includes('wt-check-celebrate'), false, '取消完成时勾选框不许挂弹跳类：');
+});
+
+await testAsync('config.celebrate === false：勾选完成只做状态切换，一点动效都不挂', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const savedPanel = fakeListPayload.data.panel;
+  fakeListPayload.data.panel = { celebrate: false };
+  try {
+    eq(mod.shouldCelebrate({ celebrate: false }), false, '显式 false 必须关掉：');
+    eq(mod.shouldCelebrate({}), true, '缺省 = 开（老宿主/精简载荷不该把行为悄悄关掉）：');
+    eq(mod.shouldCelebrate(undefined), true);
+    const report = withStableHooks(() => {
+      let tree = renderPanel({ t: mkT() });
+      checkOf(tree, 'wt-1').props.onClick();
+      tree = renderPanel({ t: mkT() });
+      const row = rowNode(tree, 'wt-1');
+      return {
+        className: String(row.props.className),
+        dataFlag: row.props['data-wt-celebrating'],
+        checkClass: String(checkOf(tree, 'wt-1')?.props?.className ?? ''),
+        done: String(checkOf(tree, 'wt-1')?.props?.className ?? '').includes('wt-check-done'),
+      };
+    });
+    eq(report.className.includes('is-celebrating'), false, '关掉后不许挂行级动效类：');
+    eq(report.dataFlag, undefined, '关掉后 data-wt-celebrating 不该出现：');
+    eq(report.checkClass.includes('wt-check-celebrate'), false, '关掉后不许挂勾选框动效类：');
+    eq(report.done, false, '关掉后连乐观勾选态都不挂（行为与改动前完全一致）：');
+  } finally {
+    fakeListPayload.data.panel = savedPanel;
+  }
+});
+
+await testAsync('prefers-reduced-motion: 系统要求减少动效时连动效类都不挂（CSS 侧另有兜底）', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const savedMatchMedia = globalThis.window.matchMedia;
+  globalThis.window.matchMedia = () => ({ matches: true });
+  try {
+    eq(mod.prefersReducedMotion(), true, 'matchMedia 命中时应当是 true：');
+    const report = withStableHooks(() => {
+      let tree = renderPanel({ t: mkT() });
+      checkOf(tree, 'wt-1').props.onClick();
+      tree = renderPanel({ t: mkT() });
+      return {
+        className: String(rowNode(tree, 'wt-1').props.className),
+        checkClass: String(checkOf(tree, 'wt-1')?.props?.className ?? ''),
+      };
+    });
+    eq(report.className.includes('is-celebrating'), false, '减少动效时不许挂行级动效类：');
+    eq(report.checkClass.includes('wt-check-celebrate'), false, '减少动效时不许挂勾选框动效类：');
+    // CSS 侧的第二道保险：@media (prefers-reduced-motion: reduce) 里把动画全部关掉
+    eq(mod.STYLE_TEXT.includes('@media (prefers-reduced-motion: reduce)'), true, 'CSS 必须有 reduced-motion 降级：');
+    eq(/@media \(prefers-reduced-motion: reduce\)[\s\S]*animation: none !important/.test(mod.STYLE_TEXT), true,
+      '降级块里必须真的把 animation 关掉：');
+    // 动效总时长必须克制
+    eq(mod.CELEBRATE_MS <= 600, true, `庆祝动效总时长必须 ≤600ms（实际 ${mod.CELEBRATE_MS}）：`);
+    eq(mod.STYLE_TEXT.includes('560ms') && mod.STYLE_TEXT.includes('320ms') && mod.STYLE_TEXT.includes('300ms'), true,
+      '三段动画的时长都要写死在样式表里（便于审计）：');
+    eq(mod.STYLE_TEXT.includes('stroke-dashoffset'), true, '对勾必须是描边出现（stroke-dashoffset 动画）：');
+    eq(mod.STYLE_TEXT.includes('stroke-dasharray'), true);
+  } finally {
+    globalThis.window.matchMedia = savedMatchMedia;
+  }
+});
+
 console.log(`\n${passed} 通过，${failures.length} 失败`);
 if (failures.length) {
   for (const f of failures) console.error(`- ${f.label}: ${f.error?.stack ?? f.error}`);

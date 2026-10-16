@@ -83,6 +83,18 @@ export function isWindowHidden(doc = typeof document !== 'undefined' ? document 
  */
 export const EDIT_PRIORITY_OPTIONS = ['high', 'normal', 'low', 'none'];
 
+/**
+ * 面板配置：是否播放「勾选完成」的庆祝动效（宿主 config.celebrate，默认 **开**）。
+ *
+ * 只认显式的 `false`：字段缺失（老宿主 / 老面板 / 测试里的精简载荷）一律按开处理，
+ * 这样新增的开关不会因为「没传」而把行为悄悄关掉。
+ * @param {{celebrate?: unknown}|null|undefined} panel /list 载荷里的 panel 字段
+ * @returns {boolean}
+ */
+export function shouldCelebrate(panel) {
+  return panel?.celebrate !== false;
+}
+
 /** 优先级 → 文案 key。 */
 const PRIORITY_LABEL_KEYS = {
   high: 'prioHigh', normal: 'prioNormal', low: 'prioLow', none: 'prioNone',
@@ -354,9 +366,82 @@ const UPDATE_TONE_STYLE = {
   error: { color: C.error, borderColor: tint(C.error, 50), background: tint(C.error, 12) },
 };
 
+/**
+ * 勾选框的**视觉尺寸**与**实际可点区域**（px）。
+ *
+ * 两个数字都由这里的常量驱动：样式表与渲染出来的节点属性（data-wt-check-size /
+ * data-wt-check-hit）取的是同一个值，所以测试断言不会与实现漂移。
+ * 26px 的视觉尺寸配 40×40 的可点区域：手指/触控板容易点中，又不把整行的横向布局挤变形
+ * （伪元素向外扩，不占布局盒）。
+ */
+export const CHECK_SIZE_PX = 26;
+export const CHECK_HIT_PX = 40;
+/** 伪元素向外扩的尺寸：(40 − 26) / 2 = 7px，26 + 7×2 = 40。 */
+const CHECK_HIT_INSET_PX = (CHECK_HIT_PX - CHECK_SIZE_PX) / 2;
+/**
+ * 行高下限（B1）。**必须 ≥ 命中盒高度**，否则相邻两行的命中盒会纵向重叠，
+ * 而 DOM 里后绘制的下一行在上层 —— 点偏几像素就变成「静默改错条目」。
+ *
+ * 几何（相对本行上沿，含 padding 5px 与勾选框 margin-top −3px）：
+ *   视觉盒 y = [2, 28]；命中盒 y = [−5, 35]（40×40）；
+ *   下一行命中盒上沿 = 44 − 5 = 39 ⇒ **重叠 0px、留 4px 间隙**。
+ * 为什么不取刚好 40：40 时下一行命中盒上沿 = 35，与本行命中盒下沿正好贴边，
+ * 边界那 1px 仍会被后绘制的下一行吃掉；44 同时对齐常见的 44px 触控目标。
+ */
+export const ROW_MIN_HEIGHT_PX = 44;
+/** 行的纵向 padding（几何算式与样式表共用，测试会解析样式表核对）。 */
+const ROW_PADDING_Y_PX = 5;
+/** 勾选框的 margin-top（让它与首行文字视觉居中对齐）。 */
+const CHECK_MARGIN_TOP_PX = -3;
+
+/**
+ * 勾选框命中盒的几何（B1 的护栏，导出供单测）。
+ *
+ * 纯计算：命中盒不得越过邻行的命中盒（相邻行的命中盒都属于「点这条」的意图区）。
+ * 测试会**从 STYLE_TEXT 里解析出真实 CSS 数值**再算一遍，所以把 min-height 改回 33px 会立刻变红。
+ * @returns {{rowHeight: number, hitWidth: number, hitHeight: number, hitTop: number, hitBottom: number, nextHitTop: number, gap: number, overlap: number}}
+ */
+export function checkHitGeometry() {
+  const visualTop = ROW_PADDING_Y_PX + CHECK_MARGIN_TOP_PX;
+  const visualBottom = visualTop + CHECK_SIZE_PX;
+  const hitTop = visualTop - CHECK_HIT_INSET_PX;
+  const hitBottom = visualBottom + CHECK_HIT_INSET_PX;
+  const nextHitTop = ROW_MIN_HEIGHT_PX + hitTop;
+  return {
+    rowHeight: ROW_MIN_HEIGHT_PX,
+    hitWidth: CHECK_SIZE_PX + 2 * CHECK_HIT_INSET_PX,
+    hitHeight: CHECK_SIZE_PX + 2 * CHECK_HIT_INSET_PX,
+    hitTop,
+    hitBottom,
+    nextHitTop,
+    gap: nextHitTop - hitBottom,
+    overlap: Math.max(0, hitBottom - nextHitTop),
+  };
+}
+/**
+ * 对勾描边动画的虚线段长。取值略大于路径实际长度（≈11.6），
+ * 这样 stroke-dashoffset 从 14 动画到 0 时，起始帧对勾完全不可见、结束时完整画出。
+ */
+const CHECK_DASH = 14;
+/** 庆祝动效的总时长：三段动画都 ≤600ms（勾选弹跳 320 / 描边 300+80 延迟 / 整行高亮 560）。 */
+export const CELEBRATE_MS = 560;
+
 /** 面板自带样式表：几何字面量（间距/字号/圆角）写死，颜色全部走变量。 */
-const STYLE_TEXT = `
+export const STYLE_TEXT = `
 @keyframes wt-spin { to { transform: rotate(360deg); } }
+/* 勾选完成时的庆祝动效（短、纯 CSS；只用 transform / opacity / background，绝不改布局） */
+@keyframes wt-check-pop {
+  0% { transform: scale(1); }
+  35% { transform: scale(1.32); }
+  70% { transform: scale(.94); }
+  100% { transform: scale(1); }
+}
+@keyframes wt-mark-draw { from { stroke-dashoffset: ${CHECK_DASH}; } to { stroke-dashoffset: 0; } }
+@keyframes wt-row-celebrate {
+  0% { background: ${tint(C.ok, 26)}; }
+  55% { background: ${tint(C.ok, 12)}; }
+  100% { background: transparent; }
+}
 .wt-root {
   height: 100%; overflow: auto; padding: 16px 18px 40px; box-sizing: border-box;
   color: ${C.label}; font-family: var(--dsw-font-family, system-ui, sans-serif); font-size: 13px;
@@ -394,15 +479,27 @@ const STYLE_TEXT = `
 .wt-icon-btn:hover { background: ${C.hover}; color: ${C.label}; }
 .wt-icon-btn-danger:hover { background: var(--dsw-alias-interactive-bg-hover-danger); color: ${C.error}; }
 .wt-check {
-  display: inline-flex; align-items: center; justify-content: center; flex: none;
-  width: 17px; height: 17px; margin-top: 1px; padding: 0; border-radius: 5px;
+  position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: ${CHECK_SIZE_PX}px; height: ${CHECK_SIZE_PX}px; margin: ${CHECK_MARGIN_TOP_PX}px 0 0; padding: 0; border-radius: 8px;
   border: 1px solid ${C.border}; background: transparent; color: transparent; cursor: pointer;
 }
+/* 可点区域 ≥ ${CHECK_HIT_PX}×${CHECK_HIT_PX}px：伪元素向外扩 ${CHECK_HIT_INSET_PX}px，
+   不占布局盒、不会推开旁边的旗子/标题 */
+.wt-check::before { content: ''; position: absolute; inset: -${CHECK_HIT_INSET_PX}px; border-radius: 12px; }
 .wt-check:hover { border-color: ${C.brand}; }
+.wt-check:focus-visible { outline: 2px solid ${C.brand}; outline-offset: 2px; }
 .wt-check-done {
   border-color: ${tint(C.ok, 55)}; background: ${tint(C.ok, 14)}; color: ${C.ok};
 }
-.wt-row { display: flex; align-items: flex-start; gap: 8px; padding: 5px 8px; border-radius: 10px; }
+/* 勾选完成的动效：勾选框弹跳 → 对勾描边画出 → 整行高亮淡出（见 wt-row-celebrate） */
+.wt-check-celebrate { animation: wt-check-pop 320ms cubic-bezier(.34, 1.56, .64, 1) both; }
+.wt-check-celebrate .wt-check-mark path {
+  stroke-dasharray: ${CHECK_DASH}; stroke-dashoffset: ${CHECK_DASH};
+  animation: wt-mark-draw 300ms ease-out 80ms both;
+}
+.wt-row.is-celebrating { animation: wt-row-celebrate ${CELEBRATE_MS}ms ease-out both; }
+/* B1：min-height 必须 ≥ 命中盒高度（见 checkHitGeometry / ROW_MIN_HEIGHT_PX） */
+.wt-row { display: flex; align-items: flex-start; gap: 8px; padding: ${ROW_PADDING_Y_PX}px 8px; min-height: ${ROW_MIN_HEIGHT_PX}px; border-radius: 10px; }
 .wt-row:hover { background: ${C.hover}; }
 .wt-row-edit {
   flex-direction: column; align-items: stretch; gap: 6px;
@@ -429,11 +526,16 @@ const STYLE_TEXT = `
 .wt-plus:hover { color: ${C.label}; border-color: ${C.brand}; background: ${tint(C.brand, 8)}; }
 .wt-plus-mark { font-size: 24px; line-height: 1; font-weight: 400; color: ${C.brand}; }
 .wt-flag-btn {
-  appearance: none; display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
-  font: inherit; font-size: 11.5px; padding: 5px 9px; border-radius: 9px;
-  background: transparent; border: 1px solid ${C.border}; color: ${C.label2};
+  appearance: none; display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 22px; height: 22px; padding: 0; border-radius: 6px; cursor: pointer;
+  background: transparent; border: 1px solid transparent; color: ${C.label2};
+  transition: opacity .12s ease, background .12s ease;
 }
-.wt-flag-btn.is-on { border-color: currentColor; background: color-mix(in srgb, currentColor 12%, transparent); color: inherit; }
+.wt-flag-btn:hover { background: ${C.hover}; }
+.wt-flag-btn:focus-visible { outline: 2px solid ${C.brand}; outline-offset: 1px; }
+/* 无优先级的行：旗子默认不占视线（opacity:0），悬停/聚焦该行或点开时才淡出来。
+   仍然留在 DOM/布局里（占住那一列，各行左侧对齐稳定），也保证纯键盘 Tab 能到达。 */
+.wt-flag-btn.is-ghost { pointer-events: none; }
 .wt-group-head {
   display: flex; align-items: center; gap: 7px; padding: 3px 8px; border-radius: 8px;
   cursor: pointer; user-select: none; color: ${C.label2};
@@ -461,6 +563,17 @@ const STYLE_TEXT = `
 .wt-spin {
   display: inline-block; width: 12px; height: 12px; border-radius: 50%;
   border: 2px solid ${C.border}; border-top-color: ${C.brand}; animation: wt-spin .8s linear infinite;
+}
+/*
+ * 降级：系统要求「减少动态效果」时全部跳过动画，只做状态切换（勾上/取消仍然是即时的）。
+ * 这是纯 CSS 的第二道保险——JS 侧 prefersReducedMotion() 已经会直接不挂 .is-celebrating。
+ */
+@media (prefers-reduced-motion: reduce) {
+  .wt-check-celebrate,
+  .wt-row.is-celebrating,
+  .wt-check-celebrate .wt-check-mark path { animation: none !important; }
+  .wt-check-celebrate .wt-check-mark path { stroke-dasharray: none; stroke-dashoffset: 0; }
+  .wt-check, .wt-flag-btn { transition: none !important; }
 }
 `;
 
@@ -594,9 +707,9 @@ function WorkTodoIcon({ size = 16, active }) {
   ]);
 }
 
-function IconCheck({ size = 11 }) {
+function IconCheck({ size = 11, className }) {
   return React.createElement('svg', {
-    width: size, height: size, viewBox: '0 0 12 12', fill: 'none',
+    className, width: size, height: size, viewBox: '0 0 12 12', fill: 'none',
     stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round',
   }, React.createElement('path', { d: 'M2 6.3 4.6 8.9 10 3.1' }));
 }
@@ -791,6 +904,78 @@ function IconFlag({ filled, dashed }) {
   ]);
 }
 
+/*
+ * 四档优先级的**唯一**权威定义：快速添加的优先级 chip 与每一行的旗子按钮共用这一份。
+ * 为什么必须抽出来：两份四旗 UI 各写一遍，文案/颜色/顺序/aria 迟早会漂移
+ * （设计稿 v5 定的是 高=红、中=琥珀、低=灰、无=虚线空心）。
+ * @param {(key: string) => string} t 文案函数
+ * @returns {{value: string, label: string, color: string, dashed?: boolean}[]}
+ */
+export function priorityFlagOptions(t) {
+  return [
+    { value: 'none', label: t('prioNone'), color: C.label3, dashed: true },
+    { value: 'high', label: t('prioHigh'), color: C.error },
+    { value: 'normal', label: t('prioNormal'), color: C.warn },
+    { value: 'low', label: t('prioLow'), color: C.label3 },
+  ];
+}
+
+/** 某一档优先级的语义色（高=红、中=琥珀、低/无=三级文字色）。 */
+export function priorityColor(value) {
+  if (value === 'high') return C.error;
+  if (value === 'normal') return C.warn;
+  return C.label3;
+}
+
+/**
+ * 四旗选择弹层：快速添加的优先级 chip 与行内旗子按钮**共用这一个组件**。
+ * 样式与文案只有这一份（这是「两份四旗 UI 漂移」的唯一防线）；点选后由调用方负责关闭。
+ * @param {{t: Function, value: string, onPick: Function, onClose: Function}} props
+ */
+function PriorityFlagsPopover({ t, value, onPick, onClose }) {
+  return React.createElement('div', {
+    role: 'group',
+    'aria-label': t('priorityLabel'),
+    'data-wt-priority-pop': 'true',
+    // Esc 关闭：挂在弹层上，焦点在任意一个旗子按钮上按 Esc 都能关
+    onKeyDown: (event) => { if (event?.key === 'Escape') onClose?.(); },
+    style: {
+      position: 'absolute', top: '100%', left: 0, zIndex: 5, marginTop: 4, padding: 6, display: 'flex', gap: 4,
+      background: C.layer1, border: `1px solid ${C.border}`, borderRadius: 10, boxShadow: '0 8px 24px rgba(0,0,0,.12)',
+    },
+  }, priorityFlagOptions(t).map((flag) => React.createElement('button', {
+    key: flag.value, type: 'button', className: 'wt-chip',
+    'data-wt-priority': flag.value,
+    'aria-pressed': value === flag.value,
+    style: {
+      color: flag.color, font: 'inherit', fontSize: 11.5, cursor: 'pointer',
+      borderColor: value === flag.value ? flag.color : undefined,
+    },
+    title: flag.label,
+    onClick: () => onPick?.(flag.value),
+  }, [
+    React.createElement(IconFlag, { key: 'f', filled: value === flag.value, dashed: flag.value === 'none' }),
+    React.createElement('span', { key: 'v' }, flag.label),
+  ])));
+}
+
+/**
+ * 系统是否要求「减少动态效果」。
+ *
+ * CSS 里已经有 @media (prefers-reduced-motion: reduce) 兜底；这里再守一道 JS：
+ * 开启减少动效时**连动效类都不挂**，避免任何残留的 keyframes/transition。
+ * matchMedia 在极少数环境（旧内核 / 测试替身）里可能不存在，所以整段包在 try 里。
+ * @param {Window|undefined} [win]
+ * @returns {boolean}
+ */
+export function prefersReducedMotion(win = typeof window !== 'undefined' ? window : undefined) {
+  try {
+    return Boolean(win?.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
+  } catch {
+    return false;
+  }
+}
+
 const IconCal = () => React.createElement('svg', { width: 13, height: 13, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, 'aria-hidden': 'true' }, [
   React.createElement('rect', { key: 'r', x: 2.2, y: 3.4, width: 11.6, height: 10.4, rx: 2 }),
   React.createElement('path', { key: 'p', d: 'M2.2 6.6h11.6M5.4 2.2v2.4M10.6 2.2v2.4' }),
@@ -907,14 +1092,7 @@ function QuickAdd({ t, onAdd, busy, projects, projectsTruncated }) {
     : t('dateUnset');
   const timeLabel = dueTime || t('timeUnset');
   const prioLabel = priority === 'high' ? t('prioHigh') : priority === 'normal' ? t('prioNormal') : priority === 'low' ? t('prioLow') : t('prioNone');
-  const prioColor = priority === 'high' ? C.error : priority === 'normal' ? C.warn : C.label3;
-
-  const flags = [
-    { value: 'none', label: t('prioNone'), color: C.label3, dashed: true },
-    { value: 'high', label: t('prioHigh'), color: C.error },
-    { value: 'normal', label: t('prioNormal'), color: C.warn },
-    { value: 'low', label: t('prioLow'), color: C.label3 },
-  ];
+  const prioColor = priorityColor(priority);
 
   const setDate = (value) => {
     setManual(true);
@@ -1011,32 +1189,25 @@ function QuickAdd({ t, onAdd, busy, projects, projectsTruncated }) {
           onChange: (event) => setTime(event.target.value),
         }),
       ]),
-      // 优先级：点开四个小旗
+      // 优先级：点开四个小旗（弹层与行内旗子按钮共用 PriorityFlagsPopover，见上）
       React.createElement('span', { key: 'prio', style: { position: 'relative' } }, [
         React.createElement('button', {
           key: 'btn', type: 'button', className: 'wt-chip', 'data-wt-field': 'priority',
           style: { color: prioColor, cursor: 'pointer', font: 'inherit', fontSize: 11.5 },
           title: t('priorityLabel'), 'aria-label': t('priorityLabel'), 'aria-expanded': flagOpen,
           onClick: () => setFlagOpen((open) => !open),
+          onKeyDown: (event) => { if (event?.key === 'Escape') setFlagOpen(false); },
         }, [
           React.createElement(IconFlag, { key: 'f', dashed: priority === 'none', filled: priority !== 'none' }),
           React.createElement('span', { key: 'v' }, `${t('priorityLabel')} · ${prioLabel}`),
         ]),
-        flagOpen ? React.createElement('div', {
+        flagOpen ? React.createElement(PriorityFlagsPopover, {
           key: 'pop',
-          style: {
-            position: 'absolute', top: '100%', left: 0, zIndex: 5, marginTop: 4, padding: 6, display: 'flex', gap: 4,
-            background: C.layer1, border: `1px solid ${C.border}`, borderRadius: 10, boxShadow: '0 8px 24px rgba(0,0,0,.12)',
-          },
-        }, flags.map((flag) => React.createElement('button', {
-          key: flag.value, type: 'button', className: 'wt-chip',
-          style: { color: flag.color, font: 'inherit', fontSize: 11.5, cursor: 'pointer', borderColor: priority === flag.value ? flag.color : undefined },
-          title: flag.label,
-          onClick: () => { setPriority(flag.value); setFlagOpen(false); },
-        }, [
-          React.createElement(IconFlag, { key: 'f', filled: priority === flag.value, dashed: flag.value === 'none' }),
-          React.createElement('span', { key: 'v' }, flag.label),
-        ]))) : null,
+          t,
+          value: priority,
+          onPick: (value) => { setPriority(value); setFlagOpen(false); },
+          onClose: () => setFlagOpen(false),
+        }) : null,
       ]),
       // 项目：**排在优先级之后**（顺序：日期 → 时间 → 优先级 → 项目）。
       // 点开一个与优先级同风格的小弹层：已有项目（点选）→ 新建（输入 + 新建）→ 未归类（清除）。
@@ -1132,11 +1303,35 @@ function QuickAdd({ t, onAdd, busy, projects, projectsTruncated }) {
  *   - `drag`：共享的 dragHandlers 对象（useMemo），每一行不再各造一个新对象；
  *     每一行与拖动相关的差异只有布尔 `dragging`。
  * ------------------------------------------------------------------ */
-const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove, onSave, drag, dragging }) {
+const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove, onSave, onPriority, celebrate, drag, dragging }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(null);
   const [notesOpen, setNotesOpen] = React.useState(false);
   const [confirming, setConfirming] = React.useState(false);
+  /** 四旗弹层是否打开。 */
+  const [flagOpen, setFlagOpen] = React.useState(false);
+  /**
+   * 「无优先级」的行默认不常显旗子（设计定稿：默认档不制造噪音）。
+   * 可见性用**组件状态**表达（而不是纯 CSS :hover），hover / focus 两条路都走同一份状态，
+   * 键盘 Tab 进这一行时（onFocus 冒泡）旗子同样会淡出来，所以纯键盘也够得着。
+   */
+  const [flagPeek, setFlagPeek] = React.useState(false);
+  /** 勾选完成时挂上的动效类（纯 CSS 动画，见 STYLE_TEXT 的 wt-check-pop / wt-row-celebrate）。 */
+  const [celebrating, setCelebrating] = React.useState(false);
+  /**
+   * 乐观的「已完成」态：勾上时立刻把这一行按已完成渲染，对勾才看得到描边动画
+   * （否则要等一次 RTT 数据回来，那时行通常已经滑进「已完成」分组了）。
+   * `null` = 完全跟随数据。
+   *
+   * B2：乐观态**只对「点击那一刻的那份数据」有效**（`optimisticFor === todo`）。
+   * 写成功后的 `refresh()` 会拿回**新对象**，引用一变乐观态立刻失效、以服务端数据为准 ——
+   * 旧实现没有任何清除分支，数据回到 `pending` 时这一行仍渲染成已完成，
+   * 用户去点它想「取消完成」，切换的是服务端真实状态（pending → completed），
+   * 显示与真实状态反向。只认引用（而不是比较 status/updatedAt 的值）是为了覆盖
+   * 「服务端把状态改回 pending 但 updatedAt 恰好没变」这种最坏情况。
+   */
+  const [optimisticDone, setOptimisticDone] = React.useState(null);
+  const [optimisticFor, setOptimisticFor] = React.useState(null);
 
   // 二次确认要能自己失效：点了删除又改主意的人，不该在几分钟后误触一次就真删掉
   React.useEffect(() => {
@@ -1146,9 +1341,17 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
   }, [confirming]);
 
   const row = todo ?? {};
-  const done = row.status === 'completed';
+  // B2：数据换了新对象（refresh/轮询拿回来的服务端真相）→ 乐观态失效
+  const optimisticActive = optimisticDone !== null && optimisticFor === todo;
+  const done = (optimisticActive ? optimisticDone : null) ?? row.status === 'completed';
   const due = typeof row.due === 'string' ? row.due : '';
   const overdue = !done && Boolean(due) && Boolean(today) && due < today;
+  // 优先级档位：非法/缺省一律按「无」处理（与宿主 records.mjs 的归一化口径一致）
+  const flagValue = EDIT_PRIORITY_OPTIONS.includes(row.priority) ? row.priority : 'none';
+  const flagLabel = t(PRIORITY_LABEL_KEYS[flagValue]);
+  const flagVisible = flagValue !== 'none' || flagPeek || flagOpen;
+  // 无优先级时淡一点（「淡色空心旗」），展开弹层时回到实色
+  const flagOpacity = !flagVisible ? 0 : (flagValue === 'none' && !flagOpen ? 0.55 : 1);
 
   const beginEdit = () => {
     setDraft(buildEditDraft(row));
@@ -1157,6 +1360,45 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
   };
 
   const stopEdit = () => { setEditing(false); setDraft(null); };
+
+  /**
+   * 勾选框：变为完成时挂上庆祝动效，取消完成时**绝不**播。
+   *
+   * 三层降级：
+   *   1. `celebrate === false`（config.celebrate）→ 与改动前完全一致，连乐观态都不挂；
+   *   2. 系统要求减少动效（prefersReducedMotion）→ 同样只做状态切换；
+   *   3. 写失败 → 立刻退回，不留一个假的「已完成」勾。
+   * 动效本身是纯 CSS（.is-celebrating / .wt-check-celebrate），这里只挂类，不跑任何动画循环。
+   */
+  const handleCheck = () => {
+    const willComplete = !done;
+    const canCelebrate = willComplete && celebrate !== false && !prefersReducedMotion();
+    if (canCelebrate) {
+      setOptimisticDone(true);
+      setOptimisticFor(todo); // B2：乐观态绑定点击那一刻的数据对象
+      setCelebrating(true);
+    } else if (done) {
+      // 取消完成：只是状态切换，把乐观态交回给数据
+      setOptimisticDone(null);
+      setOptimisticFor(null);
+      setCelebrating(false);
+    }
+    const job = Promise.resolve(onToggle(row.id));
+    job.then(
+      (result) => {
+        if (result && result.ok === false) {
+          setOptimisticDone(null);
+          setOptimisticFor(null);
+          setCelebrating(false);
+        }
+      },
+      () => {
+        setOptimisticDone(null);
+        setOptimisticFor(null);
+        setCelebrating(false);
+      },
+    );
+  };
 
   /**
    * 保存时只发改动过的字段：宿主对空 patch 会回 empty-patch 错误，
@@ -1321,24 +1563,83 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       style: dragging ? { opacity: 0.45 } : undefined,
     }
     : {};
-  return React.createElement('div', { className: 'wt-row', ...dragAttrs, style: row.priority === 'high' ? { borderLeft: `2px solid ${C.error}`, paddingLeft: 8 } : undefined }, [
-    /* 优先级呈现（设计稿 v5）：高＝红色左缘 + 实心红旗；中＝琥珀；低＝灰；无＝什么都不显示 */
-    row.priority && row.priority !== 'none' ? React.createElement('span', {
+  /**
+   * 行的样式：拖拽半透明 + 高优先级的红色左缘。
+   * 高亮/滑动**只走 CSS 动画**（.is-celebrating 的 background），这里不放任何会改布局的属性。
+   */
+  const rowStyle = {
+    ...(dragging ? { opacity: 0.45 } : {}),
+    ...(flagValue === 'high' ? { borderLeft: `2px solid ${C.error}`, paddingLeft: 8 } : {}),
+  };
+  return React.createElement('div', {
+    className: `wt-row${celebrating ? ' is-celebrating' : ''}`,
+    // 状态可见性给测试与读屏：动效开着时 data-wt-celebrating="true"
+    'data-wt-celebrating': celebrating ? 'true' : undefined,
+    'data-wt-row': row.id ?? '',
+    'data-wt-row-priority': flagValue,
+    // hover / focus 都让「无优先级」行的旗子淡出来（focus 冒泡自子元素，纯键盘同样到达）
+    onMouseEnter: () => setFlagPeek(true),
+    onMouseLeave: () => setFlagPeek(false),
+    onFocus: () => setFlagPeek(true),
+    onBlur: () => setFlagPeek(false),
+    // 动效是纯 CSS 的：动画跑完自己摘掉类，不需要定时器、更没有逐帧 setState。
+    // B3：`animationend` 会**冒泡** —— 勾选框的弹跳（320ms）与对勾描边（80→380ms）结束也会冒到行上，
+    // 旧写法在 320ms 就把 is-celebrating 摘掉，560ms 的整行高亮被截断成 57%（视觉跳变）。
+    // 只处理「事件源就是这一行自己」的那一次（并顺手校验 animationName，防止未来加新动画时误摘）。
+    onAnimationEnd: (event) => {
+      if (!event || !event.currentTarget || event.target !== event.currentTarget) return;
+      if (typeof event.animationName === 'string' && event.animationName && event.animationName !== 'wt-row-celebrate') return;
+      if (celebrating) setCelebrating(false);
+    },
+    ...dragAttrs,
+    style: rowStyle,
+  }, [
+    /* 优先级呈现（设计稿 v5）：高＝红色左缘 + 实心红旗；中＝琥珀；低＝灰；
+       无＝默认不显（悬停/聚焦该行时淡出一个空心旗，可点）。旗子是按钮：点开四旗选择器。
+       即「无」优先级的行也**始终渲染**这个按钮（占住那一列，各行左侧对齐稳定），
+       只是 opacity:0 —— 因此 Tab 键依然能聚焦到它。 */
+    React.createElement('span', {
       key: 'prio-flag',
-      title: row.priority === 'high' ? t('prioHigh') : row.priority === 'normal' ? t('prioNormal') : t('prioLow'),
-      style: {
-        display: 'inline-flex', flex: '0 0 auto',
-        color: row.priority === 'high' ? C.error : row.priority === 'normal' ? C.warn : C.label3,
-      },
-    }, React.createElement(IconFlag, { filled: row.priority === 'high' })) : null,
+      style: { position: 'relative', display: 'inline-flex', flex: '0 0 auto' },
+    }, [
+      React.createElement('button', {
+        key: 'btn',
+        type: 'button',
+        className: `wt-flag-btn${flagVisible ? '' : ' is-ghost'}`,
+        'data-wt-priority-btn': 'true',
+        'data-wt-ghost': flagVisible ? undefined : 'true',
+        'aria-label': `${t('priorityLabel')}：${flagLabel}`,
+        'aria-expanded': flagOpen,
+        'aria-haspopup': 'true',
+        title: `${t('priorityLabel')}：${flagLabel}`,
+        style: { color: priorityColor(flagValue), opacity: flagOpacity },
+        onClick: () => setFlagOpen((open) => !open),
+        onKeyDown: (event) => { if (event?.key === 'Escape') setFlagOpen(false); },
+      }, React.createElement(IconFlag, { filled: flagValue === 'high', dashed: flagValue === 'none' })),
+      flagOpen ? React.createElement(PriorityFlagsPopover, {
+        key: 'pop',
+        t,
+        value: flagValue,
+        // 选中即收弹层 + 走面板统一的写路径（POST /worktodo/update {ref, priority}）。
+        // 失败由面板顶部的错误条原样显示；成功后按现有 refresh() 机制重取列表，不整页刷新。
+        onPick: (value) => {
+          setFlagOpen(false);
+          Promise.resolve(onPriority?.(row.id, value)).catch(() => { /* 已在错误条上显示 */ });
+        },
+        onClose: () => setFlagOpen(false),
+      }) : null,
+    ]),
     React.createElement('button', {
       key: 'check',
       type: 'button',
-      className: `wt-check${done ? ' wt-check-done' : ''}`,
+      className: `wt-check${done ? ' wt-check-done' : ''}${celebrating ? ' wt-check-celebrate' : ''}`,
+      // 尺寸与可点区域：渲染出来的值与样式表取同一组常量（CHECK_SIZE_PX / CHECK_HIT_PX）
+      'data-wt-check-size': CHECK_SIZE_PX,
+      'data-wt-check-hit': CHECK_HIT_PX,
       'aria-label': done ? t('unmarkDone') : t('markDone'),
       title: done ? t('unmarkDone') : t('markDone'),
-      onClick: () => { Promise.resolve(onToggle(row.id)).catch(() => { /* 已在错误条上显示 */ }); },
-    }, done ? React.createElement(IconCheck, { key: 'i' }) : null),
+      onClick: handleCheck,
+    }, done ? React.createElement(IconCheck, { key: 'i', className: 'wt-check-mark' }) : null),
     React.createElement('div', { key: 'main', style: { flex: 1, minWidth: 0 } }, [
       React.createElement('div', {
         key: 'title',
@@ -1376,7 +1677,7 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
 /* ------------------------------------------------------------------ *
  * 分组：空组整块不渲染，避免五个空标题堆在面板上
  * ------------------------------------------------------------------ */
-function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTodo, onRemove, onSave, drag }) {
+function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTodo, onRemove, onSave, onPriority, celebrate, drag }) {
   const list = asArray(items);
   if (!list.length) return null;
   return React.createElement('div', { style: { marginTop: 6 } }, [
@@ -1402,6 +1703,8 @@ function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTod
       onToggle: onToggleTodo,
       onRemove,
       onSave,
+      onPriority,
+      celebrate,
       // S3-3：共享同一个 drag 对象（引用稳定），每行只有布尔 dragging 不同 ——
       // 否则每一行每次父级重渲染都会收到一个新的 drag 对象，memo 的浅比较必然失效
       drag,
@@ -1699,6 +2002,8 @@ function WorkTodoPanel(props) {
   // hook 的依赖数组是在渲染期求值的，放到后面（早退分支之后）会踩 TDZ。
   const version = typeof data?.version === 'string' ? data.version : '';
   const update = data?.update ?? null;
+  // 庆祝动效开关：宿主 config.celebrate 随 /list 载荷下发（缺省 = 开）
+  const celebrate = shouldCelebrate(data?.panel);
 
   /**
    * 跟随外部改动刷新（审计 F7：宿主的 onChanged/onChange 原来是死代码，面板只在
@@ -1837,6 +2142,12 @@ function WorkTodoPanel(props) {
   const handleToggle = React.useCallback((ref) => runWrite(() => postJson('/status', { ref, toggle: true })), [runWrite]);
   const handleRemove = React.useCallback((ref) => runWrite(() => postJson('/remove', { ref })), [runWrite]);
   const handleSave = React.useCallback((ref, patch) => runWrite(() => postJson('/update', { ref, ...patch })), [runWrite]);
+  /**
+   * 行内旗子选了某一档：走同一个写路径（POST /worktodo/update，body 就是 {ref, priority}）。
+   * 必须是稳定引用（useCallback），否则每一行的 React.memo 浅比较都会失效。
+   * `none` 是**真实档位**（不设优先级），宿主 patchRecord 已支持，不需要额外协议。
+   */
+  const handlePriority = React.useCallback((ref, priority) => runWrite(() => postJson('/update', { ref, priority })), [runWrite]);
 
   /** 把 dragId 挪到目标之前，得到新的完整顺序并落盘（manual 模式生效） */
 
@@ -2115,6 +2426,8 @@ function WorkTodoPanel(props) {
         onToggleTodo: handleToggle,
         onRemove: handleRemove,
         onSave: handleSave,
+        onPriority: handlePriority,
+        celebrate,
         drag: dragHandlers,
       })))
       : React.createElement('div', {
