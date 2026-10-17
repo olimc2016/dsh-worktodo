@@ -1217,6 +1217,16 @@ function seedInstalledVersion(profileDir, version) {
   writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'dsh-worktodo', version }, null, 2));
 }
 
+/**
+ * 造一个比 pkgVersion 新/旧的版本号（只服务测试，不参与生产逻辑）。
+ * 从当前版本推而不是硬编码：以后升版本时「更新/更旧」的关系不会因字面量过期而反转。
+ */
+function bumpPatch(version, delta) {
+  const parts = String(version).split('.').map((n) => parseInt(n, 10) || 0);
+  parts[2] = Math.max(0, (parts[2] ?? 0) + delta);
+  return parts.join('.');
+}
+
 /** shell 单引号转义（capture 路径里可能有空格）。 */
 function shQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
@@ -1702,7 +1712,7 @@ await test('A3：任一段位是 link:/file:/workspace: 就整体跳过 —— �
   }
 });
 
-await test('自升级（核心）：第 1 步 pnpm update 真的换掉落盘版本 → done + 新版本 + hasUpdate 重算为 false', async () => {
+await test('自升级（核心）：第 1 步 pnpm update 真的换掉落盘版本 → done + 新版本 + restartRequired', async () => {
   const profile = makeFakeProfile('swapped-by-update', '^0.2.0');
   seedInstalledVersion(profile, '0.2.0');
   const capture = join(selfUpdateRoot, 'capture-swap1.txt');
@@ -1722,11 +1732,135 @@ await test('自升级（核心）：第 1 步 pnpm update 真的换掉落盘版�
       eq(status?.installed, '0.2.7', '已安装版本要报给面板：');
       eq(invokeCount(capture), 1, `第 1 步成功就不该再跑第 2 步（实际 ${invokeCount(capture)} 次）：`);
       eq(readInvocations(capture)[0][0], 'update', '成功的这条就是用户实测有效的 pnpm update：');
-      // hasUpdate 以落盘版本重算：已经是最新 → 不该再亮「有新版本」
+      // hasUpdate 的语义没变：registry latest vs **运行版本**。装完但进程还没重启时它仍是 true，
+      // 面板必须先看 restartRequired（客户端对应用例在 smoke-client）。
       const list = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
-      eq(list.data.update.hasUpdate, false, `升级到 latest 后 hasUpdate 必须重算为 false：${JSON.stringify(list.data.update)}`);
-      eq(list.data.update.installed, '0.2.7');
+      eq(list.data.update.hasUpdate, true, `升级落盘后 hasUpdate 仍按 runningVersion 比较（装好 ≠ 已生效）：${JSON.stringify(list.data.update)}`);
+      eq(list.data.update.installedVersion, '0.2.7', '落盘版本要报给面板：');
+      eq(list.data.update.installed, '0.2.7', '老字段 installed 保留（兼容旧面板）：');
       eq(list.data.update.restartRequired, true, '落盘版本比运行版本新 → 提示重启 DSH 生效：');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('安装态 vs 运行态：落盘版本比运行版本新 → restartRequired:true，hasUpdate 仍按运行版本', async () => {
+  const newer = bumpPatch(pkgVersion, 1);
+  const profile = makeFakeProfile('state-installed-newer', '^0.2.0');
+  seedInstalledVersion(profile, newer);
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+  try {
+    await withEnv({ WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_LATEST: newer }, async () => {
+      const response = await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
+      eq(response.statusCode, 200, '安装态探测再怪也不能让 /list 失败：');
+      const update = response.json().data.update;
+      eq(update.installedVersion, newer, '要报出 node_modules 里落盘的版本：');
+      eq(update.runningVersion, pkgVersion, '要报出本进程正在运行的版本：');
+      eq(update.restartRequired, true, '落盘版本 > 运行版本 → 只差重启：');
+      // 老字段保持：旧面板读 current / installed 不受影响
+      eq(update.installed, newer, '老字段 installed 继续保留（兼容旧面板）：');
+      eq(update.current, pkgVersion, '老字段 current 仍是运行版本：');
+      // hasUpdate 语义不变：latest vs **运行版本**。即使盘上已经是最新，它仍为 true；
+      // 面板必须先看 restartRequired（smoke-client 有对应的「只显示重启」用例）。
+      eq(update.hasUpdate, true, `hasUpdate 仍按 runningVersion 比较（装好 ≠ 已生效）：${JSON.stringify(update)}`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('安装态 vs 运行态：落盘版本不高于运行版本 → restartRequired:false（旧版本/同版本都不报重启）', async () => {
+  const profile = makeFakeProfile('state-installed-older', '^0.2.0');
+  seedInstalledVersion(profile, '0.0.1');
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+  try {
+    await withEnv({ WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_LATEST: undefined }, async () => {
+      const readUpdate = async () => {
+        const response = await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
+        eq(response.statusCode, 200);
+        return response.json().data.update;
+      };
+      const older = await readUpdate();
+      eq(older.installedVersion, '0.0.1');
+      eq(older.restartRequired, false, '落盘版本 < 运行版本 → 不需要重启：');
+
+      seedInstalledVersion(profile, pkgVersion);
+      const same = await readUpdate();
+      eq(same.installedVersion, pkgVersion);
+      eq(same.restartRequired, false, '落盘版本 == 运行版本 → 不需要重启：');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('安装态 vs 运行态：落盘清单读不到/坏 JSON → installedVersion:null、restartRequired:false，/list 照常返回', async () => {
+  const profile = makeFakeProfile('state-installed-unreadable', '^0.2.0');
+  const pkgDir = join(profile, 'node_modules', 'dsh-worktodo');
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+  try {
+    await withEnv({ WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_LATEST: undefined }, async () => {
+      const readPayload = async (label) => {
+        const response = await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
+        eq(response.statusCode, 200, `${label}：/list 不能被读盘失败带崩：`);
+        const payload = response.json();
+        eq(payload.ok, true, `${label}：/list 仍要正常返回数据：`);
+        eq(Array.isArray(payload.data.todos), true, `${label}：列表数据不能丢：`);
+        return payload.data.update;
+      };
+
+      // 1) node_modules 里还没有本包
+      const missing = await readPayload('还没装');
+      eq(missing.installedVersion, null, '读不到落盘清单 → installedVersion 给 null（不是 undefined/抛错）：');
+      eq(missing.restartRequired, false, '读不到落盘版本就不能声称需要重启：');
+      eq(missing.runningVersion, pkgVersion, '运行版本仍要照常报出：');
+
+      // 2) 清单存在但不是合法 JSON（半写/损坏）
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(join(pkgDir, 'package.json'), '{ not json');
+      const broken = await readPayload('坏 JSON');
+      eq(broken.installedVersion, null);
+      eq(broken.restartRequired, false);
+
+      // 3) 合法 JSON 但没有 version 字段
+      writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: 'dsh-worktodo' }));
+      const noVersion = await readPayload('没有版本字段');
+      eq(noVersion.installedVersion, null);
+      eq(noVersion.restartRequired, false);
+
+      // 4) profile 目录根本不存在（反推失败 / 被删掉）
+      await withEnv({ WORKTODO_PROFILE_DIR: join(profile, 'does-not-exist') }, async () => {
+        const noProfile = await readPayload('profile 不存在');
+        eq(noProfile.installedVersion, null);
+        eq(noProfile.restartRequired, false);
+      });
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('hasUpdate 语义不变：latest 比 runningVersion 新，而不是比落盘版本新', async () => {
+  const profile = makeFakeProfile('state-hasupdate-semantics', '^0.2.0');
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+  try {
+    // 落盘比运行旧、latest 落在两者之间：按 running 比较应为 false；
+    // 若误改成 compare(latest, installedVersion) 就会误报 true（反向验证就抓这个）。
+    seedInstalledVersion(profile, '0.0.1');
+    await withEnv({ WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_LATEST: '0.0.2' }, async () => {
+      const update = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json().data.update;
+      eq(update.hasUpdate, false, `latest 0.0.2 低于运行版本 ${pkgVersion} → 不该提示有新版本：${JSON.stringify(update)}`);
+      eq(update.restartRequired, false);
+    });
+
+    // 落盘比运行新、latest 也比运行新但低于落盘：按 running 比较应为 true；
+    // 若误用 installedVersion 比较会得到 false。
+    seedInstalledVersion(profile, bumpPatch(pkgVersion, 2));
+    await withEnv({ WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_LATEST: bumpPatch(pkgVersion, 1) }, async () => {
+      const update = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json().data.update;
+      eq(update.hasUpdate, true, `latest 高于运行版本 → 仍要提示有新版本（与落盘版本无关）：${JSON.stringify(update)}`);
+      eq(update.restartRequired, true, '落盘版本更高 → 同时要求重启，客户端按优先级只显示重启：');
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });

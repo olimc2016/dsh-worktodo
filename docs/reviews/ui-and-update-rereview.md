@@ -461,3 +461,112 @@ B: state=done
   4. `docs/review-auto-update.md` §2.2/§4.3 的旧描述本轮**未更新**（不随本轮交付）。
   5. 仍未经过浏览器布局引擎的真机像素命中（§5 的 B1 建议），与本轮改动无关。
 - 本轮**不升版本、不改 `CHANGELOG.md`/`.github`、不 commit/push/tag、不发布**。
+
+---
+
+## 11. 修复状态（安装态 vs 运行态提示）
+
+> 本轮只修「后台已经装好新版，面板却还在喊『有新版本』」这一条体验闭环：
+> 把**安装态**（`node_modules` 落盘版本）与**运行态**（本进程加载的版本）分开报给面板，
+> 面板优先提示「已更新，重启 DSH 生效」，不再把「装好了」误报成「还没装」。
+> **不升版本、不改 `CHANGELOG.md`/`.github`、不 commit/push/tag、不发布。**
+> 写域：`~/Documents/deepseek-harness/default-workspace/dsh-worktodo/lib/index.js`、
+> `~/Documents/deepseek-harness/default-workspace/dsh-worktodo/src/client/index.js`、
+> `~/Documents/deepseek-harness/default-workspace/dsh-worktodo/tools/*`
+> （测试套件仍是 **9** 个；`lib/client.js` 是 `build-client.mjs` 的产物，随 `verify-all` 重建）。
+> Node `~/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node`，全程 `WORKTODO_NO_UPDATE_CHECK=1`。
+> 所有用例都在 `/tmp` 假 profile + 临时 `DSH_HOME` / `WORKTODO_UPDATE_STATE_PATH` 上跑，未触碰真实 `~/.dsh/profiles`。
+
+### 11.1 根因
+
+- 宿主 `updatePayload()` 把两个语义混进了一次比较：`current = installedVersion ?? PLUGIN_VERSION`，
+  于是 `hasUpdate` 实际变成「latest vs **落盘版本**」。而内存里的 `installedVersion` 只在
+  **本进程成功跑完升级序列**时才被赋值，初始化是 `null` —— 因此「另一个进程装的」「上次运行装好但没重启」
+  「用户手动 `pnpm add` 的」这些真实的「已落盘 > 运行中」状态，`/list` 根本看不见。
+- 客户端只有 `hasUpdate` 分支（以及 `run.state === 'done'` 的瞬时分支），没有稳态的 `restartRequired` 分支：
+  只要宿主报了 `hasUpdate`，页脚就渲染可点的「有新版本」。
+- 徽标无论有没有动作都渲染成 `<button>`，状态文本会给出「点了没反应」的错误暗示。
+
+### 11.2 修法
+
+宿主（`~/Documents/deepseek-harness/default-workspace/dsh-worktodo/lib/index.js`）：
+
+- `/list` 的 `update` 载荷新增/明确四个字段（老字段 `current` / `latest` / `installed` / `page` / `run` 全部保留）：
+  - `installedVersion`：**每次请求**读 `<profile>/node_modules/dsh-worktodo/package.json` 的 `version`；
+    读不到（没 profile / 还没装 / 坏 JSON / 没 version 字段）一律 `null`。
+  - `runningVersion`：本进程的 `PLUGIN_VERSION`。
+  - `restartRequired`：`installedVersion` 与 `runningVersion` 都存在且 `compareVersion(installed, running) > 0`。
+  - `hasUpdate`：**语义固定回**「registry latest 比 `runningVersion` 新」，不再拿落盘版本比较；
+    装好待重启时它仍为 `true`（老面板兼容），新面板必须先看 `restartRequired`。
+- 抽出同步的 `resolveOwnProfileDir()`（`WORKTODO_PROFILE_DIR` 优先，其次模块自身路径反推），
+  `findProfileDir()` 复用同一口径；**不扫 `$DSH_HOME/profiles/*`、不猜别的 profile**。
+- `readInstalledVersion()` 增加 `profileDir` 空值守卫，异常继续吞掉：读盘失败只让字段变 `null`，
+  `/list` 照常 200 返回。没有新增网络请求、没有新增定时器。
+
+客户端（`~/Documents/deepseek-harness/default-workspace/dsh-worktodo/src/client/index.js`）：
+
+- `updateBadgeState()` 优先级：`running` → **`restartRequired`** → `done`（落盘版本读不到时的兜底）
+  → `failed` → `hasUpdate` → `null`。`restartRequired` 时文案用已有的
+  `updatedRestart`（中「已更新到 {version}，重启 DSH 生效」/ 英「Updated to {version} — restart DSH to apply」），
+  版本号只取 `installedVersion ?? installed`，缺版本号时回落到 `updateRestartHint`，不拿 `latest` 冒充落盘版本。
+- 配色走主题变量 `UPDATE_TONE_STYLE.ok`（醒目但不用红色 error）；不新增常驻定时器，
+  仍复用列表的 30s 轮询 / focus 刷新。
+- 只有 `action` 非空才渲染 `<button>`；正在进行 / 已装好待重启 / linked 等纯状态渲染
+  `<span role="status" className="wt-chip wt-update is-state">`，并带 `aria-label`（按钮同样带）。
+  文案仍走 `t()`、无 `innerHTML`；新增 `.wt-update.is-state` 去掉可点光标与 hover 下划线。
+
+### 11.3 测试（都加进现有 9 个套件）
+
+- 宿主（`tools/smoke-host.mjs`，新增 4 条，84 → **88**）：
+  1. `落盘版本比运行版本新 → restartRequired:true，hasUpdate 仍按运行版本`：
+     假 profile 落盘 `pkgVersion+1`，注入同版本 latest；断言 `installedVersion` / `runningVersion` /
+     `restartRequired` / `hasUpdate:true`，以及老字段 `installed` / `current` 不回归。
+  2. `落盘版本不高于运行版本 → restartRequired:false`：旧版本（0.0.1）与同版本各断言一次。
+  3. `落盘清单读不到/坏 JSON → installedVersion:null、restartRequired:false，/list 照常返回`：
+     覆盖「还没装」「坏 JSON」「没有 version 字段」「profile 目录不存在」四种，每次都断言 `/list` 200、
+     `ok:true`、`todos` 仍是数组。
+  4. `hasUpdate 语义不变：latest 比 runningVersion 新，而不是比落盘版本新`：
+     「latest 落在 running 与 installed 之间 → false」和「installed 比 latest 还新、latest 比 running 新 → true」
+     两个方向，恰好能区分两种比较口径。
+- 既有的「第 1 步 pnpm update 真的换落盘版本」用例同步改口径：升级落盘后断言
+  `hasUpdate:true` + `installedVersion/installed === 0.2.7` + `restartRequired:true`（旧断言是 hasUpdate:false）。
+- 客户端（`tools/smoke-client.mjs`，51 → **52**）：
+  - 纯函数覆盖三种状态：只有 `hasUpdate` → 可点「有新版本」；`restartRequired`（即使 `hasUpdate` 同时为 true）
+    → 只报「已更新到 v0.2.7，重启 DSH 生效」、`action:null`、`tone:'ok'`、文案不含「有新版本 / 立即更新」；
+    两者都 false → `null`。另测 `installed` 回落与缺版本号的兜底文案。
+  - 渲染覆盖：`restartRequired` 载荷下全页只有 1 个 `wt-update` 节点、必须是 `<span>`、`role=status`、
+    有 `aria-label`、没有 `onClick`、全页扫不到 `button.wt-update`；对照组把 `restartRequired` 改 false 后
+    立刻回到可点按钮 + 「有新版本」。进行中原先断言「禁用按钮」改为「只读 span」，因为本轮起
+    纯状态不再渲染按钮。
+
+### 11.4 反向验证
+
+- 副本 `/tmp/wt-rev-state-client`（客户端把 `restartRequired` 分支恒置 false）→
+  `smoke-client` **50 通过 / 2 失败**：命中的正是「纯函数装好待重启」与「页脚 restartRequired 渲染」两条。
+- 副本 `/tmp/wt-rev-state-host`（宿主把 `hasUpdate` 改成 `compareVersion(latest, installedVersionOnDisk ?? runningVersion)`，
+  即旧缺陷口径）→ `smoke-host` **85 通过 / 3 失败**：命中核心升级用例、新 restartRequired 用例、
+  新 hasUpdate 语义用例，其余用例无连带红灯。
+- 两个副本都是 `/tmp` 整树拷贝，仓库源码只保留修好的版本；所有假 profile 均在 `/tmp`。
+
+### 11.5 全量与状态
+
+- `node tools/verify-all.mjs` → **10/10 个步骤通过（含 build）**，exit 0。
+  分项：数据模型 35、服务层 31、存储层 37、**宿主 88**、契约 18、**客户端 52**、CI workflow 11、
+  发布面审计 30、收录提交门禁 17。日志：`/tmp/wt-install-state-verify-all-final.log`。
+- 测试套件数仍是 **9**；`lib/client.js` 由 `build-client.mjs` 重建，sha256 `a5484890…`（`src` 与产物一致）。
+- 真实 `~/.dsh/profiles/*` 与真实待办数据未被读写；本轮**不升版本、不改 `CHANGELOG.md`/`.github`、
+  不 commit/push/tag、不发布**。
+
+### 11.6 未做项 / 剩余不确定
+
+1. `installedVersion` 改为**每次 `/list` 同步读一次**小文件（30s 轮询 + focus 刷新）。没有做 mtime 缓存或异步读；
+   这个文件通常只有几百字节且在本机盘上，本轮未测出列表延迟回归，但也没有真机大 profile 的基准数据。
+2. `updateRunSummary.installed` / `updateStatus().installed` 仍是本轮升级序列写下的**内存结论**
+   （初始化 `null`，成功升级后填），不是每次读盘；面板要判断「已装好待重启」必须看新增的
+   `update.installedVersion` / `restartRequired`。旧字段保留原语义，未混用。
+3. `maybeAutoUpdate` 的触发版本判断仍用内存 `installedVersion ?? PLUGIN_VERSION`：若用户在 DSH 运行期间
+   从外部装好了新版但本进程没重启，自动升级可能对同一个 latest 再尝试一次（跨重启节流仍在，只多一次）。
+   本轮未改这条触发路径，避免扩大写盘面。
+4. `failed` 与 `restartRequired` 同时成立时，客户端按优先级显示「重启生效」（盘上确实已装好）；
+   若失败发生在**已装好之后的重试**，用户会看不到那次失败原因。这是有意的取舍，未单独做「失败详情」入口。
+5. 仍未做浏览器布局引擎下的像素检查；`role=status` + `aria-label` 只经 React 替身树断言，未跑读屏实测。

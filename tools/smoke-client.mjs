@@ -1117,7 +1117,7 @@ test('S6-2：客户端重复注册只降级那一条，不能让 apply 把面板
 
 console.log('自升级（客户端）：只读提示变成可点的「立即更新」');
 
-test('updateBadgeState：有新版=可点，进行中/已完成/失败/linked 各有正确形态', () => {
+test('updateBadgeState：有新版=可点；装好待重启=只报重启、绝不再报「有新版本」', () => {
   eq(typeof mod.updateBadgeState, 'function', '面板应当导出升级徽标状态函数：');
   // 只给「已更新到 {version}」这个带占位符的文案真身，其余返回 key，便于断言
   const t = (key) => (key === 'updatedRestart' ? '已更新到 {version}，重启 DSH 生效' : key);
@@ -1127,6 +1127,29 @@ test('updateBadgeState：有新版=可点，进行中/已完成/失败/linked �
   eq(idle.disabled, false);
   eq(idle.text.includes('0.2.4'), true, `要显示新版本号：${idle.text}`);
   eq(idle.text.includes('updateNow'), true, `要明确写「立即更新」：${idle.text}`);
+
+  // 核心回归：后台已经装好（落盘版本 > 运行版本），hasUpdate 仍按 runningVersion 为 true；
+  // 此时必须只显示「重启生效」，不能还挂着「有新版本」和可点的更新入口。
+  const restart = mod.updateBadgeState(
+    { state: 'idle' },
+    { hasUpdate: true, latest: '0.2.7', restartRequired: true, installedVersion: '0.2.7' },
+    t,
+  );
+  eq(restart.text, '已更新到 v0.2.7，重启 DSH 生效', `装好待重启时文案要报出落盘版本：${restart.text}`);
+  eq(restart.text.includes('updateAvailable'), false, `装好待重启时不能再出现「有新版本」：${restart.text}`);
+  eq(restart.action, null, '已经装好了，不该再给「立即更新」（没有可做的事）：');
+  eq(restart.disabled, true);
+  eq(restart.tone, 'ok', '醒目但不用红色警告：');
+
+  // 老宿主只给 installed（没有 installedVersion）时也要能报出版本号
+  const legacy = mod.updateBadgeState(null, { hasUpdate: true, latest: '0.2.6', restartRequired: true, installed: '0.2.6' }, t);
+  eq(legacy.text, '已更新到 v0.2.6，重启 DSH 生效', `落盘版本字段缺失时要回落到 installed：${legacy.text}`);
+  eq(legacy.action, null);
+
+  // 落盘版本号读不到：仍要提示重启，但不编造版本号
+  const restartNoVersion = mod.updateBadgeState(null, { hasUpdate: true, latest: '0.2.7', restartRequired: true }, t);
+  eq(restartNoVersion.text, 'updateRestartHint', '没有落盘版本号时用「已更新完成」的兜底文案：');
+  eq(restartNoVersion.action, null);
 
   const running = mod.updateBadgeState({ state: 'running', to: '0.2.4', command: 'pnpm add dsh-worktodo@latest' }, null, t);
   eq(running.disabled, true, '更新中不可点（防连点出第二个子进程）：');
@@ -1148,28 +1171,74 @@ test('updateBadgeState：有新版=可点，进行中/已完成/失败/linked �
   eq(failed.text.includes('安装命令退出码 3'), true, `失败原因要显示出来：${failed.text}`);
 
   eq(mod.updateBadgeState({ state: 'idle' }, { hasUpdate: false }, t), null, '没新版、没在升级时不该渲染这一格：');
+  eq(mod.updateBadgeState({ state: 'idle' }, { hasUpdate: false, restartRequired: false }, t), null, 'restartRequired:false 时也不该渲染：');
   eq(mod.updateBadgeState(null, null, t), null);
 });
 
-test('页脚：有新版时渲染成可点的按钮（不是只读 span），进行中则禁用并改文案', () => {
+test('页脚：有新版时渲染成可点的按钮；进行中是只读状态（不是按钮）', () => {
   const t = (key) => key;
   const previous = fakeListPayload.data.update;
+  const updateNodes = () => flattenTree(renderPanel({ t }))
+    .filter((n) => String(n.props?.className ?? '').includes('wt-update'));
   try {
     fakeListPayload.data.update = { current: '0.2.0', latest: '0.2.4', hasUpdate: true, run: { state: 'idle' } };
-    const ready = flattenTree(renderPanel({ t }))
-      .filter((n) => n.type === 'button' && String(n.props?.className ?? '').includes('wt-update'));
+    const ready = updateNodes().filter((n) => n.type === 'button');
     eq(ready.length, 1, `页脚必须渲染恰好一个升级按钮：${ready.length}`);
     eq(typeof ready[0].props.onClick, 'function', '升级按钮必须真的挂了点击处理：');
     eq(ready[0].props.disabled, false, '有新版时可点：');
+    eq(typeof ready[0].props['aria-label'], 'string', '升级按钮要有 aria-label：');
     eq(textOf(ready[0]).includes('0.2.4'), true, `徽标要显示新版本：${textOf(ready[0])}`);
     eq(textOf(ready[0]).includes('updateNow'), true, `要写「立即更新」：${textOf(ready[0])}`);
 
     fakeListPayload.data.update = { current: '0.2.0', latest: '0.2.4', hasUpdate: true, run: { state: 'running', to: '0.2.4' } };
-    const busy = flattenTree(renderPanel({ t }))
-      .filter((n) => n.type === 'button' && String(n.props?.className ?? '').includes('wt-update'));
-    eq(busy.length, 1);
-    eq(busy[0].props.disabled, true, '更新中必须禁用按钮：');
-    eq(textOf(busy[0]).includes('updating'), true, `更新中要变成「正在更新…」：${textOf(busy[0])}`);
+    const busy = updateNodes();
+    eq(busy.length, 1, `进行中也只占一格：${busy.length}`);
+    eq(busy[0].type, 'span', '进行中是状态文本，不该渲染成可点按钮：');
+    eq(busy[0].props.role, 'status', '只读状态要标 role=status：');
+    eq(busy[0].props['aria-label'], 'updating v0.2.4', '状态徽标也要有 aria-label：');
+    eq(textOf(busy[0]).includes('updating'), true, `进行中要变成「正在更新…」：${textOf(busy[0])}`);
+  } finally {
+    fakeListPayload.data.update = previous;
+  }
+});
+
+test('页脚：restartRequired 时只显示「已更新到 vX，重启 DSH 生效」，且没有任何可点的更新按钮', () => {
+  const t = (key) => (key === 'updatedRestart' ? '已更新到 {version}，重启 DSH 生效' : key);
+  const previous = fakeListPayload.data.update;
+  try {
+    // 与宿主真实载荷一致：hasUpdate 仍为 true（latest vs 运行版本），restartRequired 也为 true
+    fakeListPayload.data.update = {
+      current: '0.2.5', runningVersion: '0.2.5', latest: '0.2.7',
+      hasUpdate: true, restartRequired: true, installedVersion: '0.2.7',
+      run: { state: 'idle' },
+    };
+    const nodes = flattenTree(renderPanel({ t }));
+    const chips = nodes.filter((n) => String(n.props?.className ?? '').includes('wt-update'));
+    eq(chips.length, 1, `已装好待重启只该占页脚一格：${chips.length}`);
+    const chip = chips[0];
+    eq(chip.type, 'span', '已装好待重启是纯状态，不能渲染成按钮：');
+    eq(chip.props.role, 'status');
+    eq(typeof chip.props.onClick, 'undefined', '纯状态不该有点击处理：');
+    eq(chip.props['aria-label'], '已更新到 v0.2.7，重启 DSH 生效', '徽标要有 aria-label：');
+    const text = textOf(chip);
+    eq(text, '已更新到 v0.2.7，重启 DSH 生效', `文案要报出落盘版本：${text}`);
+    eq(text.includes('有新版本'), false, `装好待重启时不能再出现「有新版本」：${text}`);
+    eq(text.includes('立即更新'), false, `装好待重启时不该再出现「立即更新」：${text}`);
+
+    // 全页扫描：不允许出现任何可点的更新按钮（button.wt-update）
+    const clickable = nodes.filter((n) => n.type === 'button' && String(n.props?.className ?? '').includes('wt-update'));
+    eq(clickable.length, 0, `已装好待重启时不该有可点的更新按钮：${clickable.length}`);
+
+    // 反向对照：同一个载荷把 restartRequired 变成 false，才回到「有新版本」+ 可点按钮
+    fakeListPayload.data.update = {
+      current: '0.2.5', runningVersion: '0.2.5', latest: '0.2.7',
+      hasUpdate: true, restartRequired: false, installedVersion: '0.2.5', run: { state: 'idle' },
+    };
+    const updateNodes = flattenTree(renderPanel({ t }))
+      .filter((n) => String(n.props?.className ?? '').includes('wt-update'));
+    eq(updateNodes.length, 1);
+    eq(updateNodes[0].type, 'button', '真正「有新版本（还没装）」时才是可点按钮：');
+    eq(textOf(updateNodes[0]).includes('updateAvailable'), true, `要回到「有新版本」文案：${textOf(updateNodes[0])}`);
   } finally {
     fakeListPayload.data.update = previous;
   }

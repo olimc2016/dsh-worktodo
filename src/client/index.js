@@ -553,11 +553,14 @@ export const STYLE_TEXT = `
 }
 .wt-link { cursor: pointer; user-select: none; color: var(--dsw-alias-link); font-size: 11px; }
 .wt-link:hover { text-decoration: underline; }
-/* 自升级那一格：本身是 <button>（可点），但外观必须与旁边的 chip 一致 */
+/* 自升级那一格：可点时是 <button>，外观必须与旁边的 chip 一致 */
 .wt-update { font: inherit; cursor: pointer; background: transparent; appearance: none; }
 .wt-update:hover { text-decoration: underline; }
 .wt-update:disabled { cursor: default; opacity: .7; }
 .wt-update:disabled:hover { text-decoration: none; }
+/* 纯状态（正在更新 / 已装好待重启 / linked）：不是按钮，别给可点的暗示 */
+.wt-update.is-state { cursor: default; }
+.wt-update.is-state:hover { text-decoration: none; }
 .wt-title { cursor: pointer; word-break: break-word; }
 .wt-title:hover { text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
 .wt-spin {
@@ -1925,11 +1928,17 @@ export function storeLocationLabel(store, t) {
 /**
  * 页脚「版本」旁边那一格该显示什么 —— 纯函数（导出供单测），不碰 DOM、不用 innerHTML。
  *
- * 状态优先级（升级过程本身比「有新版本」更重要）：
- *   running → 正在更新…（不可点）
- *   done    → 已更新到 vX，重启 DSH 生效
- *   failed  → 失败原因（`linked` 换成「本地链接安装」的专门说明，那不是一个故障）
- *   idle + hasUpdate → 「有新版本 vX · 立即更新」（可点）
+ * 状态优先级：
+ *   running            → 正在更新…（不可点）
+ *   restartRequired    → 已更新到 v<落盘版本>，重启 DSH 生效（**不可点**：装都装好了，没有可做的事）
+ *   done               → 已更新到 vX，重启 DSH 生效（升级刚结束、落盘版本读不到时的兜底）
+ *   failed             → 失败原因（`linked` 换成「本地链接安装」的专门说明，那不是一个故障）
+ *   idle + hasUpdate   → 「有新版本 vX · 立即更新」（可点）
+ *   其余               → 什么都不显示
+ *
+ * 为什么 restartRequired 必须排在 hasUpdate 前面：后台装好新版后，`hasUpdate`（latest vs
+ * **运行版本**）仍然是 true —— 但此时用户不需要再点「立即更新」，只需要重启。两个都显示会
+ * 把「装好了」误报成「还没装」。
  *
  * @param {object|null} run 宿主 /worktodo/update 的状态（或 /list 载荷里的摘要）
  * @param {object|null} update /list 载荷里的 update 字段
@@ -1948,8 +1957,20 @@ export function updateBadgeState(run, update, t) {
       disabled: true,
     };
   }
+  if (update?.restartRequired) {
+    // 落盘版本 > 运行版本：已经装好了，只差重启。不用红色（ok 语义色），但比普通 chip 醒目。
+    // 版本号只认「落盘/已安装」字段 —— 不拿 latest 顶替，否则会把「装好的是哪一版」说错。
+    const installed = update?.installedVersion ?? update?.installed;
+    return {
+      text: installed ? t('updatedRestart').replace('{version}', `v${installed}`) : t('updateRestartHint'),
+      title: installed ? `v${installed}` : t('updateRestartHint'),
+      tone: 'ok',
+      action: null,
+      disabled: true,
+    };
+  }
   if (state === 'done') {
-    const to = run?.to ?? update?.installed ?? update?.latest;
+    const to = run?.to ?? update?.installedVersion ?? update?.installed ?? update?.latest;
     return {
       text: to ? t('updatedRestart').replace('{version}', `v${to}`) : t('updateRestartHint'),
       title: to ? `v${to}` : '',
@@ -2454,16 +2475,28 @@ function WorkTodoPanel(props) {
           style: { color: C.label3 },
         }, `${t('versionLabel')} ${version ? `v${version}` : '—'}`),
         updateBadge
-          ? React.createElement('button', {
-            key: 'u',
-            type: 'button',
-            className: 'wt-chip wt-update',
-            // 升级进行中或面板还有写操作在飞时不可点，避免连点出第二个子进程
-            disabled: updateBadge.disabled || pending > 0,
-            onClick: updateBadge.action ? handleUpdate : undefined,
-            title: updateBadge.title,
-            style: { fontSize: 10, ...UPDATE_TONE_STYLE[updateBadge.tone] },
-          }, updateBadge.text)
+          ? (updateBadge.action
+            /* 只有真的能做点什么时才渲染 <button>；纯状态（正在更新/已装好待重启/失败但不可重试）
+               用 <span>，避免读屏与键盘用户撞上一个「点了没反应」的按钮。 */
+            ? React.createElement('button', {
+              key: 'u',
+              type: 'button',
+              className: 'wt-chip wt-update',
+              'aria-label': updateBadge.text,
+              // 升级进行中或面板还有写操作在飞时不可点，避免连点出第二个子进程
+              disabled: updateBadge.disabled || pending > 0,
+              onClick: handleUpdate,
+              title: updateBadge.title,
+              style: { fontSize: 10, ...UPDATE_TONE_STYLE[updateBadge.tone] },
+            }, updateBadge.text)
+            : React.createElement('span', {
+              key: 'u',
+              className: 'wt-chip wt-update is-state',
+              role: 'status',
+              'aria-label': updateBadge.text,
+              title: updateBadge.title,
+              style: { fontSize: 10, ...UPDATE_TONE_STYLE[updateBadge.tone] },
+            }, updateBadge.text))
           : null,
       ]),
       storeLocationLabel(store, t)
