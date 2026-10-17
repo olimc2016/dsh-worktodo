@@ -1117,16 +1117,19 @@ test('S6-2：客户端重复注册只降级那一条，不能让 apply 把面板
 
 console.log('自升级（客户端）：只读提示变成可点的「立即更新」');
 
-test('updateBadgeState：有新版=可点；装好待重启=只报重启、绝不再报「有新版本」', () => {
+test('updateBadgeState：有新版=可下载；装好待重启=只报重启、绝不再报「有新版本」', () => {
   eq(typeof mod.updateBadgeState, 'function', '面板应当导出升级徽标状态函数：');
-  // 只给「已更新到 {version}」这个带占位符的文案真身，其余返回 key，便于断言
-  const t = (key) => (key === 'updatedRestart' ? '已更新到 {version}，重启 DSH 生效' : key);
+  // 只给带占位符的文案真身，其余返回 key，便于断言
+  const t = (key) => ({
+    updatedRestart: '已更新到 {version}，重启 DSH 生效',
+    updateInstalledManual: '已安装 {version}，请手动重启 DSH',
+  }[key] ?? key);
 
   const idle = mod.updateBadgeState({ state: 'idle' }, { hasUpdate: true, latest: '0.2.4' }, t);
-  eq(idle.action, 'update', '有新版必须可点：');
+  eq(idle.action, 'download', '有新版时必须给「下载」按钮（照 DSH：第一步只下载）：');
   eq(idle.disabled, false);
   eq(idle.text.includes('0.2.4'), true, `要显示新版本号：${idle.text}`);
-  eq(idle.text.includes('updateNow'), true, `要明确写「立即更新」：${idle.text}`);
+  eq(idle.text.includes('updateDownload'), true, `要明确写「下载」：${idle.text}`);
 
   // 核心回归：后台已经装好（落盘版本 > 运行版本），hasUpdate 仍按 runningVersion 为 true；
   // 此时必须只显示「重启生效」，不能还挂着「有新版本」和可点的更新入口。
@@ -1167,7 +1170,8 @@ test('updateBadgeState：有新版=可点；装好待重启=只报重启、绝�
   eq(linked.action, null, 'linked 不该给「重试」（重试一百次也一样）：');
 
   const failed = mod.updateBadgeState({ state: 'failed', reason: 'exit-nonzero', error: '安装命令退出码 3' }, null, t);
-  eq(failed.action, 'retry', '失败必须能重试：');
+  // 什么都没下载过 → 重试的第一步必须是「下载」，不能直接点安装（那条路会被宿主拒绝）
+  eq(failed.action, 'download', '失败必须能重试（没下载过时先重试下载）：');
   eq(failed.text.includes('安装命令退出码 3'), true, `失败原因要显示出来：${failed.text}`);
 
   eq(mod.updateBadgeState({ state: 'idle' }, { hasUpdate: false }, t), null, '没新版、没在升级时不该渲染这一格：');
@@ -1188,7 +1192,7 @@ test('页脚：有新版时渲染成可点的按钮；进行中是只读状态�
     eq(ready[0].props.disabled, false, '有新版时可点：');
     eq(typeof ready[0].props['aria-label'], 'string', '升级按钮要有 aria-label：');
     eq(textOf(ready[0]).includes('0.2.4'), true, `徽标要显示新版本：${textOf(ready[0])}`);
-    eq(textOf(ready[0]).includes('updateNow'), true, `要写「立即更新」：${textOf(ready[0])}`);
+    eq(textOf(ready[0]).includes('updateDownload'), true, `要写「下载」（第一步）：${textOf(ready[0])}`);
 
     fakeListPayload.data.update = { current: '0.2.0', latest: '0.2.4', hasUpdate: true, run: { state: 'running', to: '0.2.4' } };
     const busy = updateNodes();
@@ -1239,6 +1243,188 @@ test('页脚：restartRequired 时只显示「已更新到 vX，重启 DSH 生�
     eq(updateNodes.length, 1);
     eq(updateNodes[0].type, 'button', '真正「有新版本（还没装）」时才是可点按钮：');
     eq(textOf(updateNodes[0]).includes('updateAvailable'), true, `要回到「有新版本」文案：${textOf(updateNodes[0])}`);
+  } finally {
+    fakeListPayload.data.update = previous;
+  }
+});
+
+console.log('自升级（客户端）：两阶段交互 —— 下载 → 进度 → 安装并重启 → 已安装待重启');
+
+/** 带占位符真身的 t，其余返回 key（便于断言「用的是哪个 key」而不是被文案细节缠住）。 */
+const updateT = (key) => ({
+  updatedRestart: '已更新到 {version}，重启 DSH 生效',
+  updateInstalledManual: '已安装 {version}，请手动重启 DSH',
+  updateInstalledManualHint: 'DSH 没有向插件暴露重启入口',
+  updateDownloading: '下载中 {percent}%',
+  updateDownloadingBytes: '下载中 · 已收到 {bytes}',
+  updateInstallHint: '应用已下载的 {version}，然后请求重启 DSH',
+  updateDownloadedState: '已下载 {version}',
+}[key] ?? key);
+
+test('updateBadgeState：阶段驱动（available→downloading→downloaded→installing→installed→restarting）', () => {
+  const badge = (run, update) => mod.updateBadgeState(run, update, updateT);
+
+  // 1) 可下载：给的是「下载」按钮，不是「立即更新」
+  const available = badge({ phase: 'available', version: '0.2.7' }, { hasUpdate: true, latest: '0.2.7' });
+  eq(available.action, 'download', 'available 阶段必须给「下载」：');
+  eq(available.disabled, false);
+  eq(available.text.includes('0.2.7'), true, `要报出目标版本：${available.text}`);
+
+  // 2) 下载中：进度来自宿主，前端不编造；不可点
+  const downloading = badge({ phase: 'downloading', version: '0.2.7', percent: 42 }, null);
+  eq(downloading.action, null, '下载中不该给任何可点动作（防连点起第二次下载）：');
+  eq(downloading.disabled, true);
+  eq(downloading.tone, 'busy');
+  eq(downloading.text.includes('42'), true, `必须显示进度百分比：${downloading.text}`);
+  // 没有 content-length（percent:null）时只报已收到字节数，不能编一个 0% 或 100%
+  const noLength = badge({ phase: 'downloading', version: '0.2.7', percent: null, download: { bytes: 2048 } }, null);
+  eq(noLength.text.includes('已收到'), true, `没有百分比时要报已下载量：${noLength.text}`);
+  eq(noLength.text.includes('2.0 KB'), true, `字节数要人类可读：${noLength.text}`);
+
+  // 3) 校验中：DSH 在这一步是 verifying（下完了但还不能装）
+  const verifying = badge({ phase: 'verifying', version: '0.2.7', percent: 100 }, null);
+  eq(verifying.action, null, '校验中不该给可点动作：');
+  eq(verifying.text, 'updateVerifying');
+
+  // 4) 已下载：第二步才出现「安装并重启」
+  const downloaded = badge({ phase: 'downloaded', version: '0.2.7', percent: 100, download: { version: '0.2.7' } }, null);
+  eq(downloaded.action, 'install', '已下载后必须给「安装并重启」：');
+  eq(downloaded.disabled, false);
+  eq(downloaded.text.includes('updateInstallRestart'), true, `按钮文案要是「安装并重启」：${downloaded.text}`);
+
+  // 5) 安装中：不可点
+  const installing = badge({ phase: 'installing', version: '0.2.7' }, null);
+  eq(installing.action, null);
+  eq(installing.tone, 'busy');
+  eq(installing.text, 'updateInstalling');
+
+  // 6) 已安装 + 重启不可用：诚实提示「请手动重启」，绝不给「重启」按钮假装能重启
+  const installedManual = badge({
+    phase: 'installed', version: '0.2.7',
+    restart: { supported: false, ok: false, reason: 'no-plugin-restart-ipc', error: 'DSH 没有向插件暴露重启入口' },
+  }, { restartSupported: false, installedVersion: '0.2.7' });
+  eq(installedManual.action, null, '重启不可用时不该给可点按钮：');
+  eq(installedManual.disabled, true);
+  eq(installedManual.text, '已安装 v0.2.7，请手动重启 DSH');
+  eq(installedManual.title.includes('没有向插件暴露重启入口'), true, `要把原因写在 title 里：${installedManual.title}`);
+  eq(installedManual.tone, 'ok', '装好了不是故障，不要用红色：');
+
+  // 7) 已安装 + 用户配了重启命令：这时才给「重启 DSH」
+  const installedRestartable = badge({
+    phase: 'installed', version: '0.2.7',
+    restart: { supported: true, ok: null, kind: 'command' },
+  }, { restartSupported: true });
+  eq(installedRestartable.action, 'restart', '配了 restartCommand 才允许给「重启 DSH」：');
+  eq(installedRestartable.text.includes('updateRestart'), true);
+
+  // 8) 重启中
+  const restarting = badge({ phase: 'restarting', version: '0.2.7', restart: { supported: true } }, null);
+  eq(restarting.action, null);
+  eq(restarting.tone, 'busy');
+  eq(restarting.text, 'updateRestarting');
+
+  // 9) 下载失败：重试的是「下载」，不是「安装」
+  const downloadFailed = badge({ phase: 'failed', version: '0.2.7', failedOperation: 'download', failure: 'download-network', error: 'HTTP 503' }, null);
+  eq(downloadFailed.action, 'download', '下载失败的重试必须回到下载这一步：');
+  eq(downloadFailed.tone, 'error');
+  eq(downloadFailed.text.includes('HTTP 503'), true, `失败原因要显示出来：${downloadFailed.text}`);
+  eq(downloadFailed.text.includes('updateDownloadFailed'), true, `要说明是「下载失败」而不是笼统「更新失败」：${downloadFailed.text}`);
+
+  // 10) 安装失败但下载物还在：重试的是安装
+  const installFailed = badge({
+    phase: 'failed', version: '0.2.7', failedOperation: 'install', failure: 'install',
+    error: '安装命令退出码 3', download: { version: '0.2.7' },
+  }, null);
+  eq(installFailed.action, 'retry', '下载物还在时重试安装：');
+
+  // 11) 校验/落盘坏了：必须回到下载（安装一个坏包没有意义）
+  const corrupt = badge({
+    phase: 'failed', version: '0.2.7', failedOperation: 'install', failure: 'download-corrupt',
+    error: '校验不通过', download: { version: '0.2.7' },
+  }, null);
+  eq(corrupt.action, 'download', '下载物坏了要重新下载：');
+
+  // 12) linked 仍然不是故障：不给重试
+  const linked = badge({ phase: 'failed', state: 'idle', reason: 'linked', failure: 'linked', error: 'link: 安装' }, null);
+  eq(linked.action, null, 'linked 不该给重试（重试一百次也一样）：');
+  eq(linked.text, 'updateLinked');
+});
+
+test('页脚：下载中渲染成只读状态 + aria 进度；已下载渲染成「安装并重启」按钮', () => {
+  const previous = fakeListPayload.data.update;
+  const nodes = () => flattenTree(renderPanel({ t: updateT }))
+    .filter((n) => String(n.props?.className ?? '').includes('wt-update'));
+  try {
+    // 下载中：只读、role=progressbar、aria-valuenow 就是宿主给的百分比
+    fakeListPayload.data.update = {
+      current: '0.2.5', latest: '0.2.7', hasUpdate: true, restartSupported: false,
+      run: { phase: 'downloading', state: 'running', version: '0.2.7', percent: 37 },
+    };
+    const busy = nodes();
+    eq(busy.length, 1, '下载中只占页脚一格：');
+    eq(busy[0].type, 'span', '下载中是状态文本，不该渲染成按钮：');
+    eq(busy[0].props.role, 'progressbar', '下载中要标 role=progressbar：');
+    eq(busy[0].props['aria-valuenow'], 37, 'aria-valuenow 必须是宿主报的百分比：');
+    eq(busy[0].props['aria-label'].includes('37'), true, `可读名里也要有百分比：${busy[0].props['aria-label']}`);
+
+    // 已下载：可点的「安装并重启」
+    fakeListPayload.data.update = {
+      current: '0.2.5', latest: '0.2.7', hasUpdate: true, restartSupported: false,
+      run: { phase: 'downloaded', state: 'idle', version: '0.2.7', percent: 100, download: { version: '0.2.7' } },
+    };
+    const ready = nodes();
+    eq(ready.length, 1);
+    eq(ready[0].type, 'button', '已下载后必须是按钮：');
+    eq(typeof ready[0].props.onClick, 'function');
+    eq(ready[0].props.disabled, false);
+    eq(ready[0].props['aria-label'].includes('updateInstallRestart'), true, `aria-label 要说清「安装并重启」：${ready[0].props['aria-label']}`);
+    eq(String(textOf(ready[0])).includes('0.2.7'), true, `要报出版本：${textOf(ready[0])}`);
+
+    // 已安装、重启不可用：只读 + 诚实文案 + 全页没有可点的更新按钮
+    fakeListPayload.data.update = {
+      current: '0.2.5', latest: '0.2.7', hasUpdate: false, restartSupported: false,
+      run: { phase: 'installed', state: 'done', version: '0.2.7', restart: { supported: false, ok: false, error: 'DSH 没有向插件暴露重启入口' } },
+    };
+    const installed = nodes();
+    eq(installed.length, 1);
+    eq(installed[0].type, 'span', '已安装待重启是纯状态：');
+    eq(installed[0].props['aria-label'], '已安装 v0.2.7，请手动重启 DSH');
+    const clickable = flattenTree(renderPanel({ t: updateT }))
+      .filter((n) => n.type === 'button' && String(n.props?.className ?? '').includes('wt-update'));
+    eq(clickable.length, 0, '重启不可用时绝不能出现可点的更新按钮（不假装能重启）：');
+  } finally {
+    fakeListPayload.data.update = previous;
+  }
+});
+
+test('轮询：只有下载/安装进行中才注册 2s 轮询（不常驻），且卸载时清掉', () => {
+  const previous = fakeListPayload.data.update;
+  const pollsDuring = (update) => {
+    fakeListPayload.data.update = update;
+    const before = intervals.length;
+    for (const cleanup of [...effectCleanups]) {
+      try { cleanup(); } catch { /* 上一轮的清理失败不影响本轮 */ }
+    }
+    effectCleanups.length = 0;
+    try {
+      renderPanel({ t: updateT });
+      return intervals.slice(before).filter((handle) => handle.ms === mod.UPDATE_POLL_MS);
+    } finally {
+      fakeListPayload.data.update = previous;
+    }
+  };
+  try {
+    eq(pollsDuring({ current: '0.2.5', latest: '0.2.7', hasUpdate: true, run: { phase: 'idle', state: 'idle' } }).length, 0,
+      '空闲时绝不能有 2s 轮询（常驻定时器会让「省着打宿主」失效）：');
+    eq(pollsDuring({ current: '0.2.5', latest: '0.2.7', hasUpdate: true, run: { phase: 'downloading', state: 'running', percent: 10 } }).length, 1,
+      '下载中必须有一个 2s 轮询：');
+    eq(pollsDuring({ current: '0.2.5', latest: '0.2.7', run: { phase: 'installed', state: 'done' } }).length, 0,
+      '安装收口后必须立刻停掉轮询：');
+    // 清理：把还活着的 effect 清理函数都跑一遍，所有 interval 都必须被 clear
+    for (const cleanup of [...effectCleanups]) {
+      try { cleanup(); } catch { /* 单个清理失败不影响结论 */ }
+    }
+    eq(intervals.every((handle) => clearedIntervals.includes(handle)), true, '卸载时必须 clearInterval：');
   } finally {
     fakeListPayload.data.update = previous;
   }

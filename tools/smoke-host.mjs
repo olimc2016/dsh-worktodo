@@ -13,6 +13,7 @@ process.env.WORKTODO_NO_UPDATE_CHECK = '1';
  * 存储指向临时目录，绝不碰用户真实的 ~/.dsh。
  */
 import { Readable } from 'node:stream';
+import { createServer } from 'node:http';
 import { spawnSync } from 'node:child_process';
 import { existsSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -20,7 +21,7 @@ import { dirname, join } from 'node:path';
 // DSH 判定「工具返回值是否 lossless JSON」用的就是这一个函数（见 assertLossless 的说明）
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { apply, shouldAutoUpdate, profileDirFromModuleUrl, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev } from '../lib/index.js';
+import { apply, shouldAutoUpdate, profileDirFromModuleUrl, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev } from '../lib/index.js';
 
 /**
  * 自动升级的跨重启节流状态文件默认落在 `$DSH_HOME/worktodo/update-state.json`（A4），
@@ -28,6 +29,31 @@ import { apply, shouldAutoUpdate, profileDirFromModuleUrl, normalizePanelConfig,
  * 保证**测试永远不会碰真实 `~/.dsh`**（要用持久化的用例会在 withEnv 里覆盖它）。
  */
 process.env.WORKTODO_UPDATE_STATE_PATH = join(mkdtempSync(join(tmpdir(), 'worktodo-update-state-')), 'update-state.json');
+
+/**
+ * 假的 tarball 分发源（本轮新增的「下载」这一步要有东西可下）。
+ *
+ * 为什么必须有：自升级被拆成「下载 → 安装」两步之后，**后台自动更新**也会真的去取一次 tarball。
+ * 这里起一个只监听 127.0.0.1 的一次性 HTTP 服务，按 npm registry 的路径约定返回一段确定性字节，
+ * 让 `downloadUpdate` 走完整的流式下载 + 进度 + 校验链路，而不是被 mock 掉。
+ * 需要注入下载失败的用例会自己再起一个坏服务去覆盖 `WORKTODO_UPDATE_TARBALL_BASE`。
+ */
+const fakeTarball = Buffer.alloc(2048, 0x51);
+const tarballServer = createServer((request, response) => {
+  response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(fakeTarball.length) });
+  response.end(fakeTarball);
+});
+await new Promise((resolve) => tarballServer.listen(0, '127.0.0.1', resolve));
+tarballServer.unref();
+process.env.WORKTODO_UPDATE_TARBALL_BASE = `http://127.0.0.1:${tarballServer.address().port}/`;
+
+/**
+ * 最近一次从 GET /worktodo/update 读到的阶段 / 重启记录（轮询式断言用）。
+ * 必须在这里（文件顶部）声明：本文件还有「用 argv 重新 spawn 自己」的 A1 子场景，
+ * 它在第 190 行左右就调用 readUpdateState —— 声明晚了会撞 TDZ。
+ */
+let lastPhase = null;
+let lastRestart = null;
 
 /**
  * A1 的写失败注入必须跑在**真实 fs 失败**下（`ulimit -f`，等价 ENOSPC）。
@@ -1390,9 +1416,45 @@ function triggerUpdate(host, body = { action: 'plugin-update' }) {
   });
 }
 
-/** GET 一次升级状态。 */
+/** GET 一次升级状态（顺便记下阶段/重启记录，方便轮询式断言）。 */
 function readUpdateState(host) {
-  return call(host.routes.get('/worktodo/update').handler, { method: 'GET', url: '/worktodo/update' });
+  const response = call(host.routes.get('/worktodo/update').handler, { method: 'GET', url: '/worktodo/update' });
+  return response.then((value) => {
+    const data = value.json()?.data;
+    if (data) {
+      lastPhase = data.phase ?? null;
+      lastRestart = data.restart ?? null;
+    }
+    return value;
+  });
+}
+
+/**
+ * 轮询 GET /worktodo/update 直到谓词成立（或超时），返回**最后读到的状态**。
+ * 为什么不用 waitFor(() => 某个全局变量)：那个全局只在 readUpdateState 里更新，
+ * 条件函数本身不重新读，永远等不到新值（踩过一次）。
+ * @param {object} host
+ * @param {(state: object) => boolean} predicate
+ * @param {number} [timeoutMs]
+ */
+async function waitForUpdatePhase(host, predicate, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  for (;;) {
+    last = (await readUpdateState(host)).json().data ?? last;
+    if (last && predicate(last)) return last;
+    if (Date.now() > deadline) return last;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/** 读「落盘的插件版本」文本（装配假 pnpm 之后用它确认真的换了版本）。 */
+function readInstalledVersionText(profileDir) {
+  try {
+    return readFileSync(join(profileDir, 'node_modules', 'dsh-worktodo', 'package.json'), 'utf8');
+  } catch {
+    return '';
+  }
 }
 
 /** 轮询状态接口，直到升级不再是 running（或超时）。 */
@@ -2091,14 +2153,27 @@ await test('自升级：从模块自身路径精确反推 profile（多个 profi
   eq(profileDirFromModuleUrl('not a url'), null, '坏输入不能抛：');
 });
 
-await test('自升级：配置默认值——autoUpdate 默认 true（显式 false 才关）、官方源、180s，非法值一律回落', async () => {
+await test('自升级：配置默认值——autoUpdate/autoInstall 默认 true（显式 false 才关）、官方源、180s，非法值一律回落', async () => {
   // 纯函数层先钉死：这是「默认就要自动更新」这条用户诉求的第一道闸
-  eq(normalizeUpdateConfig(undefined), { autoUpdate: true, updateRegistry: 'https://registry.npmjs.org/', updateTimeoutMs: 180000 }, '无配置时必须默认自动更新：');
+  eq(normalizeUpdateConfig(undefined), {
+    autoUpdate: true,
+    autoInstall: true,
+    updateRegistry: 'https://registry.npmjs.org/',
+    updateTimeoutMs: 180000,
+    restartCommand: '',
+  }, '无配置时必须默认自动更新 + 后台自动安装（沿用旧行为）：');
   eq(normalizeUpdateConfig({}).autoUpdate, true, '空配置也必须默认自动更新：');
   eq(normalizeUpdateConfig({ autoUpdate: false }).autoUpdate, false, '显式 false 必须完全关掉：');
   eq(normalizeUpdateConfig({ autoUpdate: 'yes' }).autoUpdate, true, '只有**字面量** false 才关（配置里一个手滑的 falsy 值不该静默关掉用户要的自动更新）：');
   eq(normalizeUpdateConfig({ autoUpdate: 'false' }).autoUpdate, true, '字符串 "false" 不是字面量 false：');
   eq(normalizeUpdateConfig({ autoUpdate: 0 }).autoUpdate, true, '数字 0 不是字面量 false：');
+  // autoInstall：默认 true = 沿用「后台下完就装」的旧行为；只有字面 false 才停在「已下载」
+  eq(normalizeUpdateConfig(undefined).autoInstall, true, 'autoInstall 默认必须 true（默认沿用旧行为，不是让后台停在半路）：');
+  eq(normalizeUpdateConfig({ autoInstall: false }).autoInstall, false, '显式 false 才让后台停在「已下载」：');
+  eq(normalizeUpdateConfig({ autoInstall: 'no' }).autoInstall, true, '只有字面 false 才关（与 autoUpdate 同一把口径）：');
+  // restartCommand 是显式 opt-in：不配就是空串（= 没有重启能力）
+  eq(normalizeUpdateConfig(undefined).restartCommand, '', '没配 restartCommand 时必须是空串（不能凭空造一个重启命令）：');
+  eq(normalizeUpdateConfig({ restartCommand: '  open -a DSH  ' }).restartCommand, 'open -a DSH', 'restartCommand 要 trim：');
   eq(normalizeUpdateConfig({ updateRegistry: '   ', updateTimeoutMs: -1 }).updateRegistry, 'https://registry.npmjs.org/', '空白 registry 回落官方源：');
   eq(normalizeUpdateConfig({ updateRegistry: '   ', updateTimeoutMs: -1 }).updateTimeoutMs, 180000, '非法超时回落默认：');
 
@@ -2108,6 +2183,10 @@ await test('自升级：配置默认值——autoUpdate 默认 true（显式 fal
     const defaults = (await readUpdateState(host)).json().data;
     // 面板/GET 状态要能看出「自动更新已开启」，否则用户没法解释「它怎么自己升级了」
     eq(defaults.autoUpdate, true, 'GET /worktodo/update 必须报出 autoUpdate: true：');
+    eq(defaults.autoInstall, true, 'GET 状态必须报出 autoInstall: true（默认沿用旧行为）：');
+    eq(defaults.restartSupported, false, 'DSH 没给插件留重启入口 → 默认必须报 restartSupported: false（不假装能重启）：');
+    // 没注入 latest 且关掉了查询：阶段就是 idle（available 由下面的注入用例钉）
+    eq(defaults.phase, 'idle', `没有可用新版本时阶段必须是 idle（实际 ${defaults.phase}）：`);
     eq(defaults.registry, 'https://registry.npmjs.org/', 'registry 默认必须是官方源：');
     eq(defaults.timeoutMs, 180000, '超时默认 180s：');
     eq(Array.isArray(defaults.steps), true, '状态里要有 steps 数组，能看出升级卡在哪一步：');
@@ -2650,6 +2729,474 @@ async function makePanelConfigHost(config = {}) {
   await new Promise((resolve) => setTimeout(resolve, 20));
   return { host, dir };
 }
+
+/* ------------------------------------------------------------------ *
+ * 自升级的「两步」交互（照 DSH 桌面版更新器：下载 → 安装并重启）
+ *
+ * 为什么这些用例必须在**真网络流**上跑：`downloadUpdate` 走的是 fetch + 流式读，
+ * 用 mock 替掉 fetch 就等于不测进度、不测截断、不测校验。这里起一个只监听 127.0.0.1 的
+ * 一次性 HTTP 服务当假 registry，真的把字节传过来。
+ * ------------------------------------------------------------------ */
+
+/**
+ * 起一个一次性的假 tarball 分发源。
+ * @param {{chunks?: number, chunkSize?: number, delayMs?: number, status?: number}} [options]
+ * @returns {Promise<{base: string, body: Buffer, close: () => Promise<void>}>}
+ */
+async function startTarballServer({ chunks = 1, chunkSize = 2048, delayMs = 0, status = 200 } = {}) {
+  const body = Buffer.alloc(chunkSize * chunks, 0x61);
+  const server = createServer(async (_request, response) => {
+    if (status !== 200) {
+      response.writeHead(status, { 'content-length': '0' });
+      response.end();
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(body.length) });
+    for (let index = 0; index < chunks; index += 1) {
+      response.write(body.subarray(index * chunkSize, (index + 1) * chunkSize));
+      if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    base: `http://127.0.0.1:${server.address().port}/`,
+    body,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+/** 造一个「能真的换掉落盘版本」的假 pnpm（安装链路的正向路径）。 */
+function makeInstallingPnpm(tag, profile) {
+  const capture = join(selfUpdateRoot, `capture-${tag}.txt`);
+  const bin = join(selfUpdateRoot, `bin-${tag}`);
+  writeFakePnpm(bin, { capture, installVersion: '9.9.9', installProfile: profile, installOn: 'any' });
+  return { capture, bin };
+}
+
+await test('自升级（两步）：下载带进度 → 已下载 → 安装并重启 → 已安装（阶段/进度/版本/诚实重启提示）', async () => {
+  const profile = makeFakeProfile('flow-two-step', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const { capture, bin } = makeInstallingPnpm('flow-two-step', profile);
+  // 分 4 片、每片间隔 40ms：这样「下载中」这个瞬态在轮询里一定看得见（不是一帧就过去）
+  const tarball = await startTarballServer({ chunks: 4, chunkSize: 512, delayMs: 40 });
+  const stageDir = join(selfUpdateRoot, 'stage-two-step');
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base, WORKTODO_UPDATE_STAGE_DIR: stageDir,
+    }, async () => {
+      // apply 必须在注入 latest 之后：启动那次检查才会把阶段推到 available（真实流程就是这样）
+      ({ host, dir } = await makeUpdateHost({ autoUpdate: false }));
+      // —— 起点：可下载（还没下，percent 必须是 null 而不是 0） ——
+      const before = (await readUpdateState(host)).json().data;
+      eq(before.phase, 'available', `注入 latest 后阶段应当是 available（实际 ${before.phase}）：`);
+      eq(before.version, '9.9.9', '状态里要给出目标版本：');
+      eq(before.percent, null, '还没开始下载时 percent 必须是 null（0 会被误读成「刚起步」）：');
+      eq(before.download, null, '还没下载时不该有 download 记录：');
+
+      // —— 第 1 步：下载（只下载，不动已安装的版本） ——
+      // 注意：POST 会一直等到下载结束才 resolve（路由 handler 是 await 的），
+      // 所以必须先发起、后采样，否则永远看不到「下载中」这个瞬态。
+      const downloadPromise = triggerUpdate(host, { action: 'plugin-update-download' });
+      const percents = [];
+      let last = null;
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const state = (await readUpdateState(host)).json().data;
+        last = state;
+        if (state.phase === 'downloading' && Number.isFinite(state.percent)) percents.push(state.percent);
+        if (state.phase === 'downloaded' || state.phase === 'failed') break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const started = (await downloadPromise).json();
+      eq(started.ok, true, `下载应当被接受：${JSON.stringify(started)}`);
+      eq(last?.phase, 'downloaded', `下载应当收口在 downloaded（实际 ${last?.phase}，error=${last?.error}）：`);
+      eq(last.percent, 100, '下完（且校验通过）时 percent 必须是 100：');
+      eq(last.download?.version, '9.9.9', 'download 记录里要有目标版本：');
+      eq(last.download?.bytes, tarball.body.length, `download 记录里的字节数要对（实际 ${last.download?.bytes}）：`);
+      eq(last.download?.totalBytes, tarball.body.length, 'content-length 要记成 totalBytes：');
+      eq(existsSync(last.download.artifact), true, `下载物必须真的落在暂存区：${last.download?.artifact}`);
+      eq(readFileSync(last.download.artifact).length, tarball.body.length, '暂存区里的字节数必须与源一致：');
+      eq(last.download?.artifact.startsWith(stageDir), true, `暂存区必须是我们指定的目录（绝不写进用户数据）：${last.download?.artifact}`);
+      eq(percents.length > 0, true, '必须能看到至少一次「下载中」的进度上报（不能一帧跳过）：');
+      eq(percents.some((value) => value > 0 && value < 100), true, `必须出现 0<percent<100 的中间进度：${JSON.stringify(percents)}`);
+      eq(percents.every((value, index) => index === 0 || value >= percents[index - 1]), true,
+        `进度必须单调不减：${JSON.stringify(percents)}`);
+      // 只下载不安装：一个安装子进程都不许起
+      eq(invokeCount(capture), 0, `下载这一步绝不允许动安装（实际起了 ${invokeCount(capture)} 个子进程）：`);
+
+      // —— 第 2 步：安装并重启 ——
+      const installStarted = (await triggerUpdate(host, { action: 'plugin-update-install' })).json();
+      eq(installStarted.ok, true, `安装应当被接受：${JSON.stringify(installStarted)}`);
+      const settled = await waitForUpdateSettled(host, 6000);
+      eq(settled?.phase, 'installed', `安装成功必须落在 installed（实际 ${settled?.phase}，error=${settled?.error}）：`);
+      eq(settled?.state, 'done', '老字段 state 必须同时是 done（旧面板还在读）：');
+      eq(settled?.version, '9.9.9', '装好之后要报出装的是哪一版：');
+      // 假 pnpm 在第一步就换掉了版本 → 序列可能只跑 1 条命令就收口，只要 >0 就说明真的装了
+      eq(invokeCount(capture) >= 1, true, `安装必须真的起过子进程（实际 ${invokeCount(capture)}）：`);
+      eq(readInstalledVersionText(profile).includes('9.9.9'), true, '落盘版本必须真的换成 9.9.9：');
+      // 装完要把暂存物清掉：否则下次启动会把「已装好的版本」重新认成「已下载待安装」
+      eq(existsSync(last.download.artifact), false, `安装成功后暂存物必须清掉：${last.download.artifact}`);
+
+      // —— 重启：DSH 没给插件重启入口，必须诚实（phase 停在 installed，绝不假装重启成功） ——
+      const withRestart = await waitForUpdatePhase(host, (state) => state.restart !== null, 3000);
+      eq(withRestart?.restart !== null && withRestart?.restart !== undefined, true,
+        `请求重启之后必须留下一条 restart 记录（实际 ${JSON.stringify(withRestart?.restart)}）：`);
+      eq(lastRestart?.supported, false, '默认必须报 supported:false（DSH 没向插件暴露重启）：');
+      eq(lastRestart?.ok, false, '绝不能把「没重启」报成成功：');
+      eq(lastRestart?.reason, 'no-plugin-restart-ipc', `要给稳定的原因码（实际 ${lastRestart?.reason}）：`);
+      eq(String(lastRestart?.error).includes('手动'), true, `文案必须明确请用户手动重启：${lastRestart?.error}`);
+      eq(settled?.restartSupported, false, 'GET 状态里的 restartSupported 也必须是 false：');
+      const finalState = (await readUpdateState(host)).json().data;
+      eq(finalState.phase === 'restarting', false, '重启不可用时绝不能进 restarting（那是假装能重启）：');
+    });
+  } finally {
+    await tarball.close();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('自升级（两步）：下载失败 → failed + failedOperation:download（不落半个文件），换好源后重试成功', async () => {
+  const profile = makeFakeProfile('flow-download-fail', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const { capture, bin } = makeInstallingPnpm('flow-download-fail', profile);
+  const broken = await startTarballServer({ status: 503 });
+  const good = await startTarballServer({ chunks: 1, chunkSize: 1024 });
+  const stageDir = join(selfUpdateRoot, 'stage-download-fail');
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      WORKTODO_UPDATE_TARBALL_BASE: broken.base, WORKTODO_UPDATE_STAGE_DIR: stageDir,
+    }, async () => {
+      ({ host, dir } = await makeUpdateHost({ autoUpdate: false }));
+      const failed = (await triggerUpdate(host, { action: 'plugin-update-download' })).json();
+      eq(failed.ok, false, '源返回 503 时下载必须失败（不是悄悄成功）：');
+      eq(failed.reason, 'download-failed', `失败原因要是稳定的 download-failed：${failed.reason}`);
+      eq(String(failed.error).includes('503'), true, `错误里要带上网关状态：${failed.error}`);
+      const status = (await readUpdateState(host)).json().data;
+      eq(status.phase, 'failed', `下载失败必须落到 failed：${status.phase}`);
+      eq(status.state, 'failed', '老字段 state 也要是 failed：');
+      eq(status.failedOperation, 'download', 'failedOperation 必须指明是下载这一步：');
+      eq(['download', 'download-network'].includes(status.failure), true, `要给出稳定的失败种类：${status.failure}`);
+      eq(status.percent, null, '失败后不能再挂着一个百分比：');
+      eq(status.download, null, '失败时不该有「已下载」记录：');
+      // 不落半个文件
+      const leftover = [];
+      try {
+        for (const name of readdirSync(join(stageDir, '9.9.9'))) leftover.push(name);
+      } catch { /* 目录压根没建 = 更好 */ }
+      eq(leftover.length, 0, `下载失败绝不能留下半个文件：${JSON.stringify(leftover)}`);
+      eq(invokeCount(capture), 0, '下载失败不许触发安装：');
+
+      // 换一个好源 → 重试必须能成功（失败可重试，不是死局）
+      process.env.WORKTODO_UPDATE_TARBALL_BASE = good.base;
+      const retried = (await triggerUpdate(host, { action: 'plugin-update-download' })).json();
+      eq(retried.ok, true, `换好源后重试应当成功：${JSON.stringify(retried)}`);
+      const done = await waitForUpdatePhase(host, (state) => state.phase === 'downloaded', 4000);
+      eq(done?.phase, 'downloaded', `重试后应当到 downloaded（实际 ${done?.phase}，error=${done?.error}）：`);
+    });
+  } finally {
+    await broken.close();
+    await good.close();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('自升级（两步）护栏：没下载就点「安装并重启」→ 拒绝（not-downloaded），一个子进程都不起', async () => {
+  const profile = makeFakeProfile('guard-not-downloaded', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const { capture, bin } = makeInstallingPnpm('guard-not-downloaded', profile);
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+    }, async () => {
+      ({ host, dir } = await makeUpdateHost({ autoUpdate: false }));
+      // 只有 available、没有下载物
+      const response = await triggerUpdate(host, { action: 'plugin-update-install' });
+      const body = response.json();
+      eq(body.ok, false, '下载没完成时必须拒绝安装：');
+      eq(body.reason, 'not-downloaded', `原因要是稳定的 not-downloaded（实际 ${body.reason}）：`);
+      eq(String(body.error).includes('下载'), true, `要说清「先去下载」：${body.error}`);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      eq(invokeCount(capture), 0, '被拒绝的安装绝不允许起子进程：');
+      const status = (await readUpdateState(host)).json().data;
+      eq(status.phase, 'available', `拒绝后阶段不该被改成别的东西（实际 ${status.phase}）：`);
+      eq(status.state, 'idle', '老字段 state 仍然是 idle：');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('自升级（两步）护栏：下载物被删 / 被写坏 → 安装当场拒绝（download-missing / download-corrupt）', async () => {
+  const profile = makeFakeProfile('guard-corrupt', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const { capture, bin } = makeInstallingPnpm('guard-corrupt', profile);
+  const tarball = await startTarballServer({ chunks: 1, chunkSize: 1024 });
+  const stageDir = join(selfUpdateRoot, 'stage-guard-corrupt');
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base, WORKTODO_UPDATE_STAGE_DIR: stageDir,
+    }, async () => {
+      ({ host, dir } = await makeUpdateHost({ autoUpdate: false }));
+      const downloaded = (await triggerUpdate(host, { action: 'plugin-update-download' })).json();
+      eq(downloaded.ok, true, `先正常下载：${JSON.stringify(downloaded)}`);
+      const artifact = (await readUpdateState(host)).json().data.download.artifact;
+
+      // ① 下载物被删（用户清缓存 / 换目录）
+      rmSync(artifact, { force: true });
+      const missing = (await triggerUpdate(host, { action: 'plugin-update-install' })).json();
+      eq(missing.ok, false, '下载物不在了必须拒绝安装：');
+      eq(missing.reason, 'download-missing', `原因要是 download-missing（实际 ${missing.reason}）：`);
+      eq(String(missing.error).includes('重新下载'), true, `要让用户重新下载：${missing.error}`);
+      let status = (await readUpdateState(host)).json().data;
+      eq(status.phase, 'failed', '拒绝后必须是 failed（不是悄悄继续）：');
+      eq(status.failedOperation, 'install', 'failedOperation 要指明安装这一步：');
+      eq(status.failure, 'download-corrupt', `失败种类要是 download-corrupt（实际 ${status.failure}）：`);
+
+      // ② 重新下载，然后把内容改坏（模拟写坏/半截文件）
+      eq((await triggerUpdate(host, { action: 'plugin-update-download' })).json().ok, true);
+      writeFileSync(artifact, '这不是一个 tarball');
+      const corrupt = (await triggerUpdate(host, { action: 'plugin-update-install' })).json();
+      eq(corrupt.ok, false, '内容被改坏必须拒绝安装：');
+      eq(corrupt.reason, 'download-corrupt', `原因要是 download-corrupt（实际 ${corrupt.reason}）：`);
+      status = (await readUpdateState(host)).json().data;
+      eq(String(status.error).includes('校验不通过') || String(status.error).includes('大小不对'), true,
+        `要说明是校验/大小的问题：${status.error}`);
+      // 两次拒绝都不许真的去装
+      eq(invokeCount(capture), 0, `被拒绝的安装绝不允许起子进程（实际 ${invokeCount(capture)}）：`);
+    });
+  } finally {
+    await tarball.close();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('自升级（两步）：下好了但没安装就「重启」→ 新实例启动即认回「已下载」，不用重下第二遍', async () => {
+  const profile = makeFakeProfile('resume-downloaded', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const { capture, bin } = makeInstallingPnpm('resume-downloaded', profile);
+  const tarball = await startTarballServer({ chunks: 1, chunkSize: 1024 });
+  const stageDir = join(selfUpdateRoot, 'stage-resume');
+  const statePath = join(selfUpdateRoot, 'update-state-resume.json');
+  let first;
+  let second;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base, WORKTODO_UPDATE_STAGE_DIR: stageDir,
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+    }, async () => {
+      // 第一个实例：只下载，不安装
+      first = await makeUpdateHost({ autoUpdate: false });
+      eq((await triggerUpdate(first.host, { action: 'plugin-update-download' })).json().ok, true);
+      const downloaded = await waitForUpdatePhase(first.host, (state) => state.phase === 'downloaded', 4000);
+      eq(downloaded?.phase, 'downloaded', `先把它下好（实际 ${downloaded?.phase}）：`);
+
+      // 「重启」：新的 apply（新进程生命周期的替身）
+      second = await makeUpdateHost({ autoUpdate: false });
+      const resumed = (await readUpdateState(second.host)).json().data;
+      eq(resumed.phase, 'downloaded', `重启后必须直接认回「已下载」（实际 ${resumed.phase}）：`);
+      eq(resumed.download?.version, '9.9.9', '认回的必须是同一版下载物：');
+      eq(invokeCount(capture), 0, '认回下载物不该起任何安装子进程：');
+      // 认回之后照常能装（不用重下一遍）
+      eq((await triggerUpdate(second.host, { action: 'plugin-update-install' })).json().ok, true);
+      const settled = await waitForUpdateSettled(second.host, 6000);
+      eq(settled?.phase, 'installed', `认回后应当能装上（实际 ${settled?.phase}）：`);
+    });
+  } finally {
+    await tarball.close();
+    if (first?.dir) rmSync(first.dir, { recursive: true, force: true });
+    if (second?.dir) rmSync(second.dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('自升级：config.autoInstall 两种取值——true=后台下完就装；false=后台只停在「已下载」', async () => {
+  // —— autoInstall:false（照 DSH 的做法：后台只下载，安装等用户点） ——
+  const profileOff = makeFakeProfile('autoinstall-off', '^0.2.0');
+  seedInstalledVersion(profileOff, '0.2.0');
+  const offPnpm = makeInstallingPnpm('autoinstall-off', profileOff);
+  const tarballOff = await startTarballServer({ chunks: 1, chunkSize: 1024 });
+  const stageOff = join(selfUpdateRoot, 'stage-autoinstall-off');
+  let off;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profileOff, PATH: `${offPnpm.bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      WORKTODO_UPDATE_TARBALL_BASE: tarballOff.base, WORKTODO_UPDATE_STAGE_DIR: stageOff,
+      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-autoinstall-off.json'),
+    }, async () => {
+      off = await makeUpdateHost({ autoInstall: false });
+      const status = await waitForUpdatePhase(off.host, (state) => state.phase === 'downloaded', 5000);
+      eq(status?.phase, 'downloaded', `autoInstall:false 时后台必须下完并停在 downloaded（实际 ${status?.phase}，error=${status?.error}）：`);
+      eq(status.autoInstall, false, 'GET 状态要如实报出 autoInstall:false：');
+      eq(status.state, 'idle', '停在「已下载」时不该显示在运行（老字段 idle）：');
+      eq(existsSync(status.download?.artifact), true, '下载物要真的在暂存区：');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      eq(invokeCount(offPnpm.capture), 0, 'autoInstall:false 时后台绝不允许自动安装：');
+      // 用户点「安装并重启」之后才装
+      eq((await triggerUpdate(off.host, { action: 'plugin-update-install' })).json().ok, true);
+      const settled = await waitForUpdateSettled(off.host, 6000);
+      eq(settled?.phase, 'installed', `用户点了之后要能装上（实际 ${settled?.phase}）：`);
+    });
+  } finally {
+    await tarballOff.close();
+    if (off?.dir) rmSync(off.dir, { recursive: true, force: true });
+    rmSync(stageOff, { recursive: true, force: true });
+  }
+
+  // —— 默认（autoInstall 缺省 = true）：后台下完直接装，与旧行为一致 ——
+  const profileOn = makeFakeProfile('autoinstall-default', '^0.2.0');
+  seedInstalledVersion(profileOn, '0.2.0');
+  const onPnpm = makeInstallingPnpm('autoinstall-default', profileOn);
+  const tarballOn = await startTarballServer({ chunks: 1, chunkSize: 1024 });
+  const stageOn = join(selfUpdateRoot, 'stage-autoinstall-default');
+  let on;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profileOn, PATH: `${onPnpm.bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      WORKTODO_UPDATE_TARBALL_BASE: tarballOn.base, WORKTODO_UPDATE_STAGE_DIR: stageOn,
+      // 专用节流文件：否则前面用例留下的「已试过 9.9.9」会把这次自动更新节流掉
+      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-autoinstall-default.json'),
+    }, async () => {
+      on = await makeUpdateHost();
+      const settled = await waitForUpdateSettled(on.host, 6000);
+      eq(settled?.phase, 'installed', `默认（autoInstall:true）后台要一路装完（实际 ${settled?.phase}，error=${settled?.error}）：`);
+      eq(settled?.autoInstall, true, 'GET 状态要如实报出默认 autoInstall:true：');
+      eq(invokeCount(onPnpm.capture) >= 1, true, '默认行为要真的起安装子进程（沿用旧行为）：');
+      // 后台自动装完**不**会自动请求重启：重启永远是用户动作
+      eq(settled?.restart, null, '后台自动安装不许自己请求重启（重启只能由用户点）：');
+    });
+  } finally {
+    await tarballOn.close();
+    if (on?.dir) rmSync(on.dir, { recursive: true, force: true });
+    rmSync(stageOn, { recursive: true, force: true });
+  }
+});
+
+await test('重启：没配 restartCommand 就诚实说「请手动重启」；配了才真的跑那条命令', async () => {
+  // —— 不可用：绝不假装能重启 ——
+  const profile = makeFakeProfile('restart-unavailable', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const { capture, bin } = makeInstallingPnpm('restart-unavailable', profile);
+  const tarball = await startTarballServer({ chunks: 1, chunkSize: 1024 });
+  const stageDir = join(selfUpdateRoot, 'stage-restart-unavailable');
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base, WORKTODO_UPDATE_STAGE_DIR: stageDir,
+    }, async () => {
+      ({ host, dir } = await makeUpdateHost({ autoUpdate: false }));
+      eq((await triggerUpdate(host, { action: 'plugin-update-download' })).json().ok, true);
+      eq((await triggerUpdate(host, { action: 'plugin-update-install' })).json().ok, true);
+      const settled = await waitForUpdateSettled(host, 6000);
+      eq(settled?.phase, 'installed', `装完必须停在 installed（实际 ${settled?.phase}）：`);
+      const afterInstall = await waitForUpdatePhase(host, (state) => state.restart !== null, 3000);
+      eq(afterInstall?.restart?.supported, false, '没配命令时必须 supported:false：');
+      eq(afterInstall?.restart?.reason, 'no-plugin-restart-ipc', `原因码要稳定（实际 ${afterInstall?.restart?.reason}）：`);
+      eq(String(afterInstall?.restart?.error).includes('手动'), true, `必须明确请用户手动重启：${afterInstall?.restart?.error}`);
+      // 单独点「重启」也必须是同一个诚实结论（不是抛错、不是假装成功）
+      const again = (await triggerUpdate(host, { action: 'plugin-update-restart' })).json();
+      eq(again.ok, false, '重启不可用时单独点重启也必须如实失败：');
+      eq(again.reason, 'restart-unavailable', `原因要是 restart-unavailable（实际 ${again.reason}）：`);
+      eq((await readUpdateState(host)).json().data.phase, 'installed', '失败的重启请求不能把「已安装」改成别的阶段：');
+    });
+  } finally {
+    await tarball.close();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+
+  // —— 可用：用户显式配置重启命令后，「安装并重启」真的会执行那条命令 ——
+  const profile2 = makeFakeProfile('restart-available', '^0.2.0');
+  seedInstalledVersion(profile2, '0.2.0');
+  const avail = makeInstallingPnpm('restart-available', profile2);
+  const tarball2 = await startTarballServer({ chunks: 1, chunkSize: 1024 });
+  const stageDir2 = join(selfUpdateRoot, 'stage-restart-available');
+  const marker = join(selfUpdateRoot, 'restart-marker.txt');
+  const script = join(selfUpdateRoot, 'restart-cmd.mjs');
+  writeFileSync(script, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'restarted');\n`);
+  let host2;
+  let dir2;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile2, PATH: `${avail.bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      WORKTODO_UPDATE_TARBALL_BASE: tarball2.base, WORKTODO_UPDATE_STAGE_DIR: stageDir2, WORKTODO_RESTART_COMMAND: undefined,
+    }, async () => {
+      ({ host: host2, dir: dir2 } = await makeUpdateHost({ autoUpdate: false, restartCommand: `${process.execPath} ${script}` }));
+      eq((await triggerUpdate(host2, { action: 'plugin-update-download' })).json().ok, true);
+      const before = (await readUpdateState(host2)).json().data;
+      eq(before.restartSupported, true, '配了 restartCommand 后 restartSupported 必须变成 true：');
+      eq((await triggerUpdate(host2, { action: 'plugin-update-install' })).json().ok, true);
+      // 重启命令真的跑了（marker 落盘）
+      const ran = await waitFor(() => existsSync(marker), 6000);
+      eq(ran, true, '配置了重启命令时，「安装并重启」必须真的执行它：');
+      eq(readFileSync(marker, 'utf8'), 'restarted', '跑的是我们配置的那条命令：');
+      const afterRestart = await waitForUpdatePhase(host2, (state) => state.restart !== null, 3000);
+      eq(afterRestart?.restart?.supported, true, '可用时记录里要写 supported:true：');
+      eq(afterRestart?.restart?.kind, 'command', '要记录实现方式（command）：');
+    });
+  } finally {
+    await tarball2.close();
+    if (dir2) rmSync(dir2, { recursive: true, force: true });
+    rmSync(stageDir2, { recursive: true, force: true });
+  }
+});
+
+await test('纯函数：tarball 地址 / 下载暂存目录 / 重启能力探测（都不许猜、不许碰真实目录）', () => {
+  // tarball 地址：npm registry 的约定，registry 末尾有没有斜杠都要拼对
+  eq(buildTarballUrl({ registry: 'https://registry.npmjs.org/', version: '1.2.3', env: {} }),
+    'https://registry.npmjs.org/dsh-worktodo/-/dsh-worktodo-1.2.3.tgz');
+  eq(buildTarballUrl({ registry: 'https://mirror.example', version: '1.2.3', env: {} }),
+    'https://mirror.example/dsh-worktodo/-/dsh-worktodo-1.2.3.tgz');
+  eq(buildTarballUrl({ registry: 'https://r.example/', version: '1.2.3', env: { WORKTODO_UPDATE_TARBALL_BASE: ' http://127.0.0.1:9/x/ ' } }),
+    'http://127.0.0.1:9/x/dsh-worktodo-1.2.3.tgz', '测试缝要能整体换掉分发源（否则离线测不了下载）：');
+
+  // 暂存目录：默认在插件自己的目录；状态文件被指到临时目录时暂存区跟着走
+  eq(resolveUpdateStageDir({ env: {}, home: '/tmp/fake-home' }), '/tmp/fake-home/worktodo/updates');
+  eq(resolveUpdateStageDir({ env: { WORKTODO_UPDATE_STATE_PATH: '/tmp/x/update-state.json' }, home: '/tmp/fake-home' }),
+    '/tmp/x/updates', '状态文件指到临时目录时，暂存区必须跟着走（测试绝不碰真实 ~/.dsh）：');
+  eq(resolveUpdateStageDir({ env: { WORKTODO_UPDATE_STAGE_DIR: ' /tmp/stage ' }, home: '/tmp/fake-home' }), '/tmp/stage',
+    '显式测试缝优先：');
+  eq(resolveUpdateStageDir({ env: {}, home: null }), null, '拿不到家目录时宁可不下载：');
+
+  // 重启能力：默认不可用（DSH 没给插件留入口），只有显式配置才有
+  const none = resolveRestartRequester({ env: {}, config: {} });
+  eq(none.available, false, '默认必须报不可用（不假装能重启）：');
+  eq(none.reason, 'no-plugin-restart-ipc', `默认原因码要稳定（实际 ${none.reason}）：`);
+  eq(none.command, null);
+  const fromConfig = resolveRestartRequester({ env: {}, config: { restartCommand: ' open -a DSH ' } });
+  eq(fromConfig.available, true, '显式配置了重启命令才可用：');
+  eq(fromConfig.command, 'open -a DSH', '命令要 trim 后原样使用：');
+  eq(fromConfig.kind, 'command');
+  const fromEnv = resolveRestartRequester({ env: { WORKTODO_RESTART_COMMAND: 'pkill -f DSH' }, config: {} });
+  eq(fromEnv.available, true, '环境变量也能提供重启命令（测试缝）：');
+  eq(fromEnv.command, 'pkill -f DSH');
+});
 
 await test('面板配置 normalizePanelConfig：celebrate 默认 true，只有显式 false 才关', () => {
   eq(normalizePanelConfig({}), { celebrate: true }, '缺省必须是开：');

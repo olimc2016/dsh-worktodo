@@ -515,6 +515,75 @@ await test('list 返回面板首屏需要的全部字段与五个分组', async 
   eq(body.data.panel.celebrate, true, '没配 celebrate 时必须是开（缺省 = 开）：');
 });
 
+console.log('契约：自升级的「两步」动作与状态字段（客户端 ↔ 宿主）');
+
+/**
+ * 从客户端源码里抽出它真的会发的 action 词（不手抄，改坏了立刻红）。
+ * `plugin-update` 是「一次到位」的旧兜底，会被过滤掉：它真的会去改 profile，
+ * 只在 smoke-host 里用假 profile 跑（这里的宿主没有临时 profile，绝不能碰真实安装）。
+ */
+function clientUpdateActions() {
+  const found = new Set();
+  for (const match of clientSource.matchAll(/postUpdateAction\(['"]([a-z-]+)['"]/gu)) found.add(match[1]);
+  return [...found].sort();
+}
+
+// 安全围栏：这组用例里的宿主不该反推出任何真实 profile；指到一个不存在的临时路径，
+// 万一哪条路径真的走到 profile 解析，也只会得到 profile-not-found，绝不会动真实安装。
+process.env.WORKTODO_PROFILE_DIR = join(root, 'no-such-profile');
+
+await test('两步护栏：没下载就发「安装并重启」→ 宿主明确拒绝（not-downloaded），不是静默成功', async () => {
+  const body = await hit('/worktodo/update', { method: 'POST', url: '/worktodo/update', body: { action: 'plugin-update-install' } });
+  eq(body.ok, false, '没下载时安装必须被拒绝：');
+  eq(body.reason, 'not-downloaded', `拒绝原因要是 not-downloaded（实际 ${body.reason}）：`);
+  eq(String(body.error).includes('下载'), true, `要说清「先去下载」：${body.error}`);
+  // 被拒绝的安装绝不能把阶段改成 installing/installed（那是「假装在装」）
+  const status = await hit('/worktodo/update?x=1');
+  eq(['idle', 'available', 'downloaded'].includes(status.data.phase), true,
+    `被拒绝的安装不许改动阶段（实际 ${status.data.phase}）：`);
+});
+
+await test('客户端发的每个自升级 action，宿主都按「升级」而不是「改待办」处理', async () => {
+  const actions = clientUpdateActions();
+  eq(actions.includes('plugin-update'), true, `客户端必须保留「一次到位」的旧兜底 action：${JSON.stringify(actions)}`);
+  for (const action of actions.filter((entry) => entry !== 'plugin-update')) {
+    const body = await hit('/worktodo/update', { method: 'POST', url: '/worktodo/update', body: { action } });
+    // 升级语义的响应一定带 ok + 稳定 reason（或状态）；「改待办」会因为没有 ref 报 unknown-ref
+    eq(typeof body?.ok, 'boolean', `${action} 的响应不可识别：${JSON.stringify(body)}`);
+    if (/ref|待办/u.test(String(body?.error ?? body?.reason ?? ''))) {
+      throw new Error(`${action} 被当成「改待办」处理了：${JSON.stringify(body)}`);
+    }
+    // 没注入 latest、也没下载物：这几条都必须安全地什么都不做
+    eq(['no-target', 'not-downloaded', 'restart-unavailable'].includes(body.reason), true,
+      `${action} 在没有前提时应当给出稳定原因（实际 ${body.reason}）：`);
+  }
+});
+
+await test('GET /worktodo/update 带齐面板需要的阶段字段（phase/percent/version/autoInstall/restartSupported）', async () => {
+  const body = await hit('/worktodo/update?x=1');
+  eq(body.ok, true, 'GET 必须是 ok:true（ok:false 会让面板整块显示失败）：');
+  for (const key of ['state', 'phase', 'percent', 'version', 'failedOperation', 'failure', 'download', 'restart', 'autoUpdate', 'autoInstall', 'restartSupported', 'registry', 'timeoutMs']) {
+    eq(key in body.data, true, `状态里缺少面板需要的字段 ${key}：`);
+  }
+  eq(typeof body.data.autoInstall, 'boolean', 'autoInstall 必须是布尔（面板据此解释「后台会不会自己装」）：');
+  eq(body.data.restartSupported, false, '没配 restartCommand 时 restartSupported 必须是 false（面板据此显示「请手动重启」）：');
+  eq(body.data.phase, 'idle', `没有新版本时阶段必须是 idle（实际 ${body.data.phase}）：`);
+  eq(body.data.percent, null, '没在下载时 percent 必须是 null（不是 0）：');
+});
+
+await test('/list 载荷里的 update 块也带阶段与重启能力（面板首屏就靠它，不用等轮询）', async () => {
+  const body = await hit('/worktodo/list?filter=all');
+  const block = body.data.update;
+  eq(typeof block === 'object' && block !== null, true, '/list 必须带 update 块：');
+  for (const key of ['phase', 'percent', 'version', 'autoInstall', 'restartSupported', 'run']) {
+    eq(key in block, true, `/list 的 update 块缺少 ${key}：`);
+  }
+  eq(block.run.phase, 'idle', 'update.run 也要有 phase：');
+  eq(block.phase, block.run.phase, '两个 phase 必须一致（面板两处都读）：');
+});
+
+delete process.env.WORKTODO_PROFILE_DIR;
+
 try {
   rmSync(root, { recursive: true, force: true });
 } catch { /* 清理失败不影响结论 */ }

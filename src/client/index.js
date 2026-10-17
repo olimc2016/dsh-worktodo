@@ -175,12 +175,28 @@ const zh = {
   'versionLabel': '版本',
   'versionHint': '当前安装的 dsh-worktodo 版本',
   'updateAvailable': '有新版本',
-  'updateHint': '点击立即更新（升级到最新版；装好后重启 DSH 生效）',
+  'updateHint': '点「下载」把新版本取到本地，下好后再点「安装并重启」',
   'updateNow': '立即更新',
+  'updateDownload': '下载',
+  'updateDownloadHint': '下载新版本到本地（这一步不改动已安装的版本）',
+  'updateChecking': '正在检查更新…',
+  'updateDownloading': '下载中 {percent}%',
+  'updateDownloadingBytes': '下载中 · 已收到 {bytes}',
+  'updateVerifying': '正在校验更新文件…',
+  'updateDownloadedState': '已下载 {version}',
+  'updateInstallRestart': '安装并重启',
+  'updateInstallHint': '应用已下载的 {version}，然后请求重启 DSH',
+  'updateInstalling': '安装中…',
+  'updateInstalledManual': '已安装 {version}，请手动重启 DSH',
+  'updateInstalledManualHint': 'DSH 没有向插件暴露重启入口（重启由 Electron 主进程独占），所以需要你手动退出并重新打开 DSH 才会加载新版本。',
+  'updateRestarting': '重启中…',
+  'updateRestart': '重启 DSH',
+  'updateRestartHint2': '用已配置的重启命令重启 DSH',
   'updating': '正在更新…',
   'updatedRestart': '已更新到 {version}，重启 DSH 生效',
   'updateRestartHint': '已更新完成，重启 DSH 生效',
   'updateFailed': '更新失败',
+  'updateDownloadFailed': '下载失败',
   'updateLinked': '这是本地链接安装（link:），请在仓库里用 git/pnpm 工作流更新',
   'updateRetry': '重试',
   'updateRetryHint': '点击重试',
@@ -279,12 +295,28 @@ const en = {
   'versionLabel': 'Version',
   'versionHint': 'Installed dsh-worktodo version',
   'updateAvailable': 'Update available',
-  'updateHint': 'Click to update now (installs the latest version; restart DSH to apply)',
+  'updateHint': 'Download the new version first, then click "Install and restart"',
   'updateNow': 'Update now',
+  'updateDownload': 'Download',
+  'updateDownloadHint': 'Download the new version; the installed version is untouched',
+  'updateChecking': 'Checking for updates…',
+  'updateDownloading': 'Downloading {percent}%',
+  'updateDownloadingBytes': 'Downloading · {bytes} received',
+  'updateVerifying': 'Verifying update files…',
+  'updateDownloadedState': 'Downloaded {version}',
+  'updateInstallRestart': 'Install and restart',
+  'updateInstallHint': 'Apply the downloaded {version}, then request a DSH restart',
+  'updateInstalling': 'Installing…',
+  'updateInstalledManual': 'Installed {version} — restart DSH manually',
+  'updateInstalledManualHint': 'DSH exposes no restart entry point to plugins (restarting is owned by the Electron main process), so quit and reopen DSH to load the new version.',
+  'updateRestarting': 'Restarting…',
+  'updateRestart': 'Restart DSH',
+  'updateRestartHint2': 'Restart DSH with the configured restart command',
   'updating': 'Updating…',
   'updatedRestart': 'Updated to {version} — restart DSH to apply',
   'updateRestartHint': 'Update finished — restart DSH to apply',
   'updateFailed': 'Update failed',
+  'updateDownloadFailed': 'Download failed',
   'updateLinked': 'This is a local link: install — update it with the git/pnpm workflow',
   'updateRetry': 'Retry',
   'updateRetryHint': 'Click to retry',
@@ -1928,82 +1960,189 @@ export function storeLocationLabel(store, t) {
 /**
  * 页脚「版本」旁边那一格该显示什么 —— 纯函数（导出供单测），不碰 DOM、不用 innerHTML。
  *
- * 状态优先级：
- *   running            → 正在更新…（不可点）
- *   restartRequired    → 已更新到 v<落盘版本>，重启 DSH 生效（**不可点**：装都装好了，没有可做的事）
- *   done               → 已更新到 vX，重启 DSH 生效（升级刚结束、落盘版本读不到时的兜底）
- *   failed             → 失败原因（`linked` 换成「本地链接安装」的专门说明，那不是一个故障）
- *   idle + hasUpdate   → 「有新版本 vX · 立即更新」（可点）
- *   其余               → 什么都不显示
+ * 阶段与文案**照 DSH 桌面版更新器**（`DesktopUpdateIndicator.updateCopy`）的语义来：
+ *   checking      → 正在检查更新…
+ *   available     → 「有新版本 vX · 下载」（可点：**下载**是第一步）
+ *   downloading   → 「下载中 42%」（进度来自宿主，绝不在前端编造百分比）
+ *   verifying     → 正在校验更新文件…
+ *   downloaded    → 「安装并重启」（可点：第二步才动已安装的版本）
+ *   installing    → 安装中…
+ *   installed     → 「已安装 vX，请手动重启 DSH」（**不可点**：DSH 没给插件重启入口，不假装能重启）
+ *                  …除非宿主报 restartSupported（用户配了 restartCommand），那时给「重启 DSH」按钮
+ *   restarting    → 重启中…
+ *   failed        → 失败原因 + 重试（`linked` 换成「本地链接安装」的专门说明，那不是一个故障）
+ *   旧载荷兼容    → 只有 state 没有 phase 时按老规则渲染（running→正在更新，done→已更新待重启）
  *
  * 为什么 restartRequired 必须排在 hasUpdate 前面：后台装好新版后，`hasUpdate`（latest vs
- * **运行版本**）仍然是 true —— 但此时用户不需要再点「立即更新」，只需要重启。两个都显示会
- * 把「装好了」误报成「还没装」。
+ * **运行版本**）仍然是 true —— 但此时用户不需要再下载一次，只需要重启。两个都显示会把
+ * 「装好了」误报成「还没装」。
  *
  * @param {object|null} run 宿主 /worktodo/update 的状态（或 /list 载荷里的摘要）
  * @param {object|null} update /list 载荷里的 update 字段
  * @param {(key: string) => string} t 文案函数
- * @returns {{text: string, title: string, tone: 'ok'|'busy'|'warn'|'error', action: 'update'|'retry'|null, disabled: boolean}|null}
+ * @returns {{text: string, title: string, tone: 'ok'|'busy'|'warn'|'error', action: 'download'|'install'|'restart'|'retry'|'update'|null, disabled: boolean, phase: string|null}|null}
  */
 export function updateBadgeState(run, update, t) {
   const state = run?.state ?? 'idle';
+  const phase = typeof run?.phase === 'string' ? run.phase : null;
+  const percent = Number.isFinite(run?.percent) ? Math.max(0, Math.min(100, Math.floor(run.percent))) : null;
+  const version = run?.version ?? run?.download?.version ?? update?.latest ?? null;
+  const tag = version ? ` v${version}` : '';
+  const restartSupported = update?.restartSupported === true || run?.restartSupported === true || run?.restart?.supported === true;
+  /** @type {(text: string, title: string, tone: string, action: string|null, disabled: boolean, phase: string|null) => object} */
+  const view = (text, title, tone, action, disabled, at) => ({ text, title, tone, action, disabled, phase: at ?? phase });
+
+  /* ---- 1. 新的细粒度阶段（DSH 语义） ---- */
+  if (phase === 'checking') {
+    return view(t('updateChecking'), t('updateChecking'), 'busy', null, true);
+  }
+  if (phase === 'downloading') {
+    // 有 content-length 才报百分比；没有就只报「已收到多少字节」，不编造进度
+    const text = percent === null
+      ? t('updateDownloadingBytes').replace('{bytes}', formatBytes(run?.download?.bytes ?? 0))
+      : t('updateDownloading').replace('{percent}', String(percent));
+    return view(text, run?.download?.url ? String(run.download.url) : t('updateDownloading'), 'busy', null, true);
+  }
+  if (phase === 'verifying') {
+    return view(t('updateVerifying'), t('updateVerifying'), 'busy', null, true);
+  }
+  if (phase === 'downloaded') {
+    return view(
+      `${t('updateDownloadedState').replace('{version}', version ? `v${version}` : '')} · ${t('updateInstallRestart')}`,
+      t('updateInstallHint').replace('{version}', version ? `v${version}` : ''),
+      'ok',
+      'install',
+      false,
+    );
+  }
+  if (phase === 'installing') {
+    return view(t('updateInstalling'), run?.command ? String(run.command) : t('updateInstalling'), 'busy', null, true);
+  }
+  if (phase === 'restarting') {
+    return view(t('updateRestarting'), t('updateRestarting'), 'busy', null, true);
+  }
+  if (phase === 'installed') {
+    const restarted = run?.restart?.ok === true;
+    if (restartSupported && !restarted) {
+      return view(`${t('updateRestart')}${tag}`, t('updateRestartHint2'), 'ok', 'restart', false);
+    }
+    // 诚实态：装好了，但重启只能由用户做（DSH 把重启锁在 Electron 主进程里）
+    const reason = typeof run?.restart?.error === 'string' && run.restart.error ? run.restart.error : t('updateInstalledManualHint');
+    return view(
+      t('updateInstalledManual').replace('{version}', version ? `v${version}` : ''),
+      reason,
+      'ok',
+      null,
+      true,
+    );
+  }
+  if (phase === 'failed') {
+    return failureBadge(run, t, view);
+  }
+
+  /* ---- 2. 只有 state 的旧载荷（老宿主，或页面刚刷新还没拿到新字段） ---- */
   if (state === 'running') {
     const to = run?.to ? ` v${run.to}` : '';
-    return {
-      text: `${t('updating')}${to}`,
-      title: run?.command ? String(run.command) : t('updating'),
-      tone: 'busy',
-      action: null,
-      disabled: true,
-    };
+    return view(`${t('updating')}${to}`, run?.command ? String(run.command) : t('updating'), 'busy', null, true);
   }
   if (update?.restartRequired) {
-    // 落盘版本 > 运行版本：已经装好了，只差重启。不用红色（ok 语义色），但比普通 chip 醒目。
-    // 版本号只认「落盘/已安装」字段 —— 不拿 latest 顶替，否则会把「装好的是哪一版」说错。
+    // 落盘版本 > 运行版本：已经装好了，只差重启。版本号只认「落盘/已安装」字段，不拿 latest 顶替。
     const installed = update?.installedVersion ?? update?.installed;
-    return {
-      text: installed ? t('updatedRestart').replace('{version}', `v${installed}`) : t('updateRestartHint'),
-      title: installed ? `v${installed}` : t('updateRestartHint'),
-      tone: 'ok',
-      action: null,
-      disabled: true,
-    };
+    const versionText = installed ? `v${installed}` : '';
+    // 新宿主会带上 restartSupported:false —— 那就用诚实文案；老宿主/缺字段时保持旧文案
+    const manual = update?.restartSupported === false;
+    return view(
+      manual
+        ? t('updateInstalledManual').replace('{version}', versionText)
+        : (installed ? t('updatedRestart').replace('{version}', versionText) : t('updateRestartHint')),
+      manual ? t('updateInstalledManualHint') : (versionText || t('updateRestartHint')),
+      'ok',
+      null,
+      true,
+      null,
+    );
   }
   if (state === 'done') {
     const to = run?.to ?? update?.installedVersion ?? update?.installed ?? update?.latest;
-    return {
-      text: to ? t('updatedRestart').replace('{version}', `v${to}`) : t('updateRestartHint'),
-      title: to ? `v${to}` : '',
-      tone: 'ok',
-      action: null,
-      disabled: true,
-    };
+    if (to) {
+      return view(
+        t('updateInstalledManual').replace('{version}', `v${to}`),
+        t('updateInstalledManualHint'),
+        'ok',
+        null,
+        true,
+        null,
+      );
+    }
+    return view(t('updateRestartHint'), t('updateRestartHint'), 'ok', null, true, null);
   }
   if (state === 'failed') {
-    const reason = run?.reason;
-    if (reason === 'linked') {
-      return { text: t('updateLinked'), title: t('updateLinked'), tone: 'warn', action: null, disabled: true };
-    }
-    const detail = String(run?.error ?? reason ?? '');
-    return {
-      // 失败要能重试：用户可能只是网络抖了一下
-      text: `${t('updateFailed')}：${detail}`,
-      title: `${t('updateRetryHint')}${detail ? ` — ${detail}` : ''}`,
-      tone: 'error',
-      action: 'retry',
-      disabled: false,
-    };
+    return failureBadge(run, t, view, null);
   }
   if (update?.hasUpdate) {
-    return {
-      text: `${t('updateAvailable')} v${update.latest} · ${t('updateNow')}`,
-      title: t('updateHint'),
-      tone: 'ok',
-      action: 'update',
-      disabled: false,
-    };
+    return view(
+      `${t('updateAvailable')} v${update.latest} · ${t('updateDownload')}`,
+      t('updateHint'),
+      'ok',
+      'download',
+      false,
+      null,
+    );
   }
   return null;
+}
+
+/**
+ * 失败/不可用那一格。`linked` 不是故障（那是开发工作流），单独给说明且不给重试。
+ * 重试按钮的动作由「失败发生在哪一步」决定：下载失败重试下载，安装失败重试安装。
+ * @param {object|null} run 宿主状态
+ * @param {(key: string) => string} t 文案
+ * @param {Function} view 构造返回值
+ * @param {string|null} [forcedPhase]
+ */
+function failureBadge(run, t, view, forcedPhase = undefined) {
+  const reason = run?.reason;
+  if (reason === 'linked' || run?.failure === 'linked') {
+    return view(t('updateLinked'), t('updateLinked'), 'warn', null, true, forcedPhase);
+  }
+  const detail = String(run?.error ?? reason ?? '');
+  const downloadFailed = run?.failedOperation === 'download' || run?.failure === 'download' || run?.failure === 'download-network'
+    || run?.failure === 'download-corrupt';
+  // 失败要能重试：用户可能只是网络抖了一下；下载没完成时重试的是「下载」而不是「安装」
+  const action = downloadFailed || !run?.download ? 'download' : 'retry';
+  return view(
+    `${downloadFailed ? t('updateDownloadFailed') : t('updateFailed')}：${detail}`,
+    `${t('updateRetryHint')}${detail ? ` — ${detail}` : ''}`,
+    'error',
+    action,
+    false,
+    forcedPhase,
+  );
+}
+
+/**
+ * 这个阶段算不算「进行中」（需要轮询、按钮要禁用）。
+ * 与 DSH 的 BUSY_PHASES 对齐，另外把老载荷的 `state:'running'` 也算进来。
+ * @param {object|null} run 宿主状态
+ * @returns {boolean}
+ */
+export function isUpdateBusy(run) {
+  const phase = run?.phase;
+  if (typeof phase === 'string') {
+    return phase === 'checking' || phase === 'downloading' || phase === 'verifying'
+      || phase === 'installing' || phase === 'restarting';
+  }
+  // 老载荷只有 state：running 就是忙
+  return run?.state === 'running';
+}
+
+/** 人类可读的字节数（只用于「没有 content-length 时的已下载量」）。 */
+function formatBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return '0 B';
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function WorkTodoPanel(props) {
@@ -2057,29 +2196,34 @@ function WorkTodoPanel(props) {
   const [updateRun, setUpdateRun] = React.useState(null);
   const run = updateRun ?? update?.run ?? null;
   const runState = run?.state ?? 'idle';
+  // 页脚那一格要显示什么、可点做什么：纯函数决定（见 updateBadgeState），
+  // 必须在这里算 —— 下面的点击处理要用它的 action 分派，晚于 handleUpdate 会撞 TDZ。
+  const updateBadge = updateBadgeState(run, update, t);
 
   /**
-   * 升级进度轮询：**只在 running 时存在**，一离开 running 立刻停（依赖数组里就是 runState）。
+   * 升级进度轮询：**只在「进行中」时存在**（checking/downloading/verifying/installing/restarting，
+   * 以及老载荷的 running），一离开就立刻停（依赖数组里就是这两个值）。
    * 常驻定时器会让「不打无用请求」这条约束作废，所以这里刻意不做成固定间隔的常驻 effect。
    */
+  const busy = isUpdateBusy(run);
   React.useEffect(() => {
-    if (runState !== 'running') return undefined;
+    if (!busy) return undefined;
     let alive = true;
     const timer = setInterval(() => {
       if (isWindowHidden()) return; // 后台窗口不轮询；重新可见时由 visibilitychange 补
       fetchUpdateRun()
         .then((next) => {
           if (!alive || !next) return;
-          if (next.state !== 'running') {
+          if (!isUpdateBusy(next)) {
             setUpdateRun(next);
-            refresh(); // 升级落盘后列表/版本信息要重取一次
+            refresh(); // 下载/安装落盘后列表与版本信息要重取一次
           }
         })
-        .catch(() => { /* 单次轮询失败不改状态，下一次再试；升级子进程不受影响 */ });
+        .catch(() => { /* 单次轮询失败不改状态，下一次再试；后台动作不受影响 */ });
     }, UPDATE_POLL_MS);
     timer?.unref?.(); // Node（测试环境）里不要因为这个定时器挂住事件循环
     return () => { alive = false; clearInterval(timer); };
-  }, [runState, refresh]);
+  }, [busy, refresh]);
 
   // 写操作的错误条；readError 是拉取错误（用户关掉之后，只有换成新错误才再弹）
   const [barError, setBarError] = React.useState(null);
@@ -2113,32 +2257,53 @@ function WorkTodoPanel(props) {
   }, [refresh]);
 
   /**
-   * 「立即更新」：POST 触发升级 → 立刻把本地状态设成 running（按钮马上变成「正在更新…」），
-   * 之后由上面那个 2 秒轮询接管，直到 done/failed。
+   * 自升级的**两步**动作（照 DSH 的交互）：
+   *   download → 只下载（带进度），不动已安装的版本；
+   *   install  → 安装并重启（宿主会先复核「下载物」，没下完直接拒绝）；
+   *   restart  → 装好了但重启没成功时的重试；
+   *   retry    → 按失败发生在哪一步回到那一步（下载失败重试下载，安装失败重试安装）。
    *
    * 刻意**不走 runWrite**：升级不是待办写操作，失败原因（尤其 `linked`）要留在页脚那一格，
    * 而不是弹到面板顶部的写错误条上。
    */
-  const handleUpdate = React.useCallback(() => {
-    if (runState === 'running') return Promise.resolve(false);
-    setUpdateRun({ state: 'running', from: version || null, to: update?.latest ?? null });
-    return postJson('/update', { action: 'plugin-update' })
+  const [updatePending, setUpdatePending] = React.useState(false);
+  const postUpdateAction = React.useCallback((action) => {
+    setUpdatePending(true);
+    return postJson('/update', { action })
       .then((next) => {
-        // 宿主可能同步就给结论（linked / profile-not-found），也可能给 running
-        if (next && typeof next === 'object' && next.state) setUpdateRun(next);
-        else setUpdateRun({ state: 'done', to: update?.latest ?? null });
+        // 宿主可能同步就给结论（linked / not-downloaded / restart-unavailable），也可能给 running
+        if (next && typeof next === 'object' && (next.phase || next.state)) setUpdateRun(next);
         refresh();
         return true;
       })
       .catch((updateError) => {
-        setUpdateRun({
+        setUpdateRun((previous) => ({
+          ...(previous ?? {}),
           state: 'failed',
-          reason: updateError?.reason ?? null,
+          phase: 'failed',
+          failure: null,
+          failedOperation: previous?.failedOperation ?? null,
           error: String(updateError?.message ?? updateError),
-        });
+        }));
         return false;
-      });
-  }, [runState, version, update?.latest, refresh]);
+      })
+      .finally(() => setUpdatePending(false));
+  }, [refresh]);
+
+  const handleUpdate = React.useCallback(() => {
+    if (busy || updatePending) return Promise.resolve(false);
+    const action = updateBadge?.action ?? null;
+    if (action === 'download') return postUpdateAction('plugin-update-download');
+    if (action === 'install') return postUpdateAction('plugin-update-install');
+    if (action === 'restart') return postUpdateAction('plugin-update-restart');
+    if (action === 'retry') {
+      // 下载没完成（或下载物坏了）时，重试必须回到「下载」，不能直接点安装
+      const needsDownload = !run?.download || run?.failedOperation === 'download' || run?.failure === 'download-corrupt';
+      return postUpdateAction(needsDownload ? 'plugin-update-download' : 'plugin-update-install');
+    }
+    // 兜底：老语义「立即更新」（宿主一次完成下载+安装）
+    return postUpdateAction('plugin-update');
+  }, [busy, updatePending, updateBadge?.action, run?.download, run?.failedOperation, run?.failure, postUpdateAction]);
 
   const handleAdd = React.useCallback((input) => {
     const title = String(input?.title ?? '').trim();
@@ -2287,8 +2452,6 @@ function WorkTodoPanel(props) {
   const today = typeof data?.today === 'string' && data.today ? data.today : localToday();
   const store = data?.store ?? null;
   const num = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
-  // 页脚「升级」那一格：纯函数决定文案/配色/是否可点（见 updateBadgeState）
-  const updateBadge = updateBadgeState(run, update, t);
   const overdueCount = num(stats.overdue);
   // 视图分桶：按截止（原有 GROUPS）或按项目（宿主给的 projectGroups，附 未完成/总数/逾期）
   const projectGroups = asArray(data?.projectGroups);
@@ -2476,15 +2639,16 @@ function WorkTodoPanel(props) {
         }, `${t('versionLabel')} ${version ? `v${version}` : '—'}`),
         updateBadge
           ? (updateBadge.action
-            /* 只有真的能做点什么时才渲染 <button>；纯状态（正在更新/已装好待重启/失败但不可重试）
+            /* 只有真的能做点什么时才渲染 <button>；纯状态（下载中/安装中/已装好待重启/失败但不可重试）
                用 <span>，避免读屏与键盘用户撞上一个「点了没反应」的按钮。 */
             ? React.createElement('button', {
               key: 'u',
               type: 'button',
               className: 'wt-chip wt-update',
+              // 无障碍：按钮的可读名就是当前那一格在说什么（下载/安装并重启/重启/重试）
               'aria-label': updateBadge.text,
-              // 升级进行中或面板还有写操作在飞时不可点，避免连点出第二个子进程
-              disabled: updateBadge.disabled || pending > 0,
+              // 下载/安装进行中、或面板还有写操作在飞时不可点，避免连点出第二次下载/第二个子进程
+              disabled: updateBadge.disabled || updatePending || busy || pending > 0,
               onClick: handleUpdate,
               title: updateBadge.title,
               style: { fontSize: 10, ...UPDATE_TONE_STYLE[updateBadge.tone] },
@@ -2492,8 +2656,12 @@ function WorkTodoPanel(props) {
             : React.createElement('span', {
               key: 'u',
               className: 'wt-chip wt-update is-state',
-              role: 'status',
+              // 下载中报成 progressbar（读屏能听到 42%），其余进行中/终态是普通 status
+              ...(updateBadge.phase === 'downloading' && Number.isFinite(run?.percent)
+                ? { role: 'progressbar', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.floor(run.percent) }
+                : { role: 'status' }),
               'aria-label': updateBadge.text,
+              'aria-live': 'polite',
               title: updateBadge.title,
               style: { fontSize: 10, ...UPDATE_TONE_STYLE[updateBadge.tone] },
             }, updateBadge.text))
