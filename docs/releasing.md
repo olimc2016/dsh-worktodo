@@ -54,6 +54,7 @@ trust relationship（OIDC）或"不带 bypass 的 GAT + stage publish"。所以�
 ## 每次发版（绑定之后）
 
 > 发布前必查：**平台包仍是 optional peer**（`dependencies` 里不得有 `@deepseek-ai/*`，顶层不得静态 import 平台包）。`pnpm test` / `prepublishOnly` / CI 都会跑 `verify-submission` 拦截 ✓
+> 另按规范 `docs/process/development-standard.md` §4.1 做一次 **profile 模拟安装**（插件目录内不得出现 `node_modules/@deepseek-ai`）；走暂存发布时，批准前必须做完 §4 全部验证，坏版本先 `npm dist-tag add <pkg>@<good> latest` 止血（§5.6）。
 
 ```bash
 cd <本仓库目录>
