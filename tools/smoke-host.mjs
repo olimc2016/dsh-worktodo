@@ -24,6 +24,23 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged } from '../lib/index.js';
 
 /**
+ * 「模拟版本」的**唯一**来源：全部从 package.json 派生；本文件里不许再出现当前版本号的字面量。
+ *
+ * 为什么：夹具里写死版本号，发版那天就会变成假红 —— 写死的「新版本」恰好等于刚发布的真实版本，
+ * 于是「模拟升级」其实没升级（旧 == 新），或者断言里的 `dsh-worktodo@x.y.z` 与代码实际用的
+ * 目标版本对不上。最近这次发版正是这么红的。规则：
+ *   - 「已装的老版本」用 `'0.2.0'` 这类**远低于当前版本**的历史值（与当前版本无关，永不过期）；
+ *   - 「升级目标 / 新版本」一律用 `FAKE_NEXT_VERSION`（= 当前版本 patch + 1）；
+ *   - 拼进命令 / 清单 / 动态生成的脚本时也用 `FAKE_NEXT_VERSION` 插值，不要粘贴具体数字。
+ * 本文件末尾有一条元测试：源码里一旦重新出现「当前版本号字面量」就判红。
+ */
+const PKG_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+/** 「当前装着的版本」的显式别名（断言里一眼看出是当前版本，而不是模拟的新版本）。 */
+const FAKE_CURRENT_VERSION = PKG_VERSION;
+/** 模拟的「registry 上的新版本」：必须严格大于当前版本，否则自升级用例会失去意义。 */
+const FAKE_NEXT_VERSION = bumpPatch(PKG_VERSION, 1);
+
+/**
  * 自动升级的跨重启节流状态文件默认落在 `$DSH_HOME/worktodo/update-state.json`（A4），
  * 而这里的更新用例未必都把 `$DSH_HOME` 指到临时目录 —— 全局兜一个测试专用路径，
  * 保证**测试永远不会碰真实 `~/.dsh`**（要用持久化的用例会在 withEnv 里覆盖它）。
@@ -67,10 +84,7 @@ let lastRestart = null;
  * 必须已初始化，否则会撞 TDZ。
  */
 
-// 版本断言从 package.json 动态读：硬编码会让每次发版都变红
-// （0.1.0 → 0.1.1 时正是这样被自己抓到的）
-const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-
+// 版本断言统一从顶部 PKG_VERSION / FAKE_NEXT_VERSION 派生
 let passed = 0;
 const failures = [];
 
@@ -349,7 +363,7 @@ await test('health 自检报告存储位置、版本与工具注册结果', asyn
   eq(body.store.kind, 'file');
   eq(body.count, 0);
   // 版本与工具注册结果：排查「源码改动生效了没 / 工具静默没注册」就看这两个字段
-  eq(body.version, pkgVersion);
+  eq(body.version, PKG_VERSION);
   eq(body.tools.status, 'registered');
   eq(body.tools.registered, 7);
   eq(body.tools.names.includes('worktodo_add'), true);
@@ -836,10 +850,9 @@ await test('POST /reorder 落盘手动顺序，并在 manual 模式下生效', a
 await test('GET /list 的载荷带 version 与 update（面板角落的版本信息）', async () => {
   const response = await call(routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list?filter=all' });
   const payload = response.json()?.data;
-  const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-  eq(payload.version, pkgVersion, '载荷里的版本应等于 package.json：');
+  eq(payload.version, PKG_VERSION, '载荷里的版本应等于 package.json：');
   eq(typeof payload.update, 'object', 'update 应当是个对象：');
-  eq(payload.update.current, pkgVersion);
+  eq(payload.update.current, PKG_VERSION);
   eq(typeof payload.update.page === 'string' && payload.update.page.includes('npmjs.com'), true, 'update.page 应指向 npm 页面：');
   // 关了更新检查时不该声称有新版本
   eq(payload.update.hasUpdate, false);
@@ -1244,7 +1257,7 @@ function seedInstalledVersion(profileDir, version) {
 }
 
 /**
- * 造一个比 pkgVersion 新/旧的版本号（只服务测试，不参与生产逻辑）。
+ * 造一个比当前版本新/旧的版本号（只服务测试，不参与生产逻辑）。
  * 从当前版本推而不是硬编码：以后升版本时「更新/更旧」的关系不会因字面量过期而反转。
  */
 function bumpPatch(version, delta) {
@@ -1550,7 +1563,7 @@ await test('自升级：启动检查在飞时点升级不能被「已在运行�
     sawCheck();
     setTimeout(() => {
       response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ 'dist-tags': { latest: bumpPatch(pkgVersion, 1) }, versions: {} }));
+      response.end(JSON.stringify({ 'dist-tags': { latest: bumpPatch(PKG_VERSION, 1) }, versions: {} }));
     }, 400);
   });
   await new Promise((resolve) => slowRegistry.listen(0, '127.0.0.1', resolve));
@@ -1587,9 +1600,9 @@ await test('自升级：启动检查在飞时点升级不能被「已在运行�
 });
 
 await test('自升级（核心）：pnpm update no-op → 第 2 步交 pnpm add 精确版本，仍不变则 failed 且提「版本未变」+ 逐字节回滚', async () => {
-  // 真机复现：spec pin 在 ^0.2.0，落盘 0.2.0，registry latest 0.2.7，
+  // 真机复现：spec pin 在 ^0.2.0，落盘 0.2.0，registry latest = 当前版本 + 1，
   // 而 `plugin add`/`pnpm update` 退出码 0 却「added 0」。修复后必须
-  //   第 1 步 pnpm update → 版本没变 → 第 2 步 pnpm add @0.2.7 --save-exact（规格由 pnpm 改）
+  //   第 1 步 pnpm update → 版本没变 → 第 2 步 pnpm add dsh-worktodo@<新版本> --save-exact（规格由 pnpm 改）
   //   → 版本还是没变 → failed，并把 pnpm 改过的清单**逐字节**还原
   const profile = makeFakeProfile('noop', '^0.2.0');
   seedInstalledVersion(profile, '0.2.0');
@@ -1600,14 +1613,14 @@ await test('自升级（核心）：pnpm update no-op → 第 2 步交 pnpm add 
   // 模拟真实 pnpm add：不换 node_modules 版本（所以序列最终失败），但**真的**把规格写进清单
   writeFakePnpm(bin, {
     capture, specDir, specProfile: profile,
-    addSpecText: `${JSON.stringify({ name: 'dsh-profile-noop', private: true, dependencies: { 'dsh-worktodo': '0.2.7' } }, null, 2)}\n`,
+    addSpecText: `${JSON.stringify({ name: 'dsh-profile-noop', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } }, null, 2)}\n`,
     addSpecProfile: profile,
   });
   const { host, dir } = await makeUpdateHost({ autoUpdate: false });
   try {
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '0.2.7',
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
     }, async () => {
       const response = await triggerUpdate(host);
       eq(response.json().ok, true, `触发升级应当成功启动：${JSON.stringify(response.json())}`);
@@ -1624,7 +1637,7 @@ await test('自升级（核心）：pnpm update no-op → 第 2 步交 pnpm add 
       eq(invocations[0][0], 'update', `第 1 步应当是 pnpm update：${JSON.stringify(invocations[0])}`);
       eq(invocations[0].includes('dsh-worktodo'), true, `update 必须指名要升的包：${JSON.stringify(invocations[0])}`);
       eq(invocations[1][0], 'add', `第 2 步应当让 pnpm 去改规格（add）：${JSON.stringify(invocations[1])}`);
-      eq(invocations[1].includes('dsh-worktodo@0.2.7'), true, `add 必须指名精确版本：${JSON.stringify(invocations[1])}`);
+      eq(invocations[1].includes(`dsh-worktodo@${FAKE_NEXT_VERSION}`), true, `add 必须指名精确版本：${JSON.stringify(invocations[1])}`);
       eq(invocations[1].includes('--save-exact'), true, `add 必须带 --save-exact（写死精确版本）：${JSON.stringify(invocations[1])}`);
       for (const argv of invocations) {
         eq(argv.includes('--registry'), true, `每条命令都要显式带 --registry：${JSON.stringify(argv)}`);
@@ -1662,7 +1675,7 @@ await test('A1（严重）：写盘失败（ulimit -f，等价 ENOSPC）时 prof
   seedInstalledVersion(profile, '0.2.0');
   // 假 pnpm 在 add 时把清单换成一份**小**的合法 JSON（< 1024 字节，写得进去）：
   // 相当于「pnpm 改过规格、但升级没成功」，事务收尾必须还原它，而这一步会撞 EFBIG。
-  const smallSpec = JSON.stringify({ name: 'dsh-profile-write-fail', private: true, dependencies: { 'dsh-worktodo': '0.2.7' } });
+  const smallSpec = JSON.stringify({ name: 'dsh-profile-write-fail', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } });
   eq(Buffer.byteLength(smallSpec) < 1024, true, '测试自身的假清单必须小于 ulimit 上限，否则场景不成立：');
   const bin = join(selfUpdateRoot, 'bin-write-fail');
   writeFakePnpm(bin, {
@@ -1676,7 +1689,7 @@ await test('A1（严重）：写盘失败（ulimit -f，等价 ENOSPC）时 prof
       WORKTODO_PROFILE_DIR: profile,
       PATH: `${bin}:${process.env.PATH}`,
       WORKTODO_PNPM_PATH: '',
-      WORKTODO_UPDATE_LATEST: '0.2.7',
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
       WORKTODO_CHILD_STORE: join(selfUpdateRoot, 'write-fail-store.json'),
       WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-write-fail.json'),
     },
@@ -1690,7 +1703,7 @@ await test('A1（严重）：写盘失败（ulimit -f，等价 ENOSPC）时 prof
   const text = readFileSync(join(profile, 'package.json'), 'utf8');
   // ★ 硬断言：不管回滚成没成，盘上都**必须仍是合法 JSON**（裸 writeFileSync 会在这里留下半截内容）
   const parsed = JSON.parse(text);
-  eq(parsed.dependencies['dsh-worktodo'], '0.2.7', '原子写失败时原文件必须原样不动：');
+  eq(parsed.dependencies['dsh-worktodo'], FAKE_NEXT_VERSION, '原子写失败时原文件必须原样不动：');
   eq(text, smallSpec, 'A1：还原写盘失败时目标文件绝不能出现半截内容（writeFileSync 会把它截断成 1024 字节）：');
   eq(status.state, 'failed', `写失败 + 版本未变必须落 failed（实际 ${status?.state}）：`);
   eq(status.reason, 'version-unchanged', `失败原因是版本没变（回滚失败只体现在 error 里）：${status?.reason}`);
@@ -1707,14 +1720,14 @@ await test('A1：pnpm 把清单写成非法 JSON 且版本已换 → 插件逐�
   const bin = join(selfUpdateRoot, 'bin-corrupt');
   // 假 pnpm 在 add 时把清单截断成非法 JSON，同时真的换掉落盘版本（这一步「成功」）
   writeFakePnpm(bin, {
-    capture, installVersion: '0.2.7', installProfile: profile, installOn: 'add',
+    capture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'add',
     addSpecText: '{"name":"dsh-profile-corrupt-by-pnpm","dependencies":{"dsh-worktodo":', addSpecProfile: profile,
   });
   const { host, dir } = await makeUpdateHost({ autoUpdate: false });
   try {
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '0.2.7',
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
     }, async () => {
       await triggerUpdate(host);
       const status = await waitForUpdateEnd(host, 5000);
@@ -1731,7 +1744,7 @@ await test('A1：pnpm 把清单写成非法 JSON 且版本已换 → 插件逐�
 });
 
 await test('A2：第 3 步 pnpm add 挂起到超时 → 规格逐字节回滚，error/steps 明确写「已回滚」', async () => {
-  // 审查实跑：超时后规格留在 0.2.7、node_modules 还是 0.2.0，error 完全不提「已改写规格」。
+  // 审查实跑：超时后规格留在「新版本」、node_modules 还是 0.2.0，error 完全不提「已改写规格」。
   const profile = makeFakeProfile('timeout-rollback', '^0.2.0');
   seedInstalledVersion(profile, '0.2.0');
   const originalBytes = readFileSync(join(profile, 'package.json'), 'utf8');
@@ -1740,14 +1753,14 @@ await test('A2：第 3 步 pnpm add 挂起到超时 → 规格逐字节回滚，
   // add 先把规格写成精确版本，再挂起 5s（远长于 800ms 超时）→ 序列在 add 上超时被杀
   writeFakePnpm(bin, {
     capture, addSleepSec: 5,
-    addSpecText: `${JSON.stringify({ name: 'dsh-profile-timeout-rollback', private: true, dependencies: { 'dsh-worktodo': '0.2.7' } }, null, 2)}\n`,
+    addSpecText: `${JSON.stringify({ name: 'dsh-profile-timeout-rollback', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } }, null, 2)}\n`,
     addSpecProfile: profile,
   });
   const { host, dir } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 800 });
   try {
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '0.2.7',
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
     }, async () => {
       const started = Date.now();
       await triggerUpdate(host);
@@ -1792,8 +1805,8 @@ await test('A3：dependencies 与 devDependencies 同名不同值 → 回滚逐�
   ].join('\n');
   writeFileSync(join(profile, 'package.json'), originalBytes);
   seedInstalledVersion(profile, '0.2.0');
-  // 最坏情况：pnpm 的 add 把两个段位都改成 0.2.7（于是回滚必须同时照顾两个段位的原值）
-  const rewritten = originalBytes.replaceAll('"^0.2.0"', '"0.2.7"').replaceAll('"~0.1.0"', '"0.2.7"');
+  // 最坏情况：pnpm 的 add 把两个段位都改成新版本（于是回滚必须同时照顾两个段位的原值）
+  const rewritten = originalBytes.replaceAll('"^0.2.0"', `"${FAKE_NEXT_VERSION}"`).replaceAll('"~0.1.0"', `"${FAKE_NEXT_VERSION}"`);
   eq(rewritten !== originalBytes, true, 'fixture 自检：两个段位都要被假 pnpm 改到：');
   const capture = join(selfUpdateRoot, 'capture-two-sections.txt');
   const bin = join(selfUpdateRoot, 'bin-two-sections');
@@ -1802,7 +1815,7 @@ await test('A3：dependencies 与 devDependencies 同名不同值 → 回滚逐�
   try {
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '0.2.7',
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
     }, async () => {
       await triggerUpdate(host);
       const status = await waitForUpdateEnd(host, 5000);
@@ -1856,27 +1869,27 @@ await test('自升级（核心）：第 1 步 pnpm update 真的换掉落盘版�
   seedInstalledVersion(profile, '0.2.0');
   const capture = join(selfUpdateRoot, 'capture-swap1.txt');
   const bin = join(selfUpdateRoot, 'bin-swap1');
-  // 假 pnpm 在**任意**子命令上真的把 node_modules 版本换成 0.2.7
-  writeFakePnpm(bin, { capture, installVersion: '0.2.7', installProfile: profile, installOn: 'any' });
+  // 假 pnpm 在**任意**子命令上真的把 node_modules 版本换成本用例的目标版本
+  writeFakePnpm(bin, { capture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any' });
   const { host, dir } = await makeUpdateHost({ autoUpdate: false });
   try {
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '0.2.7',
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
     }, async () => {
       await triggerUpdate(host);
       const status = await waitForUpdateEnd(host, 5000);
       eq(status?.state, 'done', `版本真变了就该 done（实际 ${status?.state}，error=${status?.error}）：`);
-      eq(status?.to, '0.2.7', 'done 要用落盘版本，而不是 registry 的 latest：');
-      eq(status?.installed, '0.2.7', '已安装版本要报给面板：');
+      eq(status?.to, FAKE_NEXT_VERSION, 'done 要用落盘版本，而不是 registry 的 latest：');
+      eq(status?.installed, FAKE_NEXT_VERSION, '已安装版本要报给面板：');
       eq(invokeCount(capture), 1, `第 1 步成功就不该再跑第 2 步（实际 ${invokeCount(capture)} 次）：`);
       eq(readInvocations(capture)[0][0], 'update', '成功的这条就是用户实测有效的 pnpm update：');
       // hasUpdate 的语义没变：registry latest vs **运行版本**。装完但进程还没重启时它仍是 true，
       // 面板必须先看 restartRequired（客户端对应用例在 smoke-client）。
       const list = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
       eq(list.data.update.hasUpdate, true, `升级落盘后 hasUpdate 仍按 runningVersion 比较（装好 ≠ 已生效）：${JSON.stringify(list.data.update)}`);
-      eq(list.data.update.installedVersion, '0.2.7', '落盘版本要报给面板：');
-      eq(list.data.update.installed, '0.2.7', '老字段 installed 保留（兼容旧面板）：');
+      eq(list.data.update.installedVersion, FAKE_NEXT_VERSION, '落盘版本要报给面板：');
+      eq(list.data.update.installed, FAKE_NEXT_VERSION, '老字段 installed 保留（兼容旧面板）：');
       eq(list.data.update.restartRequired, true, '落盘版本比运行版本新 → 提示重启 DSH 生效：');
     });
   } finally {
@@ -1885,7 +1898,7 @@ await test('自升级（核心）：第 1 步 pnpm update 真的换掉落盘版�
 });
 
 await test('安装态 vs 运行态：落盘版本比运行版本新 → restartRequired:true，hasUpdate 仍按运行版本', async () => {
-  const newer = bumpPatch(pkgVersion, 1);
+  const newer = bumpPatch(PKG_VERSION, 1);
   const profile = makeFakeProfile('state-installed-newer', '^0.2.0');
   seedInstalledVersion(profile, newer);
   const { host, dir } = await makeUpdateHost({ autoUpdate: false });
@@ -1895,11 +1908,11 @@ await test('安装态 vs 运行态：落盘版本比运行版本新 → restartR
       eq(response.statusCode, 200, '安装态探测再怪也不能让 /list 失败：');
       const update = response.json().data.update;
       eq(update.installedVersion, newer, '要报出 node_modules 里落盘的版本：');
-      eq(update.runningVersion, pkgVersion, '要报出本进程正在运行的版本：');
+      eq(update.runningVersion, PKG_VERSION, '要报出本进程正在运行的版本：');
       eq(update.restartRequired, true, '落盘版本 > 运行版本 → 只差重启：');
       // 老字段保持：旧面板读 current / installed 不受影响
       eq(update.installed, newer, '老字段 installed 继续保留（兼容旧面板）：');
-      eq(update.current, pkgVersion, '老字段 current 仍是运行版本：');
+      eq(update.current, PKG_VERSION, '老字段 current 仍是运行版本：');
       // hasUpdate 语义不变：latest vs **运行版本**。即使盘上已经是最新，它仍为 true；
       // 面板必须先看 restartRequired（smoke-client 有对应的「只显示重启」用例）。
       eq(update.hasUpdate, true, `hasUpdate 仍按 runningVersion 比较（装好 ≠ 已生效）：${JSON.stringify(update)}`);
@@ -1924,9 +1937,9 @@ await test('安装态 vs 运行态：落盘版本不高于运行版本 → resta
       eq(older.installedVersion, '0.0.1');
       eq(older.restartRequired, false, '落盘版本 < 运行版本 → 不需要重启：');
 
-      seedInstalledVersion(profile, pkgVersion);
+      seedInstalledVersion(profile, PKG_VERSION);
       const same = await readUpdate();
-      eq(same.installedVersion, pkgVersion);
+      eq(same.installedVersion, PKG_VERSION);
       eq(same.restartRequired, false, '落盘版本 == 运行版本 → 不需要重启：');
     });
   } finally {
@@ -1953,7 +1966,7 @@ await test('安装态 vs 运行态：落盘清单读不到/坏 JSON → installe
       const missing = await readPayload('还没装');
       eq(missing.installedVersion, null, '读不到落盘清单 → installedVersion 给 null（不是 undefined/抛错）：');
       eq(missing.restartRequired, false, '读不到落盘版本就不能声称需要重启：');
-      eq(missing.runningVersion, pkgVersion, '运行版本仍要照常报出：');
+      eq(missing.runningVersion, PKG_VERSION, '运行版本仍要照常报出：');
 
       // 2) 清单存在但不是合法 JSON（半写/损坏）
       mkdirSync(pkgDir, { recursive: true });
@@ -1989,14 +2002,14 @@ await test('hasUpdate 语义不变：latest 比 runningVersion 新，而不是�
     seedInstalledVersion(profile, '0.0.1');
     await withEnv({ WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_LATEST: '0.0.2' }, async () => {
       const update = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json().data.update;
-      eq(update.hasUpdate, false, `latest 0.0.2 低于运行版本 ${pkgVersion} → 不该提示有新版本：${JSON.stringify(update)}`);
+      eq(update.hasUpdate, false, `latest 0.0.2 低于运行版本 ${PKG_VERSION} → 不该提示有新版本：${JSON.stringify(update)}`);
       eq(update.restartRequired, false);
     });
 
     // 落盘比运行新、latest 也比运行新但低于落盘：按 running 比较应为 true；
     // 若误用 installedVersion 比较会得到 false。
-    seedInstalledVersion(profile, bumpPatch(pkgVersion, 2));
-    await withEnv({ WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_LATEST: bumpPatch(pkgVersion, 1) }, async () => {
+    seedInstalledVersion(profile, bumpPatch(PKG_VERSION, 2));
+    await withEnv({ WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_LATEST: bumpPatch(PKG_VERSION, 1) }, async () => {
       const update = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json().data.update;
       eq(update.hasUpdate, true, `latest 高于运行版本 → 仍要提示有新版本（与落盘版本无关）：${JSON.stringify(update)}`);
       eq(update.restartRequired, true, '落盘版本更高 → 同时要求重启，客户端按优先级只显示重启：');
@@ -2013,23 +2026,23 @@ await test('自升级（核心）：第 1 步 no-op、第 2 步改写规格后 i
   const bin = join(selfUpdateRoot, 'bin-swap2');
   // 只在 add 这一步才换版本：模拟「update 被旧规格挡住、pnpm 改成精确规格后才真的装上」
   writeFakePnpm(bin, {
-    capture, installVersion: '0.2.7', installProfile: profile, installOn: 'add',
-    addSpecText: `${JSON.stringify({ name: 'dsh-profile-swap-by-install', private: true, dependencies: { 'dsh-worktodo': '0.2.7' } }, null, 2)}\n`,
+    capture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'add',
+    addSpecText: `${JSON.stringify({ name: 'dsh-profile-swap-by-install', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } }, null, 2)}\n`,
     addSpecProfile: profile,
   });
   const { host, dir } = await makeUpdateHost({ autoUpdate: false });
   try {
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '0.2.7',
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
     }, async () => {
       await triggerUpdate(host);
       const status = await waitForUpdateEnd(host, 5000);
       eq(status?.state, 'done', `第 2 步生效就该 done（实际 ${status?.state}，error=${status?.error}）：`);
-      eq(status?.to, '0.2.7');
+      eq(status?.to, FAKE_NEXT_VERSION);
       eq(invokeCount(capture), 2, `应当先 update 再 add（实际 ${invokeCount(capture)} 次）：`);
       // 升级成功 = 保留 pnpm 写下的精确规格（不回滚），并显式记一步
-      eq(readProfileSpec(profile), '0.2.7', '成功升级后规格应当保留 pnpm 写下的精确版本：');
+      eq(readProfileSpec(profile), FAKE_NEXT_VERSION, '成功升级后规格应当保留 pnpm 写下的精确版本：');
       eq(status?.steps?.some((step) => step.kind === 'profile-manifest'), true,
         `成功路径要有一步说明「规格由 pnpm 改写并保留」：${JSON.stringify(status?.steps)}`);
     });
@@ -2170,18 +2183,18 @@ await test('自升级：拿得到官方 CLI 时走 dsh plugin --profile <name> a
     "import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';",
     `appendFileSync(${JSON.stringify(capture)}, 'INVOKE\\n' + process.argv.slice(2).join('\\n') + '\\n');`,
     `mkdirSync(${JSON.stringify(cliPkgDir)}, { recursive: true });`,
-    `writeFileSync(${JSON.stringify(join(cliPkgDir, 'package.json'))}, JSON.stringify({ name: 'dsh-worktodo', version: '0.2.7' }, null, 2));`,
+    `writeFileSync(${JSON.stringify(join(cliPkgDir, 'package.json'))}, JSON.stringify({ name: 'dsh-worktodo', version: ${JSON.stringify(FAKE_NEXT_VERSION)} }, null, 2));`,
     '',
   ].join('\n'));
   // 兜底用假 pnpm 一起塞进 PATH：真出问题时也绝不打网络/真装
   const fallbackCapture = join(selfUpdateRoot, 'capture-cli-fallback.txt');
   const bin = join(selfUpdateRoot, 'bin-cli');
-  writeFakePnpm(bin, { capture: fallbackCapture, installVersion: '0.2.7', installProfile: profile, installOn: 'any' });
+  writeFakePnpm(bin, { capture: fallbackCapture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any' });
   const { host, dir } = await makeUpdateHost({ autoUpdate: false, updateRegistry: 'https://registry.npmjs.org/' });
   try {
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_CLI: fakeCli,
-      WORKTODO_PNPM_PATH: undefined, PATH: `${bin}:${process.env.PATH}`, WORKTODO_UPDATE_LATEST: '0.2.7',
+      WORKTODO_PNPM_PATH: undefined, PATH: `${bin}:${process.env.PATH}`, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
     }, async () => {
       const response = await triggerUpdate(host);
       eq(response.json().ok, true, `CLI 路径也该能触发：${JSON.stringify(response.json())}`);
@@ -2299,7 +2312,7 @@ await test('Windows 执行器：pnpm 必须走 node(pnpm.mjs) 或 pnpm.cmd+shell
   eq(pnpm.command === 'pnpm', false, 'Windows 上绝不能裸 spawn("pnpm")（它是 pnpm.cmd，CreateProcess 解析不到）：');
   eq(bundledPnpmCandidates({ platform: 'win32', resourcesPath: resources, execPath }).includes(bundledPnpm), true,
     '候选路径必须包含 runtime/<name>/dependencies/pnpm/bin/pnpm.mjs 这一真实布局：');
-  const steps = buildUpdateSteps({ cli: null, pnpm, profileName: 'desktop', registry: 'https://registry.npmjs.org/', target: '0.2.6' });
+  const steps = buildUpdateSteps({ cli: null, pnpm, profileName: 'desktop', registry: 'https://registry.npmjs.org/', target: FAKE_NEXT_VERSION });
   eq(steps[0].args[0], bundledPnpm, 'pnpm 步骤的第一个 argv 必须是完整的 pnpm.mjs 路径：');
 
   // 2) 找不到自带 pnpm.mjs：Windows 兜底必须是 pnpm.cmd + shell（仍带 windowsHide）
@@ -2565,11 +2578,11 @@ await test('自升级：shouldAutoUpdate 只在开启、有新版、不重入、
 await test('自升级：buildUpdateSteps 的步骤顺序——CLI 优先，再 pnpm update，最后交 pnpm add 精确版本', () => {
   const cli = { args: ['/tmp/fake-cli.mjs'] };
   const pnpm = { args: [] };
-  const withCli = buildUpdateSteps({ cli, pnpm, profileName: 'desktop', registry: 'https://registry.npmjs.org/', target: '0.2.7' });
+  const withCli = buildUpdateSteps({ cli, pnpm, profileName: 'desktop', registry: 'https://registry.npmjs.org/', target: FAKE_NEXT_VERSION });
   eq(withCli.map((step) => step.kind), ['cli-add-latest', 'pnpm-update', 'pnpm-add-exact'], 'CLI 可用时三步都要有且顺序固定：');
   eq(withCli[0].args.join(' '), `/tmp/fake-cli.mjs plugin --profile desktop add dsh-worktodo@latest --registry https://registry.npmjs.org/`);
   eq(withCli[1].args.join(' '), 'update dsh-worktodo --registry https://registry.npmjs.org/');
-  eq(withCli[2].args.join(' '), 'add dsh-worktodo@0.2.7 --save-exact --registry https://registry.npmjs.org/',
+  eq(withCli[2].args.join(' '), `add dsh-worktodo@${FAKE_NEXT_VERSION} --save-exact --registry https://registry.npmjs.org/`,
     'A1 首选方案：第 3 步必须让 pnpm 自己去改规格（add --save-exact），插件不再手写 profile JSON：');
   eq(withCli[2].requiresTarget, true, '第 3 步必须依赖 registry 的精确版本：');
   eq(withCli[2].prepare, undefined, '第 3 步绝不允许再有「自己改写 profile」的 prepare 副作用：');
@@ -2991,7 +3004,7 @@ await test('小问题 3（端到端）：只有 devDependencies 的 profile → 
   try {
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '0.2.7',
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
     }, async () => {
       await triggerUpdate(host);
       const status = await waitForUpdateEnd(host, 5000);
@@ -3018,7 +3031,7 @@ await test('小问题 3（端到端）：只有 dependencies 的 profile → pnp
   try {
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '0.2.7',
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
     }, async () => {
       await triggerUpdate(host);
       await waitForUpdateEnd(host, 5000);
@@ -3562,6 +3575,31 @@ await test('面板配置随 /list 载荷下发：默认 celebrate:true，config.
   } finally {
     rmSync(on.dir, { recursive: true, force: true });
     rmSync(off.dir, { recursive: true, force: true });
+  }
+});
+
+await test('元测试：模拟版本全部从 package.json 派生，源码里没有当前版本号字面量（防发版假红回归）', () => {
+  // 1) 派生关系本身要成立：它必须严格新于当前版本、且形如 x.y.z
+  eq(FAKE_CURRENT_VERSION, PKG_VERSION, 'FAKE_CURRENT_VERSION 必须就是 package.json 的版本：');
+  eq(FAKE_NEXT_VERSION === PKG_VERSION, false, '模拟的新版本不能等于当前版本（否则「升级」其实没升级）：');
+  eq(/^\d+\.\d+\.\d+$/.test(FAKE_NEXT_VERSION), true, `模拟新版本必须是 x.y.z：${FAKE_NEXT_VERSION}`);
+  eq(bumpPatch(FAKE_NEXT_VERSION, -1), PKG_VERSION, 'FAKE_NEXT_VERSION 必须是当前版本 patch + 1：');
+
+  // 2) 源码里不许再出现当前版本号的字面量 —— 夹具/断言/假 pnpm/生成脚本都必须引用常量。
+  //    为什么扫全文：这次假红正是「漏改」了几处字符串（断言、生成脚本、清单片段），
+  //    只盯某几行或列白名单还会再漏。历史夹具用的老版本（0.2.0 等）远低于当前版本，
+  //    且版本号单调递增，不会与当前版本撞车；边界用「前后不能是数字或点」判定，
+  //    避免将来 0.2.10 被 0.2.1 误伤这类子串问题。
+  const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  const escaped = PKG_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const fixated = new RegExp(`(?<![\\d.])${escaped}(?![\\d.])`);
+  const offenders = source.split('\n')
+    .map((line, index) => ({ index: index + 1, line: line.trim() }))
+    .filter(({ line }) => fixated.test(line));
+  if (offenders.length) {
+    throw new Error(`源码里出现了当前版本 ${PKG_VERSION} 的字面量（发版后会变成假红），`
+      + `请改用 PKG_VERSION / FAKE_NEXT_VERSION 派生：\n`
+      + offenders.map(({ index, line }) => `  第 ${index} 行：${line}`).join('\n'));
   }
 });
 
