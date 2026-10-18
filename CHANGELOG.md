@@ -2,6 +2,25 @@
 
 > 本文提到的 `tools/`、`docs/` 等路径都在**仓库**里，不在 npm 发布包内：<https://github.com/olimc2016/dsh-worktodo>
 
+## 0.2.7
+
+### 修复（Windows 自更新点更新无效）
+
+- **根因**：自更新里"DSH 自带 pnpm 的路径"写错了（少了一层 `<runtime-name>/dependencies`），导致**永远回退到裸 `spawn('pnpm')`**；
+  Windows 上 `pnpm` 实际是 `pnpm.cmd`，无 shell 的 `CreateProcess` 不会按 PATHEXT 解析 `.cmd` → 直接 `ENOENT` ✗；
+  于是 CLI 与 pnpm 两条路都没能改 `node_modules`，**版本一直停在旧版**（点更新、重启都没用）。
+- **跨平台修复**：
+  - pnpm 执行改**首选**「同一进程的 node 跑 DSH 自带的 `pnpm.mjs`」（无 shell、`ELECTRON_RUN_AS_NODE`、`windowsHide`）；兜底 `pnpm.cmd` + `shell:true` 并逐参数加引号；**绝不裸 `spawn('pnpm')`**。
+  - 路径解析改 `fileURLToPath`，同时认 `/` 与 `\`、盘符大小写、`%20`、UNC；CLI 定位按官方启动器改为「检查 `app.asar` 归档是否存在」，并优先 `DSH_DESKTOP_NODE_EXECUTABLE`。
+  - Windows 下 `rename` 覆盖失败时先删目标再重试；二次失败明确报错且**不留半文件**。
+  - **仍然每步校验落盘版本**：没变即 `failed`，**绝不假成功**。
+- **失败详情可见**：失败状态新增 `diagnostics`（失败步骤 / 命令 / argv / 退出码 / 目标与落盘版本 / 日志尾部 / pnpm 来源），面板失败态下方有一行「详情」小字 + 悬停全文（中英双语、纯文本、无 `innerHTML`）。
+
+### 测试
+
+- 9 个测试套件、全量 **10/10**（含 build；本机与干净 `env -i` 环境均通过）；宿主 103 条、客户端 63 条。
+- 反向验证三处（路径只认 `/` / 退回裸 pnpm / 假成功判定）均**先红后绿**。
+
 ## 0.2.6
 
 > 面板体验与自更新完善版。

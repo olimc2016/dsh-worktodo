@@ -200,6 +200,13 @@ const zh = {
   'updateLinked': '这是本地链接安装（link:），请在仓库里用 git/pnpm 工作流更新',
   'updateRetry': '重试',
   'updateRetryHint': '点击重试',
+  'updateFailureDetail': '详情',
+  'updateDetailStep': '步骤',
+  'updateDetailCommand': '命令',
+  'updateDetailExit': '退出码',
+  'updateDetailSpawn': '启动错误',
+  'updateDetailVersion': '版本',
+  'updateDetailLog': '日志尾部',
   'addOpen': '新增待办',
   'addCancel': '取消',
   'prioNone': '无',
@@ -320,6 +327,13 @@ const en = {
   'updateLinked': 'This is a local link: install — update it with the git/pnpm workflow',
   'updateRetry': 'Retry',
   'updateRetryHint': 'Click to retry',
+  'updateFailureDetail': 'Details',
+  'updateDetailStep': 'step',
+  'updateDetailCommand': 'command',
+  'updateDetailExit': 'exit code',
+  'updateDetailSpawn': 'spawn error',
+  'updateDetailVersion': 'version',
+  'updateDetailLog': 'log tail',
   'addOpen': 'New todo',
   'addCancel': 'Cancel',
   'prioNone': 'None',
@@ -2179,6 +2193,40 @@ export function updateBadgeState(run, update, t) {
 }
 
 /**
+ * 失败诊断的一行摘要（导出供单测）：**步骤 / 命令 / 退出码 / 版本 / 日志尾部**。
+ *
+ * 只拼宿主已经给的事实，不猜、不编。面板把它放在失败徽标下面的一行小字里，
+ * 同时整段挂到 `title` 上（hover 可看全文）；用户报障时复制这段即可定位。
+ * @param {object|null} run 宿主状态（含 diagnostics）
+ * @param {(key: string) => string} t 文案函数
+ * @returns {string}
+ */
+export function updateFailureDetail(run, t) {
+  const diagnostics = run?.diagnostics;
+  if (!diagnostics || typeof diagnostics !== 'object') {
+    const current = run?.from ? String(run.from) : null;
+    const target = run?.to ?? run?.version ?? null;
+    return current || target
+      ? `${t('updateDetailVersion')}=${current ?? '?'}→${target ?? '?'}`
+      : '';
+  }
+  const parts = [];
+  if (diagnostics.step) parts.push(`${t('updateDetailStep')}=${diagnostics.step}`);
+  if (diagnostics.command) parts.push(`${t('updateDetailCommand')}=${diagnostics.command}`);
+  if (diagnostics.exitCode !== null && diagnostics.exitCode !== undefined) {
+    parts.push(`${t('updateDetailExit')}=${diagnostics.exitCode}`);
+  }
+  if (diagnostics.spawnError) parts.push(`${t('updateDetailSpawn')}=${diagnostics.spawnError}`);
+  if (diagnostics.currentVersion || diagnostics.target) {
+    parts.push(`${t('updateDetailVersion')}=${diagnostics.currentVersion ?? '?'}→${diagnostics.target ?? '?'}`);
+  }
+  if (Array.isArray(diagnostics.logTail) && diagnostics.logTail.length) {
+    parts.push(`${t('updateDetailLog')}=${diagnostics.logTail.slice(-3).join(' / ')}`);
+  }
+  return parts.join(' · ');
+}
+
+/**
  * 失败/不可用那一格。`linked` 不是故障（那是开发工作流），单独给说明且不给重试。
  * 重试按钮的动作由「失败发生在哪一步」决定：下载失败重试下载，安装失败重试安装。
  * @param {object|null} run 宿主状态
@@ -2191,19 +2239,24 @@ function failureBadge(run, t, view, forcedPhase = undefined) {
   if (reason === 'linked' || run?.failure === 'linked') {
     return view(t('updateLinked'), t('updateLinked'), 'warn', null, true, forcedPhase);
   }
-  const detail = String(run?.error ?? reason ?? '');
+  const reasonText = String(run?.error ?? reason ?? '');
+  const detail = updateFailureDetail(run, t);
   const downloadFailed = run?.failedOperation === 'download' || run?.failure === 'download' || run?.failure === 'download-network'
     || run?.failure === 'download-corrupt';
   // 失败要能重试：用户可能只是网络抖了一下；下载没完成时重试的是「下载」而不是「安装」
   const action = downloadFailed || !run?.download ? 'download' : 'retry';
-  return view(
-    `${downloadFailed ? t('updateDownloadFailed') : t('updateFailed')}：${detail}`,
-    `${t('updateRetryHint')}${detail ? ` — ${detail}` : ''}`,
+  const title = [t('updateRetryHint'), reasonText, detail].filter(Boolean).join(' — ');
+  const badge = view(
+    `${downloadFailed ? t('updateDownloadFailed') : t('updateFailed')}：${reasonText}`,
+    title,
     'error',
     action,
     false,
     forcedPhase,
   );
+  // 小字行：完整诊断（footer 会截断显示，title 里始终是全文）
+  badge.detail = detail;
+  return badge;
 }
 
 /**
@@ -2788,6 +2841,18 @@ function WorkTodoPanel(props) {
             }, updateBadge.text))
           : null,
       ]),
+      /* 失败详情：一行小字（完整内容在 title 里，可 hover 查看；只用文本节点，绝不拼 HTML）。
+         内容全部来自宿主 diagnostics：步骤 / 命令 / 退出码 / 目标与当前版本 / 日志尾部。 */
+      updateBadge?.detail
+        ? React.createElement('div', {
+          key: 'udetail',
+          className: 'wt-update-detail',
+          title: updateBadge.detail,
+          style: { color: C.label3, wordBreak: 'break-word', marginBottom: 2 },
+        }, `${t('updateFailureDetail')} · ${String(updateBadge.detail).length > 240
+          ? `${String(updateBadge.detail).slice(0, 240)}…`
+          : updateBadge.detail}`)
+        : null,
       storeLocationLabel(store, t)
         ? React.createElement('div', {
           key: 'store',

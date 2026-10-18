@@ -15,13 +15,13 @@ process.env.WORKTODO_NO_UPDATE_CHECK = '1';
 import { Readable } from 'node:stream';
 import { createServer } from 'node:http';
 import { spawnSync } from 'node:child_process';
-import { existsSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, win32 } from 'node:path';
 // DSH 判定「工具返回值是否 lossless JSON」用的就是这一个函数（见 assertLossless 的说明）
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { apply, shouldAutoUpdate, profileDirFromModuleUrl, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev } from '../lib/index.js';
+import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged } from '../lib/index.js';
 
 /**
  * 自动升级的跨重启节流状态文件默认落在 `$DSH_HOME/worktodo/update-state.json`（A4），
@@ -1321,6 +1321,36 @@ function writeFakePnpm(binDir, {
 }
 
 /**
+ * 写一个**用 node 直接跑**的假 pnpm（`pnpm.mjs`），服务 Windows 模拟：
+ * 真机 Windows 上 `spawn('pnpm')` 会 ENOENT（可执行文件是 `pnpm.cmd`），
+ * 修复后首选 `node <pnpm.mjs>`。这个假脚本能证明「子进程真的是 node + pnpm.mjs」：
+ * 它被跑起来才会写 capture；旧的裸 `pnpm` 路径在 macOS 模拟里根本不会执行到这里。
+ *
+ * @param {string} file `.mjs` 路径（WORKTODO_PNPM_PATH）
+ * @param {{capture: string, installVersion?: string|null, installProfile?: string|null}} options
+ * @returns {string}
+ */
+function writeFakePnpmMjs(file, { capture, installVersion = null, installProfile = null }) {
+  mkdirSync(dirname(file), { recursive: true });
+  const lines = [
+    "import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';",
+    `appendFileSync(${JSON.stringify(capture)}, 'INVOKE\\n' + process.argv.slice(2).join('\\n') + '\\n');`,
+  ];
+  if (installVersion && installProfile) {
+    const pkgDir = join(installProfile, 'node_modules', 'dsh-worktodo');
+    lines.push(
+      `if (process.argv[2] === 'add') {`,
+      `  mkdirSync(${JSON.stringify(pkgDir)}, { recursive: true });`,
+      `  writeFileSync(${JSON.stringify(join(pkgDir, 'package.json'))}, ${JSON.stringify(JSON.stringify({ name: 'dsh-worktodo', version: installVersion }, null, 2))});`,
+      '}',
+    );
+  }
+  lines.push('', '');
+  writeFileSync(file, lines.join('\n'));
+  return file;
+}
+
+/**
  * A1 的 ulimit 子场景（父用例 spawn 本文件时带 `--selfupdate-writefail-child`）。
  *
  * 只做一件事：在「写盘必然失败（EFBIG）」的进程里跑一次完整升级序列，然后把状态机原样打印出来。
@@ -2198,6 +2228,264 @@ await test('自升级：从模块自身路径精确反推 profile（多个 profi
   eq(profileDirFromModuleUrl(pathToFileURL(join(emptyLib, 'index.js')).href), null, '缺 package.json 不算 profile：');
 
   eq(profileDirFromModuleUrl('not a url'), null, '坏输入不能抛：');
+});
+
+await test('Windows 路径：file:///C:/... → C:\\...\\profiles\\desktop（反斜杠/盘符大小写/%20/UNC 都认）', () => {
+  // 1) 最常见的 Windows registry 安装布局（用户名用变量拼，避免 CI 隐私闸门把示例当真实家目录）
+  const user = 'u';
+  const winUrl = `file:///C:/Users/${user}/.dsh/profiles/desktop/node_modules/dsh-worktodo/lib/index.js`;
+  const winProfile = win32.join('C:\\Users\\u\\.dsh\\profiles\\desktop');
+  eq(profileDirFromModuleUrl(winUrl, { platform: 'win32', exists: () => true }), winProfile,
+    'Windows file URL 必须切出 C:\\...\\profiles\\desktop：');
+  eq(profileDirFromModuleUrl(winUrl, { platform: 'win32', exists: () => true }).includes('/'), false,
+    '返回的目录必须是 Windows 分隔符（不能混进 /）：');
+
+  // 2) 盘符小写：Windows 路径大小写不敏感，返回值按路径形状保留，但比较时必须等价
+  const lower = profileDirFromModuleUrl(
+    `file:///c:/users/${user}/.dsh/profiles/desktop/node_modules/dsh-worktodo/lib/index.js`,
+    { platform: 'win32', exists: () => true },
+  );
+  eq(lower.toLowerCase(), winProfile.toLowerCase(), '盘符/目录大小写不同也必须等价：');
+
+  // 3) %20：fileURLToPath 负责解码，绝不能把 %20 当目录名
+  const spaced = profileDirFromModuleUrl(
+    `file:///C:/Users/${user}/My%20Profile/profiles/desktop/node_modules/dsh-worktodo/lib/index.js`,
+    { platform: 'win32', exists: () => true },
+  );
+  eq(spaced, win32.join('C:\\Users\\u\\My Profile\\profiles\\desktop'), '%20 必须解码成空格：');
+
+  // 4) UNC：\\server\share\... 不能崩，也不能丢掉服务器名
+  const unc = profileDirFromModuleUrl(
+    'file://server/share/profiles/desktop/node_modules/dsh-worktodo/lib/index.js',
+    { platform: 'win32', exists: () => true },
+  );
+  eq(unc, '\\\\server\\share\\profiles\\desktop', 'UNC 路径必须原样保留 \\\\server\\share：');
+
+  // 5) 反斜杠写法（WORKTODO_PROFILE_DIR 注入）与 URL 推导等价
+  const injected = resolveOwnProfileDir({
+    platform: 'win32',
+    env: { WORKTODO_PROFILE_DIR: 'C:\\Users\\u\\.dsh\\profiles\\desktop' },
+  });
+  eq(injected, winProfile, '显式注入的反斜杠 profile 路径必须原样 resolve：');
+  eq(resolveOwnProfileDir({
+    platform: 'win32',
+    env: { WORKTODO_PROFILE_DIR: `C:/Users/${user}/.dsh/profiles/desktop` },
+  }), winProfile, '注入路径用正斜杠时也要归一成 Windows 形状：');
+
+  // 6) 目录里没有 package.json → 不算 profile（与 POSIX 同一规则）
+  eq(profileDirFromModuleUrl(winUrl, { platform: 'win32', exists: () => false }), null,
+    'Windows 路径也必须检查 profile 目录里的 package.json：');
+  eq(profileDirFromModuleUrl('file:///C:/C:/not-a-profile/lib/index.js', { platform: 'win32', exists: () => true }), null,
+    '没有 node_modules/dsh-worktodo 段时必须是 null（绝不猜目录）：');
+});
+
+await test('Windows 执行器：pnpm 必须走 node(pnpm.mjs) 或 pnpm.cmd+shell，绝不裸 spawn("pnpm")；CLI 拼 app.asar\\...\\cli.js', () => {
+  const resources = 'C:\\Users\\u\\AppData\\Local\\Programs\\DeepSeek Harness\\resources';
+  const execPath = 'C:\\Users\\u\\AppData\\Local\\Programs\\DeepSeek Harness\\DeepSeek Harness.exe';
+  const bundledPnpm = win32.join(resources, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs');
+  const cliPath = win32.join(resources, 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js');
+  const archivePath = win32.join(resources, 'app.asar');
+  // pnpm 看的是 pnpm.mjs 本体；CLI 看的是 **app.asar 归档文件**（asar 内部路径普通 fs 看不见）
+  const pnpmExists = (candidate) => candidate === bundledPnpm;
+  const cliExists = (candidate) => candidate === archivePath;
+
+  // 1) 首选：同一进程的 node + 自带 pnpm.mjs（无 shell，argv 里带空格的路径不会被拆开）
+  const pnpm = resolvePnpmUpdater({ platform: 'win32', resourcesPath: resources, execPath, exists: pnpmExists, env: {} });
+  eq(pnpm.command, execPath, '自带 pnpm 必须用 process.execPath 跑，而不是 PATH 上的 pnpm：');
+  eq(pnpm.args, [bundledPnpm], 'pnpm.mjs 必须作为一个完整 argv 传入（路径含空格也不能拆）：');
+  eq(pnpm.env.ELECTRON_RUN_AS_NODE, '1', 'Electron 下必须带 ELECTRON_RUN_AS_NODE=1：');
+  eq(pnpm.shell, false, '首选路径绝不经 shell（绕开 Windows 引号/空格问题）：');
+  eq(pnpm.windowsHide, true, '所有 spawn 都必须 windowsHide: true：');
+  eq(pnpm.command === 'pnpm', false, 'Windows 上绝不能裸 spawn("pnpm")（它是 pnpm.cmd，CreateProcess 解析不到）：');
+  eq(bundledPnpmCandidates({ platform: 'win32', resourcesPath: resources, execPath }).includes(bundledPnpm), true,
+    '候选路径必须包含 runtime/<name>/dependencies/pnpm/bin/pnpm.mjs 这一真实布局：');
+  const steps = buildUpdateSteps({ cli: null, pnpm, profileName: 'desktop', registry: 'https://registry.npmjs.org/', target: '0.2.6' });
+  eq(steps[0].args[0], bundledPnpm, 'pnpm 步骤的第一个 argv 必须是完整的 pnpm.mjs 路径：');
+
+  // 2) 找不到自带 pnpm.mjs：Windows 兜底必须是 pnpm.cmd + shell（仍带 windowsHide）
+  const fallback = resolvePnpmUpdater({ platform: 'win32', resourcesPath: null, execPath, exists: () => false, env: {} });
+  eq(fallback.command, 'pnpm.cmd', 'Windows 兜底命令必须是 pnpm.cmd：');
+  eq(fallback.command === 'pnpm', false, '兜底也绝不能是裸 pnpm：');
+  eq(fallback.shell, true, 'pnpm.cmd 必须配 shell: true，否则 cmd 脚本起不来：');
+  eq(fallback.windowsHide, true, '兜底 spawn 也要 windowsHide: true：');
+
+  // 3) POSIX 保持原样（回归：别把 Windows 修复带成 macOS/Linux 的回归）
+  const posix = resolvePnpmUpdater({ platform: 'darwin', resourcesPath: null, execPath: '/usr/local/bin/node', exists: () => false, env: {} });
+  eq(posix.command, 'pnpm', 'POSIX 仍用 PATH 上的 pnpm：');
+  eq(posix.shell, false, 'POSIX 不需要 shell：');
+  eq(posix.windowsHide, true, 'POSIX 也统一带 windowsHide（无害）：');
+
+  // 4) CLI：Windows resourcesPath 必须拼成 resources\app.asar\...\cli.js
+  const cli = resolveCliUpdater({ platform: 'win32', resourcesPath: resources, execPath, exists: cliExists });
+  eq(cli.command, execPath, 'CLI 也必须用官方 node 可执行文件（Electron 二进制）：');
+  eq(cli.args[0], '--expose-internals', 'CLI 启动参数要保留 --expose-internals：');
+  eq(cli.args[1], cliPath, 'Windows 上必须拼出 resources\\app.asar\\...\\cli.js：');
+  eq(cli.args[1].includes('app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host\\lib\\cli.js'), true,
+    'CLI 路径必须是 Windows 反斜杠形状：');
+  eq(cli.env.ELECTRON_RUN_AS_NODE, '1', '跑 asar 内 CLI 必须 ELECTRON_RUN_AS_NODE=1：');
+  eq(cli.env.DSH_DESKTOP_NODE_EXECUTABLE, execPath, 'CLI 必须带上官方启动器同款 DSH_DESKTOP_NODE_EXECUTABLE：');
+  const cliViaEnv = resolveCliUpdater({
+    platform: 'win32', resourcesPath: resources, execPath: 'C:\\stale\\electron.exe', exists: cliExists,
+    env: { DSH_DESKTOP_NODE_EXECUTABLE: execPath },
+  });
+  eq(cliViaEnv.command, execPath, 'DSH_DESKTOP_NODE_EXECUTABLE 必须优先于 process.execPath：');
+  eq(cli.shell, false, 'CLI 不经 shell：');
+  eq(cli.windowsHide, true, 'CLI spawn 也要 windowsHide: true：');
+  eq(resolveCliUpdater({ platform: 'win32', resourcesPath: resources, execPath, exists: () => false }), null,
+    '拿不到 CLI 必须返回 null，交给 pnpm 兜底（不能瞎猜一个不存在的路径）：');
+});
+
+await test('Windows 原子写：rename 覆盖失败 → 先删目标再 rename；仍失败 → 明确报错且不留半文件', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'worktodo-win-atomic-'));
+  const file = join(dir, 'package.json');
+  const tmpFiles = () => readdirSync(dir).filter((name) => name.includes('.worktodo-tmp-'));
+  try {
+    writeFileSync(file, 'old-content');
+
+    // 1) 第一次 rename 抛 EPERM（目标被占用/只读）→ 先删目标，再 rename 成功
+    let renameCalls = 0;
+    const renameFirstFails = (from, to) => {
+      renameCalls += 1;
+      if (renameCalls === 1) {
+        const error = new Error('EPERM: operation not permitted, rename');
+        error.code = 'EPERM';
+        throw error;
+      }
+      renameSync(from, to);
+    };
+    writeFileAtomicSync(file, 'new-content', { platform: 'win32', rename: renameFirstFails });
+    eq(readFileSync(file, 'utf8'), 'new-content', 'Windows rename 失败后必须先删目标、再 rename 成功：');
+    eq(renameCalls, 2, '应当恰好重试一次 rename：');
+    eq(tmpFiles(), [], '成功后不能留下临时文件：');
+
+    // 2) 目标被占用且删不掉 → 必须明确报 Windows 原子写失败，原文件一个字节都不动，临时文件清掉
+    writeFileSync(file, 'keep-me');
+    let threw = null;
+    try {
+      writeFileAtomicSync(file, 'must-not-land', {
+        platform: 'win32',
+        rename: () => { const error = new Error('EBUSY'); error.code = 'EBUSY'; throw error; },
+        unlink: (target) => {
+          if (target === file) { const error = new Error('EPERM: locked'); error.code = 'EPERM'; throw error; }
+          unlinkSync(target); // 清理临时文件必须还能成功
+        },
+      });
+    } catch (error) {
+      threw = error;
+    }
+    eq(Boolean(threw), true, '连目标都删不掉时必须抛错（不能假装写成功）：');
+    eq(String(threw?.message).includes('Windows 原子写失败'), true, `错误必须是明确的 Windows 原子写失败：${threw?.message}`);
+    eq(readFileSync(file, 'utf8'), 'keep-me', '失败时原文件必须保持旧内容（绝不半写）：');
+    eq(tmpFiles(), [], '失败后也不能留下临时文件：');
+
+    // 3) 非 Windows：rename 失败不吞、不删目标（保持原行为）
+    writeFileSync(file, 'posix-old');
+    let posixError = null;
+    try {
+      writeFileAtomicSync(file, 'posix-new', {
+        platform: 'darwin',
+        rename: () => { const error = new Error('EPERM'); error.code = 'EPERM'; throw error; },
+      });
+    } catch (error) {
+      posixError = error;
+    }
+    eq(Boolean(posixError), true, 'POSIX rename 失败也必须抛：');
+    eq(String(posixError?.message).includes('Windows 原子写失败'), false, 'POSIX 不该走 Windows 专用错误文案：');
+    eq(readFileSync(file, 'utf8'), 'posix-old', 'POSIX 失败时原文件不动：');
+    eq(tmpFiles(), [], 'POSIX 失败后也要清临时文件：');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('Windows 假成功护栏：落盘版本没变（含 null）绝不算升级成功；变了才算', () => {
+  eq(installedVersionChanged('0.2.5', '0.2.5'), false, '版本没变必须判失败（退出码 0 不算数）：');
+  eq(installedVersionChanged('0.2.5', '0.2.6'), true, '版本真的变了才算成功：');
+  eq(installedVersionChanged('0.2.5', null), false, '读不到落盘版本 = 不能声称成功：');
+  eq(installedVersionChanged(null, '0.2.6'), true, '原来没装、现在装上了：');
+  eq(installedVersionChanged('0.2.5', '0.2.4'), true, '版本变了（即使是降级）也要如实判定「变了」，由上层比对目标：');
+});
+
+await test('自升级（Windows 模拟端到端）：pnpm 由 node 跑 pnpm.mjs；命令成功但版本没变 → failed + 可读诊断', async () => {
+  const profile = makeFakeProfile('win32-noop', '^0.2.5');
+  seedInstalledVersion(profile, '0.2.5');
+  const capture = join(selfUpdateRoot, 'capture-win32-noop.txt');
+  const fakePnpm = writeFakePnpmMjs(join(selfUpdateRoot, 'fake-pnpm-win32-noop.mjs'), { capture });
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+  try {
+    await withEnv({
+      // 关键：命令形状按 Windows 解析，但 profile 仍是临时 POSIX 目录（不碰真实数据）
+      WORKTODO_PLATFORM: 'win32',
+      WORKTODO_PROFILE_DIR: profile,
+      WORKTODO_PNPM_PATH: fakePnpm,
+      WORKTODO_UPDATE_LATEST: '0.2.6',
+    }, async () => {
+      const response = await triggerUpdate(host);
+      eq(response.json().ok, true, `触发升级不该被拒：${JSON.stringify(response.json())}`);
+      const status = await waitForUpdateEnd(host, 8000);
+      eq(status?.state, 'failed', `版本没变绝不能报 done（实际 ${status?.state}）：`);
+      eq(status?.reason, 'version-unchanged', `原因必须是 version-unchanged：${status?.reason}`);
+      eq(String(status?.error).includes('落盘版本未变'), true, `error 必须说清版本没变：${status?.error}`);
+
+      // 真子进程证据：只有 node 真的跑起了 pnpm.mjs，capture 里才会有 INVOKE
+      const invocations = readInvocations(capture);
+      eq(invocations.length > 0, true, `必须真的用 node 跑了 pnpm.mjs（capture=${JSON.stringify(invocations)}）：`);
+      eq(invocations[0][0], 'update', `假 pnpm 收到的第一个参数应是 update：${JSON.stringify(invocations[0])}`);
+      const added = invocations.find((argv) => argv[0] === 'add');
+      eq(Boolean(added), true, `版本没变时必须继续尝试 pnpm add：${JSON.stringify(invocations)}`);
+
+      // 诊断：失败步骤 + 命令 + 退出码 + 目标/当前版本 + 日志尾部，GET 状态里必须可读
+      const d = status?.diagnostics;
+      eq(Boolean(d), true, `失败状态必须带 diagnostics：${JSON.stringify(status)}`);
+      eq(d.step, 'pnpm-add-exact', `诊断要指出最后失败在 add 这一步：${d.step}`);
+      eq(String(d.command).includes('pnpm add'), true, `诊断要带命令：${d.command}`);
+      eq(d.exitCode, 0, `命令退出码要如实记录（0 也要显示，才能证明「命令成功≠升级成功」）：${d.exitCode}`);
+      eq(d.target, '0.2.6', `诊断要有目标版本：${d.target}`);
+      eq(d.currentVersion, '0.2.5', `诊断要有当前版本：${d.currentVersion}`);
+      eq(d.installedVersion, '0.2.5', `诊断要有落盘版本：${d.installedVersion}`);
+      eq(d.platform, 'win32', `诊断要标明模拟的平台：${d.platform}`);
+      eq(d.pnpm.command, process.execPath, `Windows 模拟下 pnpm 必须由 node 执行：${d.pnpm.command}`);
+      eq(d.pnpm.source, 'override-script', `诊断要能看出执行器来源：${d.pnpm.source}`);
+      eq(d.pnpm.shell, false, '首选路径不该经 shell：');
+      eq(Array.isArray(d.logTail), true, '诊断要带日志尾部数组：');
+      eq(Array.isArray(d.argv) && d.argv.includes('add'), true, `诊断要带真实 argv：${JSON.stringify(d.argv)}`);
+
+      // GET /worktodo/update（面板轮询/排查走这条）同样要带诊断
+      const viaGet = (await readUpdateState(host)).json().data;
+      eq(viaGet?.diagnostics?.step, 'pnpm-add-exact', `GET /update 也要能读到失败步骤：${JSON.stringify(viaGet?.diagnostics)}`);
+      eq(Array.isArray(viaGet?.diagnostics?.logTail), true, 'GET /update 要带完整日志尾部：');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('自升级（Windows 模拟端到端）：假 pnpm 真的换掉落盘版本 → done（正对照，证明护栏不是永远失败）', async () => {
+  const profile = makeFakeProfile('win32-success', '^0.2.5');
+  seedInstalledVersion(profile, '0.2.5');
+  const capture = join(selfUpdateRoot, 'capture-win32-success.txt');
+  const fakePnpm = writeFakePnpmMjs(join(selfUpdateRoot, 'fake-pnpm-win32-success.mjs'), {
+    capture, installVersion: '0.2.6', installProfile: profile,
+  });
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+  try {
+    await withEnv({
+      WORKTODO_PLATFORM: 'win32',
+      WORKTODO_PROFILE_DIR: profile,
+      WORKTODO_PNPM_PATH: fakePnpm,
+      WORKTODO_UPDATE_LATEST: '0.2.6',
+    }, async () => {
+      await triggerUpdate(host);
+      const status = await waitForUpdateEnd(host, 8000);
+      eq(status?.state, 'done', `版本真的变了就必须 done（实际 ${status?.state}，error=${status?.error}）：`);
+      eq(status?.installed, '0.2.6', `done 必须报落盘的新版本：${status?.installed}`);
+      eq(status?.diagnostics ?? null, null, '成功时不该留失败诊断：');
+      const onDisk = JSON.parse(readFileSync(join(profile, 'node_modules', 'dsh-worktodo', 'package.json'), 'utf8')).version;
+      eq(onDisk, '0.2.6', '成功判定只认落盘 node_modules 里的版本：');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 await test('自升级：配置默认值——autoUpdate/autoInstall 默认 true（显式 false 才关）、官方源、180s，非法值一律回落', async () => {

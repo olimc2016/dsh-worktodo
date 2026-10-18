@@ -1198,6 +1198,72 @@ test('updateBadgeState：有新版=可下载；装好待重启=只报重启、�
   eq(mod.updateBadgeState(null, null, t), null);
 });
 
+test('updateBadgeState：失败详情包含步骤/命令/退出码/版本/日志尾部（中英双语键，不 innerHTML）', () => {
+  const zh = (key) => ({
+    updateFailureDetail: '详情',
+    updateDetailStep: '步骤',
+    updateDetailCommand: '命令',
+    updateDetailExit: '退出码',
+    updateDetailSpawn: '启动错误',
+    updateDetailVersion: '版本',
+    updateDetailLog: '日志尾部',
+  }[key] ?? key);
+  const en = (key) => ({
+    updateFailureDetail: 'Details',
+    updateDetailStep: 'step',
+    updateDetailCommand: 'command',
+    updateDetailExit: 'exit code',
+    updateDetailSpawn: 'spawn error',
+    updateDetailVersion: 'version',
+    updateDetailLog: 'log tail',
+  }[key] ?? key);
+  const run = {
+    state: 'failed',
+    phase: 'failed',
+    reason: 'version-unchanged',
+    error: '命令执行成功但 dsh-worktodo 落盘版本未变',
+    from: '0.2.5',
+    diagnostics: {
+      step: 'pnpm-add-exact',
+      command: 'pnpm add dsh-worktodo@0.2.6 --save-exact',
+      exitCode: 0,
+      currentVersion: '0.2.5',
+      target: '0.2.6',
+      platform: 'win32',
+      logTail: ['ERR_PNPM_NO_MATCHING_VERSION', 'added 0'],
+      pnpm: { command: 'node', shell: false },
+    },
+  };
+  const badge = mod.updateBadgeState(run, null, zh);
+  eq(badge.action, 'download', '失败态仍要能重试（没下载过时先重试下载）：');
+  eq(badge.tone, 'error');
+  eq(badge.text.includes('落盘版本未变'), true, `失败原因要显示：${badge.text}`);
+  eq(typeof badge.detail, 'string', '失败态必须带一行可读详情：');
+  for (const part of [
+    '步骤=pnpm-add-exact',
+    '命令=pnpm add dsh-worktodo@0.2.6',
+    '退出码=0',
+    '版本=0.2.5→0.2.6',
+    '日志尾部=ERR_PNPM_NO_MATCHING_VERSION / added 0',
+  ]) {
+    eq(badge.detail.includes(part), true, `详情缺少「${part}」：${badge.detail}`);
+    eq(badge.title.includes(part), true, `title（hover 全文）缺少「${part}」：${badge.title}`);
+  }
+  // 中英双语：同一份宿主诊断换英文文案键也必须成立
+  const english = mod.updateBadgeState(run, null, en);
+  for (const part of ['step=pnpm-add-exact', 'command=pnpm add', 'exit code=0', 'version=0.2.5→0.2.6', 'log tail=ERR_PNPM']) {
+    eq(english.detail.includes(part), true, `英文详情缺少「${part}」：${english.detail}`);
+  }
+  // 老宿主没有 diagnostics 时，只回落到版本，不编造步骤/退出码
+  const legacy = mod.updateBadgeState({ state: 'failed', reason: 'exit-nonzero', error: '退出码 3', from: '0.2.5', to: '0.2.6' }, null, zh);
+  eq(legacy.detail.includes('版本=0.2.5→0.2.6'), true);
+  eq(legacy.detail.includes('退出码=3'), false, '没有 diagnostics 时不能凭空编退出码：');
+  // linked 不是故障：不给「详情」行（也不给重试）
+  const linked = mod.updateBadgeState({ state: 'failed', reason: 'linked', error: 'link: 安装' }, null, zh);
+  eq(linked.detail, undefined, 'linked 不该有失败详情：');
+  eq(linked.action, null);
+});
+
 test('页脚：有新版时渲染成可点的按钮；进行中是只读状态（不是按钮）', () => {
   const t = (key) => key;
   const previous = fakeListPayload.data.update;
@@ -1220,6 +1286,45 @@ test('页脚：有新版时渲染成可点的按钮；进行中是只读状态�
     eq(busy[0].props.role, 'status', '只读状态要标 role=status：');
     eq(busy[0].props['aria-label'], 'updating v0.2.4', '状态徽标也要有 aria-label：');
     eq(textOf(busy[0]).includes('updating'), true, `进行中要变成「正在更新…」：${textOf(busy[0])}`);
+  } finally {
+    fakeListPayload.data.update = previous;
+  }
+});
+
+test('页脚：失败时渲染一行详情（title 里是全文），且不使用 innerHTML', () => {
+  const t = (key) => ({
+    updateFailureDetail: '详情',
+    updateDetailStep: '步骤',
+    updateDetailCommand: '命令',
+    updateDetailExit: '退出码',
+    updateDetailVersion: '版本',
+    updateDetailLog: '日志尾部',
+  }[key] ?? key);
+  const previous = fakeListPayload.data.update;
+  try {
+    fakeListPayload.data.update = {
+      current: '0.2.5', latest: '0.2.6', hasUpdate: true,
+      run: {
+        state: 'failed', phase: 'failed', reason: 'version-unchanged', from: '0.2.5',
+        error: '命令执行成功但落盘版本未变',
+        diagnostics: {
+          step: 'pnpm-add-exact',
+          command: 'pnpm add dsh-worktodo@0.2.6 --save-exact',
+          exitCode: 0,
+          currentVersion: '0.2.5',
+          target: '0.2.6',
+          logTail: ['ERR_PNPM_NO_MATCHING_VERSION'],
+        },
+      },
+    };
+    const nodes = flattenTree(renderPanel({ t }));
+    const details = nodes.filter((n) => String(n.props?.className ?? '').includes('wt-update-detail'));
+    eq(details.length, 1, `失败态必须渲染恰好一行详情：${details.length}`);
+    eq(textOf(details[0]).includes('详情'), true, `详情行要有「详情」前缀：${textOf(details[0])}`);
+    eq(textOf(details[0]).includes('pnpm-add-exact'), true, `详情行要显示失败步骤：${textOf(details[0])}`);
+    eq(String(details[0].props.title).includes('日志尾部=ERR_PNPM_NO_MATCHING_VERSION'), true,
+      `hover 的 title 要是全文（含日志尾部）：${details[0].props.title}`);
+    eq(details[0].props.dangerouslySetInnerHTML, undefined, '详情只能用文本节点，绝不能 innerHTML：');
   } finally {
     fakeListPayload.data.update = previous;
   }
