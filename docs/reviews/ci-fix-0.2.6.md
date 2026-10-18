@@ -12,7 +12,7 @@
 CI 日志副本在 `/tmp/f26/`。失败 job 是 **publish**（`publish.yml`，tag `v0.2.6`），
 不是 test matrix 的那两个 job：
 
-- `/tmp/f26/publish/4_Run actions_setup-node@v4.txt:3`：`node-version: 22`
+- `/tmp/f26/publish/4_Run actions_setup-node at v4 txt:3`：`node-version: 22`
 - 同文件 `:16`：`node: v22.23.3`
 - 失败汇总：`/tmp/f26/0_publish.txt:915-922` → 宿主接线与工具、客户端↔宿主契约两个 suite 红，
   `8/10 个步骤通过（含构建）`
