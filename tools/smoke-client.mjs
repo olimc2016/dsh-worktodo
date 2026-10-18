@@ -162,7 +162,7 @@ function shallowEqualProps(a, b) {
 const effectRuns = [];
 /** effect 返回的清理函数，收起来验证面板确实做了回收。 */
 const effectCleanups = [];
-/** 组件请求过的状态更新（setter 是空实现，只记录「刷新被请求过」）。 */
+/** 组件请求过的状态更新：`{slot, next}`，slot 用于区分「刷新 tick」与其他 setState。 */
 const stateUpdates = [];
 
 /* 定时器替身：记录面板注册的自动刷新定时器，验证「有轮询且卸载时清掉」。 */
@@ -222,15 +222,15 @@ const stubReact = {
       if (!hookCache.has(id)) hookCache.set(id, { value: typeof init === 'function' ? init() : init });
       const slot = hookCache.get(id);
       return [slot.value, (next) => {
-        stateUpdates.push(next);
+        stateUpdates.push({ slot: id, next });
         slot.value = typeof next === 'function' ? next(slot.value) : next;
       }];
     }
-    return [typeof init === 'function' ? init() : init, (next) => { stateUpdates.push(next); }];
+    return [typeof init === 'function' ? init() : init, (next) => { stateUpdates.push({ slot: id, next }); }];
   },
   useReducer: (reducer, init) => {
-    hookSlotId();
-    return [typeof init === 'function' ? init() : init, (next) => { stateUpdates.push(next); }];
+    const id = hookSlotId();
+    return [typeof init === 'function' ? init() : init, (next) => { stateUpdates.push({ slot: id, next }); }];
   },
   // 真的执行 effect：否则「组件挂载后去拉列表」这条最关键的路径根本不会被测到
   useEffect(fn) {
@@ -265,18 +265,37 @@ const stubReact = {
 
 /** 开一段「同一实例被反复渲染」的窗口：状态/回调/memo 缓存按位置保留，计数从 0 起。 */
 function withStableHooks(run) {
+  resetStableWindow();
+  stableHooks = true;
+  try {
+    return run();
+  } finally {
+    stableHooks = false;
+  }
+}
+
+/**
+ * 异步版：写操作要等 fetch/微任务落地才能看到 setState/定时器，
+ * 而同步版会在第一个 await 处就把 stableHooks 关掉。
+ */
+async function withStableHooksAsync(run) {
+  resetStableWindow();
+  stableHooks = true;
+  try {
+    return await run();
+  } finally {
+    stableHooks = false;
+  }
+}
+
+/** 清掉上一条用例留下的 hook/memo 缓存（窗口之间互不串味）。 */
+function resetStableWindow() {
   hookCache.clear();
   memoStores.clear();
   for (const type of memoizedTypes) {
     type.__meta.renders = 0;
     type.__meta.bailouts = 0;
     type.__meta.lastNode = null;
-  }
-  stableHooks = true;
-  try {
-    return run();
-  } finally {
-    stableHooks = false;
   }
 }
 
@@ -1444,6 +1463,48 @@ console.log('项目选择器（快速添加第二行：日期 → 时间 → 优
 const settleList = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /**
+ * 假定时器：只接管 setTimeout / clearTimeout，记录面板排的定时器，由用例显式推进。
+ * `flush` 用**真实** setTimeout 等一次宏任务，把 fetch/await 链放完（不受假定时器影响）。
+ * setInterval 在文件顶部早已被全局替身接管，不受这里影响。
+ */
+function installFakeTimers() {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const timers = [];
+  globalThis.setTimeout = (fn, ms) => {
+    const handle = { fn, ms, cleared: false, unref() {} };
+    timers.push(handle);
+    return handle;
+  };
+  globalThis.clearTimeout = (handle) => { if (handle) handle.cleared = true; };
+  return {
+    timers,
+    flush: () => new Promise((resolve) => realSetTimeout(resolve, 0)),
+    restore: () => {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    },
+  };
+}
+
+/**
+ * 点一下顶部「刷新」按钮，从它产生的唯一一次 setState 反推出 tick 状态槽 id。
+ * 有了槽 id，就能把「刷新发生了几次」和 setPending / 乐观态等其他 setState 区分开。
+ */
+function tickSlotId(tree) {
+  const button = allNodes(tree).find((n) => n.type === 'button' && n.props?.title === '[refresh]');
+  eq(Boolean(button), true, '面板顶部必须有刷新按钮（用它定位 tick 状态槽）：');
+  const before = stateUpdates.length;
+  button.props.onClick();
+  const record = stateUpdates[before];
+  eq(Boolean(record) && typeof record.slot === 'string', true, '刷新按钮必须只触发一次 tick 状态更新：');
+  return record.slot;
+}
+
+/** 某个状态槽被更新过几次（用来数「刷新发生了几次」）。 */
+const slotUpdateCount = (slot) => stateUpdates.filter((update) => update?.slot === slot).length;
+
+/**
  * 统一的取节点列表：传渲染树（对象）就摊平，传已经摊平过的数组就原样用。
  * 直接用 flattenTree(array) 会把每个节点连同它的后代再数一遍（深度重复），踩过一次。
  */
@@ -2182,14 +2243,254 @@ await testAsync('prefers-reduced-motion: 系统要求减少动效时连动效类
     eq(mod.STYLE_TEXT.includes('@media (prefers-reduced-motion: reduce)'), true, 'CSS 必须有 reduced-motion 降级：');
     eq(/@media \(prefers-reduced-motion: reduce\)[\s\S]*animation: none !important/.test(mod.STYLE_TEXT), true,
       '降级块里必须真的把 animation 关掉：');
-    // 动效总时长必须克制
-    eq(mod.CELEBRATE_MS <= 600, true, `庆祝动效总时长必须 ≤600ms（实际 ${mod.CELEBRATE_MS}）：`);
-    eq(mod.STYLE_TEXT.includes('560ms') && mod.STYLE_TEXT.includes('320ms') && mod.STYLE_TEXT.includes('300ms'), true,
-      '三段动画的时长都要写死在样式表里（便于审计）：');
+    // 动效总时长必须「从容但不拖沓」：1.1–1.3s，且刷新排在动画之后
+    eq(mod.CELEBRATE_MS >= 1100 && mod.CELEBRATE_MS <= 1300, true,
+      `庆祝动效总时长必须落在 1.1–1.3s（实际 ${mod.CELEBRATE_MS}ms）：`);
+    eq(mod.CELEBRATE_REFRESH_MS > mod.CELEBRATE_MS, true,
+      '刷新必须排在动画结束之后（早一帧都会把最后一帧截掉）：');
+    eq(mod.STYLE_TEXT.includes(`${mod.CHECK_POP_MS}ms`), true, '勾选框时长要写死在样式表里（便于审计）：');
     eq(mod.STYLE_TEXT.includes('stroke-dashoffset'), true, '对勾必须是描边出现（stroke-dashoffset 动画）：');
     eq(mod.STYLE_TEXT.includes('stroke-dasharray'), true);
   } finally {
     globalThis.window.matchMedia = savedMatchMedia;
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * 完成动效的「从容」调校（本轮）
+ *
+ * 旧实现：勾选框 320ms 弹跳 / 描边 300ms / 整行 560ms，且写成功立刻 refresh，
+ * 动画还没播完行就被重新归组 —— 观感就是「一闪而过」。
+ * 这里钉住三件事：节拍常量、刷新被延后、降级路径仍然立即刷新。
+ * 反向验证：把 620ms 改回 320ms → 第一节变红；把延后刷新改回立即 → 第二节变红。
+ * ------------------------------------------------------------------ */
+
+console.log('完成动效调校：节拍 / 延迟刷新 / 降级立即刷新 / 清理');
+
+await testAsync('完成动效节拍：勾选框 600–700ms、对勾 480–560ms 且 delay>0、整行 1000–1300ms', async () => {
+  const style = mod.STYLE_TEXT;
+  const pop = /\.wt-check-celebrate \{ animation: wt-check-pop (\d+)ms ([^;]+); \}/.exec(style);
+  const mark = /animation: wt-mark-draw (\d+)ms ([^\s;]+) (\d+)ms/.exec(style);
+  const row = /animation: wt-row-celebrate (\d+)ms ([^\s;]+) (\d+)ms/.exec(style);
+  const title = /animation: wt-title-settle (\d+)ms ([^\s;]+) (\d+)ms/.exec(style);
+
+  eq(Boolean(pop), true, '样式表里必须找得到 wt-check-pop 的 animation 声明：');
+  eq(Boolean(mark), true, '样式表里必须找得到 wt-mark-draw 的 animation 声明：');
+  eq(Boolean(row), true, '样式表里必须找得到 wt-row-celebrate 的 animation 声明：');
+  eq(Boolean(title), true, '样式表里必须找得到 wt-title-settle 的 animation 声明：');
+
+  const popMs = Number(pop[1]);
+  const markMs = Number(mark[1]);
+  const markDelay = Number(mark[3]);
+  const rowMs = Number(row[1]);
+  const rowDelay = Number(row[3]);
+  const titleMs = Number(title[1]);
+
+  eq(popMs >= 600 && popMs <= 700, true, `勾选框时长必须在 600–700ms（实际 ${popMs}ms）：`);
+  eq(popMs, mod.CHECK_POP_MS, '样式表与导出的 CHECK_POP_MS 必须一致：');
+  eq(markMs >= 480 && markMs <= 560, true, `对勾描边时长必须在 480–560ms（实际 ${markMs}ms）：`);
+  eq(markMs, mod.MARK_DRAW_MS, '样式表与导出的 MARK_DRAW_MS 必须一致：');
+  eq(markDelay > 0, true, `对勾必须有正延迟（实际 ${markDelay}ms）：`);
+  eq(markDelay, mod.MARK_DRAW_DELAY_MS, '样式表与导出的 MARK_DRAW_DELAY_MS 必须一致：');
+  eq(rowMs >= 1000 && rowMs <= 1300, true, `整行过渡时长必须在 1000–1300ms（实际 ${rowMs}ms）：`);
+  eq(rowMs, mod.ROW_CELEBRATE_MS, '样式表与导出的 ROW_CELEBRATE_MS 必须一致：');
+  eq(rowDelay, mod.ROW_CELEBRATE_DELAY_MS, '整行延迟必须来自常量：');
+  eq(titleMs, mod.TITLE_SETTLE_MS, '标题变灰时长必须来自常量：');
+  eq(mod.CELEBRATE_MS, rowDelay + rowMs, 'CELEBRATE_MS 必须是「整行 delay + duration」：');
+  eq(mod.CELEBRATE_REFRESH_MS > mod.CELEBRATE_MS, true, '刷新延迟必须晚于动画结束：');
+  eq(mod.CELEBRATE_REFRESH_MS <= mod.CELEBRATE_MS + 200, true, '刷新延迟不能拖得太久（落位要跟手）：');
+
+  // 缓动：柔和收尾，不许再有回弹过冲
+  eq(pop[2].includes('cubic-bezier(0.22, 0.61, 0.36, 1)') || pop[2].includes('ease-out'), true,
+    `勾选框缓动必须柔和（实际 ${pop[2]}）：`);
+  eq(/1\.56/.test(pop[2]), false, `勾选框缓动不许带过冲回弹（实际 ${pop[2]}）：`);
+  eq(style.includes('scale(1.06)'), true, '勾选框只做 1 → 1.06 → 1 的轻微呼吸：');
+  eq(style.includes('scale(1.32)'), false, '不许再出现 1.32 那种弹跳：');
+  // 整行背景必须缓慢淡出，标题颜色走主题里的柔和灰
+  eq(/wt-row-celebrate[\s\S]*?100% \{ background: transparent; \}/.test(style), true,
+    '整行背景必须淡出到透明（不能一眼就没）：');
+  eq(/wt-title-settle[\s\S]*?to \{ color: var\(--dsw-alias-label-tertiary\); \}/.test(style), true,
+    '标题必须过渡到主题的 label-tertiary：');
+  eq(mod.STYLE_TEXT.includes('stroke-dashoffset'), true, '对勾必须是 stroke-dashoffset 描边动画：');
+});
+
+await testAsync('刷新被延后：完成动效播完前不刷新，假定时器推进后恰好刷新一次', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const clock = installFakeTimers();
+  try {
+    await withStableHooksAsync(async () => {
+      const t = mkT();
+      const tree = renderPanel({ t });
+      const tickSlot = tickSlotId(tree);
+      const before = slotUpdateCount(tickSlot);
+      const statusBefore = fetchCalls.filter((call) => call.url.includes('/worktodo/status')).length;
+
+      checkOf(tree, 'wt-1').props.onClick(); // 勾选完成 → 播动效
+      await clock.flush();
+
+      const statusPosts = fetchCalls.filter((call) => call.url.includes('/worktodo/status'))
+        .slice(statusBefore);
+      eq(statusPosts.length, 1, `写请求必须只发一次（实际 ${statusPosts.length}）：`);
+      eq(JSON.parse(statusPosts[0].options.body), { ref: 'wt-1', toggle: true }, '写报文必须仍是 toggle：');
+
+      const pending = clock.timers.filter((handle) => !handle.cleared);
+      eq(clock.timers.length, 1, `完成写入后只该排一个待刷新定时器（实际 ${clock.timers.length}）：`);
+      eq(pending.length, 1, '动画播完前定时器必须还挂着（绝不许写成功就刷新）：');
+      eq(pending[0].ms, mod.CELEBRATE_REFRESH_MS, '延后时长必须是 CELEBRATE_REFRESH_MS：');
+      eq(pending[0].ms >= mod.CELEBRATE_MS, true, '刷新不得早于动画总时长：');
+      eq(slotUpdateCount(tickSlot) - before, 0,
+        `动画结束前刷新发生了 ${slotUpdateCount(tickSlot) - before} 次（必须为 0）：`);
+
+      pending[0].fn(); // 假定时器推进到「动画播完」
+      await clock.flush();
+      eq(pending[0].cleared, false, '触发后的定时器不应再被当成待清理：');
+      eq(slotUpdateCount(tickSlot) - before, 1, '假定时器推进后必须恰好刷新一次：');
+    });
+  } finally {
+    clock.restore();
+  }
+});
+
+await testAsync('reduced-motion / celebrate:false：不排延迟定时器，写完立即刷新', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const savedMatchMedia = globalThis.window.matchMedia;
+  const savedPanel = fakeListPayload.data.panel;
+
+  // 1) 系统要求减少动态效果
+  globalThis.window.matchMedia = () => ({ matches: true });
+  const reduceClock = installFakeTimers();
+  try {
+    await withStableHooksAsync(async () => {
+      const t = mkT();
+      renderPanel({ t });
+      await reduceClock.flush();
+      const tree = renderPanel({ t });
+      const tickSlot = tickSlotId(tree);
+      const before = slotUpdateCount(tickSlot);
+      checkOf(tree, 'wt-1').props.onClick();
+      await reduceClock.flush();
+      eq(reduceClock.timers.length, 0, 'reduced-motion 不许排延迟刷新定时器：');
+      eq(slotUpdateCount(tickSlot) - before, 1, 'reduced-motion 必须写完立即刷新一次：');
+      const after = renderPanel({ t: mkT() });
+      eq(Boolean(inRow(after, 'wt-1', 'is-celebrating')), false, 'reduced-motion 不许挂动效类：');
+    });
+  } finally {
+    reduceClock.restore();
+    globalThis.window.matchMedia = savedMatchMedia;
+  }
+
+  // 2) config.celebrate = false
+  fakeListPayload.data.panel = { celebrate: false };
+  const quietClock = installFakeTimers();
+  try {
+    await withStableHooksAsync(async () => {
+      const t = mkT();
+      renderPanel({ t });
+      await quietClock.flush();
+      const tree = renderPanel({ t });
+      const tickSlot = tickSlotId(tree);
+      const before = slotUpdateCount(tickSlot);
+      checkOf(tree, 'wt-1').props.onClick();
+      await quietClock.flush();
+      eq(quietClock.timers.length, 0, 'celebrate:false 不许排延迟刷新定时器：');
+      eq(slotUpdateCount(tickSlot) - before, 1, 'celebrate:false 必须写完立即刷新一次：');
+    });
+  } finally {
+    quietClock.restore();
+    fakeListPayload.data.panel = savedPanel;
+  }
+});
+
+await testAsync('连续点击：第二次点击取消上一段待刷新，并立即刷新', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const clock = installFakeTimers();
+  try {
+    await withStableHooksAsync(async () => {
+      const t = mkT();
+      let tree = renderPanel({ t });
+      const tickSlot = tickSlotId(tree);
+      const before = slotUpdateCount(tickSlot);
+
+      checkOf(tree, 'wt-1').props.onClick(); // 第一次：完成 → 延迟刷新
+      await clock.flush();
+      eq(clock.timers.filter((handle) => !handle.cleared).length, 1, '前提：第一次完成已经排了一个待刷新：');
+
+      // 换一个 t 身份强制行 body 重跑（memo 浅比较否则会直接复用点击前的树）
+      tree = renderPanel({ t: mkT() }); // 乐观完成态生效，第二次点击语义变成「取消完成」
+      eq(checkOf(tree, 'wt-1').props['aria-label'], '[unmarkDone]', '前提：第二次点击是取消完成：');
+      checkOf(tree, 'wt-1').props.onClick();
+      await clock.flush();
+
+      eq(clock.timers[0].cleared, true, '第二次点击必须取消第一次的待刷新定时器：');
+      eq(clock.timers.filter((handle) => !handle.cleared).length, 0, '取消完成不排新的延迟刷新：');
+      eq(slotUpdateCount(tickSlot) - before, 1, '取消完成必须立即刷新一次（不等动画）：');
+    });
+  } finally {
+    clock.restore();
+  }
+});
+
+await testAsync('写失败：取消延迟刷新并立即刷新，不留在假完成态', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const clock = installFakeTimers();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url, options) => {
+    if (String(url).includes('/worktodo/status')) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ ok: false, error: 'boom' }),
+      });
+    }
+    return realFetch(url, options);
+  };
+  globalThis.window.fetch = globalThis.fetch;
+  try {
+    await withStableHooksAsync(async () => {
+      const t = mkT();
+      const tree = renderPanel({ t });
+      const tickSlot = tickSlotId(tree);
+      const before = slotUpdateCount(tickSlot);
+      checkOf(tree, 'wt-1').props.onClick();
+      await clock.flush();
+
+      eq(clock.timers.length, 0, '写失败不许留下延迟刷新定时器：');
+      eq(slotUpdateCount(tickSlot) - before, 1, '写失败必须立即刷新一次：');
+      const after = renderPanel({ t: mkT() });
+      eq(Boolean(inRow(after, 'wt-1', 'is-celebrating')), false, '写失败必须摘掉动效类：');
+    });
+  } finally {
+    clock.restore();
+    globalThis.fetch = realFetch;
+    globalThis.window.fetch = realFetch;
+  }
+});
+
+await testAsync('卸载：待刷新定时器会被清理（不留悬空回调）', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const clock = installFakeTimers();
+  try {
+    await withStableHooksAsync(async () => {
+      const t = mkT();
+      const tree = renderPanel({ t });
+      checkOf(tree, 'wt-1').props.onClick();
+      await clock.flush();
+      eq(clock.timers.filter((handle) => !handle.cleared).length, 1, '前提：完成写入后排了一个待刷新：');
+
+      // React 卸载时会调用每个 effect 的清理函数；这里把收集到的清理函数跑一遍
+      for (const cleanup of [...effectCleanups]) {
+        try { cleanup(); } catch { /* 单个清理失败不影响结论 */ }
+      }
+      eq(clock.timers[0].cleared, true, '卸载必须 clearTimeout 掉待刷新定时器：');
+      eq(clock.timers.filter((handle) => !handle.cleared).length, 0, '卸载后不许再有活着的待刷新定时器：');
+    });
+  } finally {
+    clock.restore();
   }
 });
 

@@ -455,24 +455,56 @@ export function checkHitGeometry() {
  * 这样 stroke-dashoffset 从 14 动画到 0 时，起始帧对勾完全不可见、结束时完整画出。
  */
 const CHECK_DASH = 14;
-/** 庆祝动效的总时长：三段动画都 ≤600ms（勾选弹跳 320 / 描边 300+80 延迟 / 整行高亮 560）。 */
-export const CELEBRATE_MS = 560;
+
+/*
+ * 「勾选完成」动效的节拍（纯 CSS，主机只负责挂/摘类）。
+ *
+ * 设计目标：从容、有层次、克制优雅 —— 不是「一闪而过」。
+ * 顺序是「勾选框轻轻呼吸 → 对勾被写出来 → 整行慢慢落定」，
+ * 三段有明确先后（各段 delay 是刻意留的），总时长约 1.2s。
+ * 缓动全部选 ease-out 一类「起步快、收尾慢」的曲线，**不用带回弹的过冲曲线**
+ * （旧的 .34,1.56,.64,1 会弹一下，看起来廉价）。
+ */
+/** 勾选框：620ms，scale 1 → 1.06 → 1（很轻的呼吸感，不弹跳）+ 极轻的背景淡入。 */
+export const CHECK_POP_MS = 620;
+/** 对勾描边：520ms，等勾选框先起来一点（delay 140ms）再「写出来」。 */
+export const MARK_DRAW_MS = 520;
+export const MARK_DRAW_DELAY_MS = 140;
+/** 整行：1150ms 的柔和过渡（delay 80ms）——背景淡出 + 标题在 560ms 内变灰。 */
+export const ROW_CELEBRATE_MS = 1150;
+export const ROW_CELEBRATE_DELAY_MS = 80;
+/** 标题颜色过渡：560ms（整行过渡的前半段；只动 color，不碰布局）。 */
+export const TITLE_SETTLE_MS = 560;
+/** 从勾上到完全落定的总时长：行动画的 delay + duration = 1230ms。 */
+export const CELEBRATE_MS = ROW_CELEBRATE_DELAY_MS + ROW_CELEBRATE_MS;
+/**
+ * 「动效播完**再**刷新」的延迟。
+ *
+ * 比 CELEBRATE_MS 多留 30ms 余量：刷新会把行按新数据重新归组，
+ * 提前哪怕一帧也会把最后一帧切掉（旧实现就是这样「落位」得太早，看起来一闪而过）。
+ */
+export const CELEBRATE_REFRESH_MS = CELEBRATE_MS + 30;
 
 /** 面板自带样式表：几何字面量（间距/字号/圆角）写死，颜色全部走变量。 */
 export const STYLE_TEXT = `
 @keyframes wt-spin { to { transform: rotate(360deg); } }
-/* 勾选完成时的庆祝动效（短、纯 CSS；只用 transform / opacity / background，绝不改布局） */
+/* 勾选完成的庆祝动效：轻柔呼吸 / 描边写出 / 整行落定。
+   只动 transform / background / color / opacity，绝不改布局（零布局跳动）。 */
 @keyframes wt-check-pop {
-  0% { transform: scale(1); }
-  35% { transform: scale(1.32); }
-  70% { transform: scale(.94); }
-  100% { transform: scale(1); }
+  0% { transform: scale(1); background: transparent; }
+  40% { transform: scale(1.06); background: ${tint(C.ok, 10)}; }
+  100% { transform: scale(1); background: ${tint(C.ok, 14)}; }
 }
 @keyframes wt-mark-draw { from { stroke-dashoffset: ${CHECK_DASH}; } to { stroke-dashoffset: 0; } }
 @keyframes wt-row-celebrate {
   0% { background: ${tint(C.ok, 26)}; }
-  55% { background: ${tint(C.ok, 12)}; }
+  40% { background: ${tint(C.ok, 16)}; }
+  75% { background: ${tint(C.ok, 6)}; }
   100% { background: transparent; }
+}
+@keyframes wt-title-settle {
+  from { color: ${C.label}; }
+  to { color: ${C.label3}; }
 }
 .wt-root {
   height: 100%; overflow: auto; padding: 16px 18px 40px; box-sizing: border-box;
@@ -523,13 +555,18 @@ export const STYLE_TEXT = `
 .wt-check-done {
   border-color: ${tint(C.ok, 55)}; background: ${tint(C.ok, 14)}; color: ${C.ok};
 }
-/* 勾选完成的动效：勾选框弹跳 → 对勾描边画出 → 整行高亮淡出（见 wt-row-celebrate） */
-.wt-check-celebrate { animation: wt-check-pop 320ms cubic-bezier(.34, 1.56, .64, 1) both; }
+/* 勾选完成的动效：勾选框轻呼吸 → 对勾描边写出 → 整行柔和落定（见 wt-row-celebrate）。
+   三段各有 delay，先后关系是刻意的；缓动一律柔和 ease-out，不带过冲回弹。 */
+.wt-check-celebrate { animation: wt-check-pop ${CHECK_POP_MS}ms cubic-bezier(0.22, 0.61, 0.36, 1) both; }
 .wt-check-celebrate .wt-check-mark path {
   stroke-dasharray: ${CHECK_DASH}; stroke-dashoffset: ${CHECK_DASH};
-  animation: wt-mark-draw 300ms ease-out 80ms both;
+  animation: wt-mark-draw ${MARK_DRAW_MS}ms ease-out ${MARK_DRAW_DELAY_MS}ms both;
 }
-.wt-row.is-celebrating { animation: wt-row-celebrate ${CELEBRATE_MS}ms ease-out both; }
+.wt-row.is-celebrating { animation: wt-row-celebrate ${ROW_CELEBRATE_MS}ms ease-out ${ROW_CELEBRATE_DELAY_MS}ms both; }
+/* 标题在整行淡出的前半段慢慢变成「已完成」的柔和灰（只动 color） */
+.wt-row.is-celebrating .wt-title {
+  animation: wt-title-settle ${TITLE_SETTLE_MS}ms ease-out ${ROW_CELEBRATE_DELAY_MS}ms both;
+}
 /* B1：min-height 必须 ≥ 命中盒高度（见 checkHitGeometry / ROW_MIN_HEIGHT_PX） */
 .wt-row { display: flex; align-items: flex-start; gap: 8px; padding: ${ROW_PADDING_Y_PX}px 8px; min-height: ${ROW_MIN_HEIGHT_PX}px; border-radius: 10px; }
 .wt-row:hover { background: ${C.hover}; }
@@ -606,6 +643,7 @@ export const STYLE_TEXT = `
 @media (prefers-reduced-motion: reduce) {
   .wt-check-celebrate,
   .wt-row.is-celebrating,
+  .wt-row.is-celebrating .wt-title,
   .wt-check-celebrate .wt-check-mark path { animation: none !important; }
   .wt-check-celebrate .wt-check-mark path { stroke-dasharray: none; stroke-dashoffset: 0; }
   .wt-check, .wt-flag-btn { transition: none !important; }
@@ -911,6 +949,53 @@ function useList(sort, shapes) {
 
   const refresh = React.useCallback(() => setTick((n) => n + 1), []);
   return { ...state, refresh };
+}
+
+/**
+ * 「完成动效播完再刷新」的调度器（导出供单测；面板里由 useMemo 持有一个实例）。
+ *
+ * 为什么需要它：刷新会拿回服务端真相并把行**按新分组重排**。旧实现在写成功的
+ * `finally` 里立刻 refresh，于是勾选后 ~1 个 RTT 行就滑进「已完成」，
+ * 三段动画被拦腰切断 —— 这正是「太快、一闪而过」的根因。
+ *
+ * 约束：
+ *   - 只用**一个**定时器，绝不做逐帧 JS 动画（动画本身全是 CSS）；
+ *   - `schedule` 先取消上一个待刷新（连续点击/连续完成时由最后一次接管，不会补两次）；
+ *   - `cancel` 幂等：卸载、写失败、取消完成都直接调它，不会留下悬空回调。
+ *
+ * @param {() => void} refresh 真正触发列表重取的回调
+ * @param {{setTimeout?: Function, clearTimeout?: Function}} [timers] 测试可注入假定时器
+ * @returns {{schedule: (ms?: number) => any, cancel: () => boolean, isPending: () => boolean}}
+ */
+export function createCelebrationRefresh(refresh, timers = {}) {
+  const setTimer = typeof timers.setTimeout === 'function'
+    ? timers.setTimeout
+    : (fn, ms) => setTimeout(fn, ms);
+  const clearTimer = typeof timers.clearTimeout === 'function'
+    ? timers.clearTimeout
+    : (handle) => clearTimeout(handle);
+  let timer = null;
+
+  const cancel = () => {
+    if (timer === null) return false;
+    try { clearTimer(timer); } catch { /* 已触发 / 环境不支持 clearTimeout，忽略 */ }
+    timer = null;
+    return true;
+  };
+
+  const schedule = (ms = CELEBRATE_REFRESH_MS) => {
+    cancel();
+    const delay = Number.isFinite(Number(ms)) && Number(ms) > 0 ? Number(ms) : CELEBRATE_REFRESH_MS;
+    timer = setTimer(() => {
+      timer = null;
+      refresh();
+    }, delay);
+    // Node（测试环境）里不要因为这个定时器挂住事件循环；浏览器返回的 number 没有 unref
+    timer?.unref?.();
+    return timer;
+  };
+
+  return { schedule, cancel, isPending: () => timer !== null };
 }
 
 /* ------------------------------------------------------------------ *
@@ -1418,7 +1503,8 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       setOptimisticFor(null);
       setCelebrating(false);
     }
-    const job = Promise.resolve(onToggle(row.id));
+    // 把「这次要播动效」告诉面板：刷新会推迟到动画播完，别让行在半路重排。
+    const job = Promise.resolve(onToggle(row.id, { celebrate: canCelebrate }));
     job.then(
       (result) => {
         if (result && result.ok === false) {
@@ -1617,9 +1703,9 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     onMouseLeave: () => setFlagPeek(false),
     onFocus: () => setFlagPeek(true),
     onBlur: () => setFlagPeek(false),
-    // 动效是纯 CSS 的：动画跑完自己摘掉类，不需要定时器、更没有逐帧 setState。
-    // B3：`animationend` 会**冒泡** —— 勾选框的弹跳（320ms）与对勾描边（80→380ms）结束也会冒到行上，
-    // 旧写法在 320ms 就把 is-celebrating 摘掉，560ms 的整行高亮被截断成 57%（视觉跳变）。
+    // 动效是纯 CSS 的：动画跑完自己摘掉类，不需要逐帧 setState；列表刷新的延后由面板负责。
+    // B3：`animationend` 会**冒泡** —— 勾选框的呼吸（620ms）与对勾描边（140→660ms）结束也会冒到行上，
+    // 旧写法在 320ms 就把 is-celebrating 摘掉，整行高亮被截断（视觉跳变）。
     // 只处理「事件源就是这一行自己」的那一次（并顺手校验 animationName，防止未来加新动画时误摘）。
     onAnimationEnd: (event) => {
       if (!event || !event.currentTarget || event.target !== event.currentTarget) return;
@@ -2166,6 +2252,14 @@ function WorkTodoPanel(props) {
   const celebrate = shouldCelebrate(data?.panel);
 
   /**
+   * 完成动效的「延迟刷新」调度器：勾选完成时先让 1.2s 的 CSS 动画播完，
+   * 再拿服务端真相重排列表（旧实现写成功就 refresh，动画被当场切断）。
+   * 卸载时整条 effect 的清理函数会把待刷新定时器取消，不留悬空回调。
+   */
+  const celebrationRefresh = React.useMemo(() => createCelebrationRefresh(refresh), [refresh]);
+  React.useEffect(() => () => celebrationRefresh.cancel(), [celebrationRefresh]);
+
+  /**
    * 跟随外部改动刷新（审计 F7：宿主的 onChanged/onChange 原来是死代码，面板只在
    * 挂载 / 切排序 / 点刷新 / 自己写操作后才拉数据，agent 用工具加了一条用户看不到）。
    * 这里定期 + 窗口重新聚焦 / 重新可见时拉一次；清理函数里清掉定时器与监听，卸载后不留活动引用。
@@ -2239,22 +2333,42 @@ function WorkTodoPanel(props) {
   /**
    * 所有写操作的统一外壳：成功清掉错误条，失败把宿主的 error 原文放上去，
    * 无论成败最后都重新拉一次列表（避免本地状态和磁盘上的真相对不上）。
+   *
+   * `options.deferRefreshMs`：完成类动画专用 —— 写成功后**不立刻** refresh，
+   * 而是交给 celebrationRefresh 在动画播完后补一次，期间行留在原位把动画播完。
+   * 失败 / 取消完成 / 其他写操作仍然立即 refresh（reduced-motion、celebrate:false 也走这条）。
+   * @param {() => Promise<object>} job
+   * @param {{deferRefreshMs?: number}} [options]
    * @returns {Promise<{ok: boolean, data: object}>} data 是宿主返回的 data（失败时为空对象）
    */
-  const runWrite = React.useCallback(async (job) => {
+  const runWrite = React.useCallback(async (job, options = {}) => {
+    const deferMs = Number(options?.deferRefreshMs);
+    const wantsDeferredRefresh = Number.isFinite(deferMs) && deferMs > 0;
+    // 任何一次新写入都先取消上一段待刷新：连续点击/连续完成时由最后一次接管，
+    // 绝不让上一个已取消的操作在 1.2s 后再补一次刷新。
+    celebrationRefresh.cancel();
     setPending((n) => n + 1);
+    let writeFailed = false;
     try {
       const data = await job();
       setBarError(null);
       return { ok: true, data: data ?? {} };
     } catch (writeError) {
+      writeFailed = true;
       setBarError(String(writeError?.message ?? writeError));
+      // 写失败：取消完成动画的待刷新，立刻拿服务端真相（行不该停在假完成态）
+      celebrationRefresh.cancel();
       return { ok: false, data: {} };
     } finally {
       setPending((n) => Math.max(0, n - 1));
-      refresh();
+      if (wantsDeferredRefresh && !writeFailed) {
+        celebrationRefresh.schedule(deferMs);
+      } else {
+        celebrationRefresh.cancel();
+        refresh();
+      }
     }
-  }, [refresh]);
+  }, [refresh, celebrationRefresh]);
 
   /**
    * 自升级的**两步**动作（照 DSH 的交互）：
@@ -2325,7 +2439,14 @@ function WorkTodoPanel(props) {
     })).then((result) => result.ok);
   }, [runWrite, t]);
 
-  const handleToggle = React.useCallback((ref) => runWrite(() => postJson('/status', { ref, toggle: true })), [runWrite]);
+  /**
+   * 勾选完成：行内说「这次要播动效」时，刷新推迟到动画播完（见 createCelebrationRefresh）；
+   * 取消完成 / reduced-motion / celebrate:false 不推迟，立刻刷新让状态直接切换。
+   */
+  const handleToggle = React.useCallback((ref, options = {}) => runWrite(
+    () => postJson('/status', { ref, toggle: true }),
+    options?.celebrate ? { deferRefreshMs: CELEBRATE_REFRESH_MS } : undefined,
+  ), [runWrite]);
   const handleRemove = React.useCallback((ref) => runWrite(() => postJson('/remove', { ref })), [runWrite]);
   const handleSave = React.useCallback((ref, patch) => runWrite(() => postJson('/update', { ref, ...patch })), [runWrite]);
   /**
