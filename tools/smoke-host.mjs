@@ -14,14 +14,14 @@ process.env.WORKTODO_NO_UPDATE_CHECK = '1';
  */
 import { Readable } from 'node:stream';
 import { createServer } from 'node:http';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
 // DSH 判定「工具返回值是否 lossless JSON」用的就是这一个函数（见 assertLossless 的说明）
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged } from '../lib/index.js';
+import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged, resolveUpdateLockPath, resolveStartupCheckDelayMs, acquireUpdateLock, releaseUpdateLock, classifyCliFailure, killProcessTree } from '../lib/index.js';
 
 /**
  * 「模拟版本」的**唯一**来源：全部从 package.json 派生；本文件里不许再出现当前版本号的字面量。
@@ -46,6 +46,13 @@ const FAKE_NEXT_VERSION = bumpPatch(PKG_VERSION, 1);
  * 保证**测试永远不会碰真实 `~/.dsh`**（要用持久化的用例会在 withEnv 里覆盖它）。
  */
 process.env.WORKTODO_UPDATE_STATE_PATH = join(mkdtempSync(join(tmpdir(), 'worktodo-update-state-')), 'update-state.json');
+
+/**
+ * 启动检查默认延后 25s（稳定性复审 A1/A2）。测试要的是「apply 后很快就能观察到检查结果」，
+ * 所以这里统一把延后设成 0；专门的「延后」用例会在 withEnv 里覆盖成真实时长，
+ * 用来钉住「apply 返回后不会立刻抢跑」。
+ */
+process.env.WORKTODO_STARTUP_CHECK_DELAY_MS = '0';
 
 /**
  * 假的 tarball 分发源（本轮新增的「下载」这一步要有东西可下）。
@@ -1293,6 +1300,7 @@ function writeFakePnpm(binDir, {
   installVersion = null, installProfile = null, installOn = 'install',
   specDir = null, specProfile = null,
   addSpecText = null, addSpecProfile = null, addSleepSec = 0,
+  addLockText = null, addLockProfile = null,
 }) {
   mkdirSync(binDir, { recursive: true });
   const file = join(binDir, 'pnpm');
@@ -1311,6 +1319,11 @@ function writeFakePnpm(binDir, {
   if (addSpecText && (addSpecProfile ?? specProfile)) {
     const target = join(addSpecProfile ?? specProfile, 'package.json');
     rewrite.push(`if [ "$1" = "add" ]; then printf '%s' ${shQuote(addSpecText)} > ${shQuote(target)}; fi`);
+  }
+  // 真实的 pnpm add 会同时改写 package.json 与 pnpm-lock.yaml（C2：回滚必须成对）
+  if (addLockText && (addLockProfile ?? addSpecProfile ?? specProfile)) {
+    const target = join(addLockProfile ?? addSpecProfile ?? specProfile, 'pnpm-lock.yaml');
+    rewrite.push(`if [ "$1" = "add" ]; then printf '%s' ${shQuote(addLockText)} > ${shQuote(target)}; fi`);
   }
   const addSleep = addSleepSec > 0 ? [`if [ "$1" = "add" ]; then sleep ${addSleepSec}; fi`] : [];
   const lines = [
@@ -1360,6 +1373,66 @@ function writeFakePnpmMjs(file, { capture, installVersion = null, installProfile
   }
   lines.push('', '');
   writeFileSync(file, lines.join('\n'));
+  return file;
+}
+
+/** 进程是否还活着（进程树用例用它断言孙进程真的没了）。 */
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return String(error?.code ?? '') !== 'ESRCH';
+  }
+}
+
+/**
+ * 假 pnpm：派生一个**长命孙进程**（每 50ms 往心跳文件追加一个字节），自己再睡很久。
+ *
+ * 服务 B1：旧实现只 `child.kill()` 直接子进程，孙进程会活下来继续写；修复后
+ * `detached:true` + `process.kill(-pid)` 必须把整组杀掉。心跳文件用来证明「不是恰好退出了」。
+ */
+function writeFakeTreePnpm(file, { capture, heartbeat, pidFile }) {
+  mkdirSync(dirname(file), { recursive: true });
+  // 孙进程用独立的 .cjs，避免把 JS 源码塞进 shell 的引号里（跨平台/转义都更稳）
+  const grandchild = join(dirname(file), 'grandchild.cjs');
+  writeFileSync(grandchild, [
+    "const fs = require('node:fs');",
+    `fs.appendFileSync(${JSON.stringify(heartbeat)}, 'x');`,
+    `setInterval(() => fs.appendFileSync(${JSON.stringify(heartbeat)}, 'x'), 50);`,
+    '',
+  ].join('\n'));
+  const script = [
+    '#!/bin/sh',
+    `printf 'INVOKE\\n' >> ${shQuote(capture)}`,
+    `"${process.execPath}" ${shQuote(grandchild)} &`,
+    `echo $! > ${shQuote(pidFile)}`,
+    'sleep 30',
+    '',
+  ].join('\n');
+  writeFileSync(file, script, { mode: 0o755 });
+  return file;
+}
+
+/**
+ * 假 pnpm：写下自己的 pid → 睡一段时间 → 改写 profile 并留下 WROTE 标记。
+ *
+ * 服务 B2：dispose 必须在「睡醒之前」把整棵树杀掉，否则 1.2s 后它就会继续写 profile。
+ */
+function writeSlowWritingPnpm(file, { capture, pidFile, profile, marker, newSpec, sleepSec = 1.2 }) {
+  mkdirSync(dirname(file), { recursive: true });
+  const pkg = JSON.stringify({ name: 'dsh-profile-slow-writer', private: true, dependencies: { 'dsh-worktodo': newSpec } });
+  const script = [
+    '#!/bin/sh',
+    `printf 'INVOKE\n' >> ${shQuote(capture)}`,
+    `echo $$ > ${shQuote(pidFile)}`,
+    `sleep ${sleepSec}`,
+    `printf '%s' ${shQuote(pkg)} > ${shQuote(join(profile, 'package.json'))}`,
+    `printf 'WROTE\n' >> ${shQuote(marker)}`,
+    '',
+  ].join('\n');
+  writeFileSync(file, script, { mode: 0o755 });
   return file;
 }
 
@@ -1785,6 +1858,92 @@ await test('A2：第 3 步 pnpm add 挂起到超时 → 规格逐字节回滚，
   }
 });
 
+await test('C2（中）：失败回滚把 package.json + pnpm-lock.yaml 当同一事务 —— 两者都逐字节还原', async () => {
+  // 审查实跑：旧 journal 只还原 package.json，lockfile 留在新规格 → profile 三方不一致。
+  // 修复后两者进同一个快照，任何非 done 出口都一起回滚。
+  const profile = makeFakeProfile('lockfile-rollback', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const manifest = join(profile, 'package.json');
+  const lock = join(profile, 'pnpm-lock.yaml');
+  const manifestBytes = readFileSync(manifest, 'utf8');
+  const lockBytes = [
+    "lockfileVersion: '9.0'",
+    '',
+    'importers:',
+    '  .:',
+    '    dependencies:',
+    `      dsh-worktodo:`,
+    '        specifier: ^0.2.0',
+    '        version: 0.2.0',
+    '',
+  ].join('\n');
+  writeFileSync(lock, lockBytes);
+  const capture = join(selfUpdateRoot, 'capture-lockfile-rollback.txt');
+  const bin = join(selfUpdateRoot, 'bin-lockfile-rollback');
+  // 假 pnpm add：两个文件都改成新版本规格，但 node_modules 版本不变（→ 序列失败 → 必须回滚两者）
+  writeFakePnpm(bin, {
+    capture,
+    addSpecText: `${JSON.stringify({ name: 'dsh-profile-lockfile-rollback', private: true, dependencies: { 'dsh-worktodo': `^${FAKE_NEXT_VERSION}` } }, null, 2)}\n`,
+    addLockText: `lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      dsh-worktodo:\n        specifier: ^${FAKE_NEXT_VERSION}\n        version: ${FAKE_NEXT_VERSION}\n`,
+    addSpecProfile: profile,
+    addLockProfile: profile,
+  });
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+    }, async () => {
+      await triggerUpdate(host);
+      const status = await waitForUpdateEnd(host, 5000);
+      eq(status?.state, 'failed', `版本没变必须 failed（实际 ${status?.state}）：`);
+      eq(status?.reason, 'version-unchanged', `失败原因是 version-unchanged：${status?.reason}`);
+      // ★ 核心：两个文件都逐字节回到原值
+      eq(readFileSync(manifest, 'utf8') === manifestBytes, true, 'C2：package.json 必须逐字节回滚：');
+      eq(readFileSync(lock, 'utf8') === lockBytes, true,
+        `C2：pnpm-lock.yaml 也必须逐字节回滚（旧实现会把它留在新版本）；实际：\n${readFileSync(lock, 'utf8')}`);
+      eq(readFileSync(lock, 'utf8').includes(FAKE_NEXT_VERSION), false, 'C2：lockfile 里不许残留新版本号：');
+      const rollbackStep = status?.steps?.find((step) => step.kind === 'rollback-profile-spec');
+      eq(Boolean(rollbackStep), true, `要有回滚步骤：${JSON.stringify(status?.steps)}`);
+      eq(rollbackStep?.ok, true, `回滚必须标成功：${JSON.stringify(rollbackStep)}`);
+      eq(String(rollbackStep?.note).includes('pnpm-lock.yaml'), true,
+        `C2：回滚说明要提到 lockfile（让用户知道两者一起还原）：${rollbackStep?.note}`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('C2：原本没有 pnpm-lock.yaml，pnpm 新建后失败 → 回滚把它删掉（恢复原状）', async () => {
+  const profile = makeFakeProfile('lockfile-created', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const manifestBytes = readFileSync(join(profile, 'package.json'), 'utf8');
+  const lock = join(profile, 'pnpm-lock.yaml');
+  eq(existsSync(lock), false, '前置条件：原 profile 没有 lockfile：');
+  const capture = join(selfUpdateRoot, 'capture-lockfile-created.txt');
+  const bin = join(selfUpdateRoot, 'bin-lockfile-created');
+  writeFakePnpm(bin, {
+    capture,
+    addLockText: `lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      dsh-worktodo:\n        specifier: ^${FAKE_NEXT_VERSION}\n        version: ${FAKE_NEXT_VERSION}\n`,
+    addLockProfile: profile,
+  });
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+    }, async () => {
+      await triggerUpdate(host);
+      const status = await waitForUpdateEnd(host, 5000);
+      eq(status?.state, 'failed', `版本没变必须 failed（实际 ${status?.state}）：`);
+      eq(existsSync(lock), false, 'C2：本次新建的 lockfile 必须被删掉（恢复「原本没有」的状态）：');
+      eq(readFileSync(join(profile, 'package.json'), 'utf8') === manifestBytes, true, 'C2：manifest 仍逐字节不变：');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 await test('A3：dependencies 与 devDependencies 同名不同值 → 回滚逐字节还原原文件（段位/协议值不得被冲掉）', async () => {
   // 审查实跑复现：旧回滚把「第一个字段的原值」写回**所有**字段，
   // `devDependencies.dsh-worktodo = "link:…"` 被静默改成 `"^0.2.0"`。
@@ -2127,6 +2286,296 @@ await test('自升级：子进程不退出 → 到 updateTimeoutMs 被杀并落 
   }
 });
 
+await test('B1（严重）：超时杀整棵进程树 —— 孙进程不再存活、心跳停止增长', async () => {
+  // 审查实跑：600ms 超时只杀直接子进程，孙进程心跳从 50 字节涨到 165 字节。
+  // 修复后 POSIX 用独立进程组 + kill(-pid)，Windows 用 taskkill /T /F。
+  if (process.platform === 'win32') {
+    console.log('      [skip] 本机不是 Windows；Windows 分支由 killProcessTree 的 taskkill /T 覆盖');
+    return;
+  }
+  const profile = makeFakeProfile('tree-kill', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const capture = join(selfUpdateRoot, 'capture-tree.txt');
+  const heartbeat = join(selfUpdateRoot, 'tree-heartbeat.txt');
+  const pidFile = join(selfUpdateRoot, 'tree-grandchild.pid');
+  const bin = join(selfUpdateRoot, 'bin-tree');
+  writeFakeTreePnpm(join(bin, 'pnpm'), { capture, heartbeat, pidFile });
+  const statePath = join(selfUpdateRoot, 'update-state-tree-kill.json');
+  let host;
+  let dir;
+  let grandchild = null;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      // 独立状态/锁路径：避免和其它用例共享锁文件（否则可能撞上 busy，子进程根本不会起）
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+    }, async () => {
+      // 1.5s 足够让 node 孙进程完成冷启动并开始写心跳，又远短于脚本的 sleep 30
+      ({ host, dir } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 1500 }));
+      await triggerUpdate(host);
+      eq(await waitFor(() => existsSync(pidFile), 3000), true,
+        `前置条件：假 pnpm 必须先派生一个长命孙进程（bin=${readdirSync(bin).join(',')}）：`);
+      grandchild = Number(readFileSync(pidFile, 'utf8').trim());
+      eq(isPidAlive(grandchild), true, `前置条件：孙进程（pid=${grandchild}）应当活着：`);
+      const wroteHeartbeat = await waitFor(() => existsSync(heartbeat), 3000);
+      eq(wroteHeartbeat, true, `前置条件：孙进程必须已经在写心跳（bin=${readdirSync(bin).join(',')}；capture=${existsSync(capture) ? readFileSync(capture, 'utf8') : '无'}）：`);
+      const status = await waitForUpdateEnd(host, 5000);
+      eq(status?.reason, 'timeout', `应当以 timeout 收口（实际 ${status?.reason}）：`);
+      eq(await waitFor(() => !isPidAlive(grandchild), 2000), true,
+        `B1：超时后孙进程必须已经不存在（pid=${grandchild}）；旧实现只杀直接子进程，孙进程会继续写 profile：`);
+      const before = statSync(heartbeat).size;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      const after = statSync(heartbeat).size;
+      eq(after, before, `B1：超时后心跳文件不许再增长（${before} → ${after} 字节）：`);
+      console.log(`      [tree] 超时 1500ms 后孙进程 pid=${grandchild} 已退出，心跳停在 ${after} 字节`);
+    });
+  } finally {
+    if (grandchild && isPidAlive(grandchild)) {
+      try { process.kill(grandchild, 'SIGKILL'); } catch { /* 已退出 */ }
+    }
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('B4（高）：CLI 明确拒绝（active-run / 兼容性）→ failed，且绝不降级 pnpm（零 pnpm 写盘）', async () => {
+  // 审查实跑/静态：旧实现把 CLI 的任何非 0 都当成「这一步失败」，随后 pnpm 直接写 profile，
+  // 绕开 DSH 的 active-run 锁与兼容性预检。现在必须直接 failed、后面 pnpm 一步都不跑。
+  const cases = [
+    { name: 'active-run', stderr: 'error: another install is already running for this profile (active-run)', reason: 'active-run' },
+    { name: 'incompatible', stderr: 'error: plugin compatibility check failed: dsh-worktodo@99 is incompatible with this DSH build', reason: 'incompatible' },
+  ];
+  for (const item of cases) {
+    const profile = makeFakeProfile(`cli-refuse-${item.name}`, '^0.2.0');
+    seedInstalledVersion(profile, '0.2.0');
+    const manifest = join(profile, 'package.json');
+    const originalBytes = readFileSync(manifest, 'utf8');
+    const cliCapture = join(selfUpdateRoot, `capture-cli-refuse-${item.name}.txt`);
+    const pnpmCapture = join(selfUpdateRoot, `capture-cli-refuse-${item.name}-pnpm.txt`);
+    const fakeCli = join(selfUpdateRoot, `fake-cli-refuse-${item.name}.mjs`);
+    writeFileSync(fakeCli, [
+      "import { appendFileSync } from 'node:fs';",
+      `appendFileSync(${JSON.stringify(cliCapture)}, 'INVOKE\\n' + process.argv.slice(2).join('\\n') + '\\n');`,
+      `console.error(${JSON.stringify(item.stderr)});`,
+      'process.exit(1);',
+      '',
+    ].join('\n'));
+    const bin = join(selfUpdateRoot, `bin-cli-refuse-${item.name}`);
+    // 如果实现错误地降级，这个假 pnpm 会立刻改写 profile（版本 + 规格）→ 断言会抓到
+    writeFakePnpm(bin, {
+      capture: pnpmCapture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any',
+      addSpecText: `${JSON.stringify({ name: 'dsh-profile-cli-refuse', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } }, null, 2)}\n`,
+      addSpecProfile: profile,
+    });
+    const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+    try {
+      await withEnv({
+        WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_CLI: fakeCli,
+        PATH: `${bin}:${process.env.PATH}`, WORKTODO_PNPM_PATH: undefined,
+        WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      }, async () => {
+        await triggerUpdate(host);
+        const status = await waitForUpdateEnd(host, 5000);
+        eq(status?.state, 'failed', `B4（${item.name}）：CLI 拒绝必须 failed（实际 ${status?.state}）：`);
+        eq(status?.reason, item.reason, `B4（${item.name}）：失败原因要能区分拒绝类型（实际 ${status?.reason}）：`);
+        eq(String(status?.error).includes('不会降级'), true,
+          `B4（${item.name}）：error 必须明确写「不会降级到 pnpm」：${status?.error}`);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        eq(invokeCount(cliCapture), 1, `B4（${item.name}）：CLI 只许调用一次（不许重试）：`);
+        eq(invokeCount(pnpmCapture), 0,
+          `B4（${item.name}）：CLI 明确拒绝后一个 pnpm 子进程都不许起（否则会绕过宿主事务）：`);
+        eq(status?.steps?.some((step) => step.kind === 'pnpm-update' || step.kind === 'pnpm-add-exact'), false,
+          `B4（${item.name}）：pnpm 步骤根本不该出现在状态里：${JSON.stringify(status?.steps)}`);
+        eq(readFileSync(manifest, 'utf8'), originalBytes,
+          `B4（${item.name}）：零 pnpm 写盘，清单逐字节不变：`);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+await test('B4：只有 CLI 不可用（找不到脚本）才允许降级 pnpm —— 正对照', async () => {
+  const profile = makeFakeProfile('cli-unavailable-fallback', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const capture = join(selfUpdateRoot, 'capture-cli-unavailable-pnpm.txt');
+  const bin = join(selfUpdateRoot, 'bin-cli-unavailable');
+  // 假 pnpm 真的换版本 → 序列应当从 CLI 降级到 pnpm 并成功
+  writeFakePnpm(bin, { capture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any' });
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile,
+      // 指向一个不存在的脚本：node 会以退出码 1 + Cannot find module 失败
+      WORKTODO_UPDATE_CLI: join(selfUpdateRoot, 'no-such-cli.mjs'),
+      PATH: `${bin}:${process.env.PATH}`, WORKTODO_PNPM_PATH: undefined,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+    }, async () => {
+      await triggerUpdate(host);
+      const status = await waitForUpdateEnd(host, 5000);
+      eq(status?.state, 'done', `CLI 只是找不到、pnpm 能装时应当 done（实际 ${status?.state}，error=${status?.error}；steps=${JSON.stringify(status?.steps)}）：`);
+      eq(invokeCount(capture) >= 1, true, `B4：CLI 不可用时必须降级到 pnpm（实际 ${invokeCount(capture)} 次）：`);
+      eq(status?.steps?.some((step) => step.kind === 'pnpm-update'), true, '降级后应当真的跑 pnpm 步骤：');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('B2（高）：dispose 取消在飞安装 —— 子进程被杀、之后零 spawn、零写盘', async () => {
+  const profile = makeFakeProfile('dispose-inflight', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const manifest = join(profile, 'package.json');
+  const originalBytes = readFileSync(manifest, 'utf8');
+  const capture = join(selfUpdateRoot, 'capture-dispose-inflight.txt');
+  const pidFile = join(selfUpdateRoot, 'dispose-inflight.pid');
+  const marker = join(selfUpdateRoot, 'dispose-inflight-wrote.txt');
+  const bin = join(selfUpdateRoot, 'bin-dispose-inflight');
+  writeSlowWritingPnpm(join(bin, 'pnpm'), {
+    capture, pidFile, profile, marker, newSpec: FAKE_NEXT_VERSION, sleepSec: 1.2,
+  });
+  const stageDir = join(selfUpdateRoot, 'stage-dispose-inflight');
+  const statePath = join(selfUpdateRoot, 'update-state-dispose-inflight.json');
+  let host;
+  let dir;
+  let pid = null;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_STAGE_DIR: stageDir, WORKTODO_UPDATE_STATE_PATH: statePath,
+    }, async () => {
+      ({ host, dir } = await makeUpdateHost({ autoInstall: true, updateTimeoutMs: 5000 }));
+      eq(await waitFor(() => existsSync(capture), 5000), true,
+        '前置条件：autoInstall:true 必须真的起了一个安装子进程：');
+      const beforeDispose = (await readUpdateState(host)).json().data;
+      eq(beforeDispose.phase, 'installing', `前置条件：dispose 时应当正在安装（实际 ${beforeDispose.phase}）：`);
+      pid = Number(readFileSync(pidFile, 'utf8').trim());
+      eq(isPidAlive(pid), true, `前置条件：安装子进程（pid=${pid}）应当活着：`);
+
+      // 模拟插件卸载：调用所有 effect 的 dispose
+      for (const effect of [...host.effects].reverse()) {
+        try { await effect.dispose?.(); } catch { /* 单个清理失败不打断 */ }
+      }
+
+      eq(await waitFor(() => !isPidAlive(pid), 2000), true,
+        `B2：dispose 必须杀掉在飞子进程（pid=${pid}）；旧实现卸载后子进程还会跑完并写 profile：`);
+      const invocationsAtDispose = invokeCount(capture);
+      await new Promise((resolve) => setTimeout(resolve, 1700)); // 远长于假 pnpm 的 1.2s
+      eq(invokeCount(capture), invocationsAtDispose,
+        `B2：dispose 后不许再起新的子进程（${invocationsAtDispose} → ${invokeCount(capture)}）：`);
+      eq(existsSync(marker), false, 'B2：dispose 后子进程不许再写 profile（WROTE 标记不该出现）：');
+      eq(readFileSync(manifest, 'utf8'), originalBytes, 'B2：dispose 后 profile 必须逐字节不变（零写盘）：');
+      eq(existsSync(join(dirname(statePath), 'update.lock')), false,
+        'B2：dispose 必须释放跨进程锁（否则下次更新永远 busy）：');
+    });
+  } finally {
+    if (pid && isPidAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* 已退出 */ } }
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('B3（高）：两个实例并发 → 只有一个拿到跨进程锁，另一个 busy 且零 pnpm 写盘', async () => {
+  const profile = makeFakeProfile('lock-concurrent', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const capture = join(selfUpdateRoot, 'capture-lock-concurrent.txt');
+  const bin = join(selfUpdateRoot, 'bin-lock-concurrent');
+  // 假 pnpm 睡 1.2s：第一个实例持锁期间，第二个实例必须被挡住
+  writeFakePnpm(bin, {
+    capture, sleepSec: 1.2, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any',
+  });
+  const statePath = join(selfUpdateRoot, 'update-state-lock-concurrent.json');
+  const lockFile = join(dirname(statePath), 'update.lock');
+  let hostA;
+  let hostB;
+  let dirA;
+  let dirB;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+    }, async () => {
+      ({ host: hostA, dir: dirA } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 5000 }));
+      ({ host: hostB, dir: dirB } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 5000 }));
+      const first = (await triggerUpdate(hostA)).json();
+      eq(first.ok, true, `第一个实例应当开始安装：${JSON.stringify(first)}`);
+      eq(await waitFor(() => existsSync(capture), 3000), true, '前置条件：第一个实例必须已经起了子进程（= 已持锁）：');
+      // 确认锁真的写在约定的位置、内容带 pid/token
+      eq(existsSync(lockFile), true, 'B3：安装期间必须有跨进程锁文件：');
+      const owner = JSON.parse(readFileSync(lockFile, 'utf8'));
+      eq(owner.pid, process.pid, 'B3：锁内容要记录 pid：');
+      eq(typeof owner.token === 'string' && owner.token.length > 0, true, 'B3：锁内容要记录 token：');
+
+      const second = (await triggerUpdate(hostB)).json();
+      eq(second.ok, false, `B3：第二个实例必须 busy 失败而不是并发写（实际 ${JSON.stringify(second)}）：`);
+      eq(second.reason, 'busy', `B3：reason 要是 busy（实际 ${second.reason}）：`);
+      eq(String(second.error).includes('未做任何写操作'), true,
+        `B3：busy 要说明零写盘：${second.error}`);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      eq(invokeCount(capture), 1,
+        `B3：并发时只允许一个安装子进程（实际 ${invokeCount(capture)}；旧实现每个实例各起一个）：`);
+      eq((await readUpdateState(hostB)).json().data.phase, 'failed', 'B3：第二个实例的状态必须是 failed(busy)：');
+
+      const settled = await waitForUpdateEnd(hostA, 7000);
+      eq(settled?.state, 'done', `B3：第一个实例应当正常装完（实际 ${settled?.state}，error=${settled?.error}）：`);
+      eq(existsSync(lockFile), false, 'B3：序列结束后锁必须释放：');
+    });
+  } finally {
+    if (dirA) rmSync(dirA, { recursive: true, force: true });
+    if (dirB) rmSync(dirB, { recursive: true, force: true });
+  }
+});
+
+await test('B3：跨进程锁纯函数 —— 第二次 busy、>10min 可回收、release 只删自己的锁', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'worktodo-lock-'));
+  const file = join(dir, 'update.lock');
+  const t0 = Date.now();
+  try {
+    eq(resolveUpdateLockPath({ env: {}, home: '/tmp/fake-home' }), '/tmp/fake-home/worktodo/update.lock',
+      'B3：默认锁路径必须是 $DSH_HOME/worktodo/update.lock：');
+    eq(resolveUpdateLockPath({ env: { WORKTODO_UPDATE_STATE_PATH: '/tmp/x/state.json' }, home: null }), '/tmp/x/update.lock',
+      'B3：测试缝覆盖状态文件时，锁跟着走（绝不写真实 ~/.dsh）：');
+
+    const first = acquireUpdateLock({ file, now: t0 });
+    eq(first.ok, true, 'B3：第一次必须拿到锁：');
+    const second = acquireUpdateLock({ file, now: t0 + 1000 });
+    eq(second.ok, false, 'B3：第二个实例必须 busy：');
+    eq(second.reason, 'busy', 'B3：busy 原因码：');
+    eq(second.owner?.token, first.token, 'B3：busy 要能报出持有者 token：');
+    eq(releaseUpdateLock({ file, token: 'not-ours' }), false, 'B3：release 绝不删别人的锁：');
+    eq(existsSync(file), true, 'B3：错误的 release 不许删锁：');
+    eq(releaseUpdateLock({ file, token: first.token }), true, 'B3：自己的锁必须能释放：');
+    eq(existsSync(file), false, 'B3：释放后锁文件消失：');
+
+    // stale：超过 10 分钟 → 可以直接回收
+    const old = acquireUpdateLock({ file, now: t0 });
+    eq(old.ok, true, 'B3：重新拿锁：');
+    const reclaimed = acquireUpdateLock({ file, now: t0 + 11 * 60 * 1000 });
+    eq(reclaimed.ok, true, 'B3：>10min 的 stale 锁必须被回收，不能永久堵住更新：');
+    eq(reclaimed.reclaimed, true, 'B3：要标记这是一次回收：');
+    releaseUpdateLock({ file, token: reclaimed.token });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('B1/B3：killProcessTree 在 POSIX 用独立进程组（负 pid），不会退回只杀直接子进程', async () => {
+  // 纯函数层钉一下：传一个真实 spawn 的 shell，确认返回 mode=process-group
+  if (process.platform === 'win32') return;
+  const proc = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 30000)'], { stdio: 'ignore', detached: true });
+  try {
+    eq(Number.isInteger(proc.pid), true, '前置条件：子进程要有 pid：');
+    const result = killProcessTree(proc);
+    eq(result.killed, true, 'B1：杀进程树必须报告成功：');
+    eq(result.mode, 'process-group', `B1：POSIX 必须走 process.kill(-pid) 杀整组（实际 ${result.mode}）：`);
+    eq(await waitFor(() => !isPidAlive(proc.pid), 2000), true, 'B1：直接子进程也必须真的退出：');
+  } finally {
+    try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* 已退出 */ }
+  }
+});
+
 await test('自升级：升级进行中 GET /list 仍然及时返回（不阻塞请求，给出实测耗时）', async () => {
   const profile = makeFakeProfile('nonblocking', '^0.2.0');
   const capture = join(selfUpdateRoot, 'capture-nonblocking.txt');
@@ -2243,6 +2692,33 @@ await test('自升级：从模块自身路径精确反推 profile（多个 profi
   eq(profileDirFromModuleUrl('not a url'), null, '坏输入不能抛：');
 });
 
+await test('C6：嵌套 node_modules/dsh-worktodo 取最后一段 —— 推不出就 null，绝不指到外层 profile', () => {
+  // 稳定性审查：旧改动把 lastIndexOf 换成了 exec（第一个匹配），嵌套布局会切到外层、把别人的 profile
+  // 当自己的。这里钉住「取最后一段 + 内层没有 package.json 就 null」。
+  const outer = join(selfUpdateRoot, 'nested-outer');
+  const outerPkg = join(outer, 'node_modules', 'dsh-worktodo', 'x');
+  const libDir = join(outerPkg, 'node_modules', 'dsh-worktodo', 'lib');
+  mkdirSync(libDir, { recursive: true });
+  // 外层 profile 有 package.json（旧实现会错误地指向它）；内层先不放
+  writeFileSync(join(outer, 'package.json'), JSON.stringify({
+    name: 'dsh-profile-outer', private: true, dependencies: { 'dsh-worktodo': '^0.2.0' },
+  }));
+  writeFileSync(join(libDir, 'index.js'), '// fake nested module');
+  const url = pathToFileURL(join(libDir, 'index.js')).href;
+
+  eq(profileDirFromModuleUrl(url), null,
+    'C6：内层没有 package.json 时必须返回 null（零写盘失败），绝不能指到外层 profile：');
+
+  // 内层是真正的包根（有 package.json）→ 必须返回内层，而不是外层
+  writeFileSync(join(outerPkg, 'package.json'), JSON.stringify({ name: 'dsh-worktodo', version: '0.2.0' }));
+  eq(profileDirFromModuleUrl(url), outerPkg,
+    `C6：嵌套布局必须取最后一段（内层 ${outerPkg}），不是外层 ${outer}：`);
+
+  // 反过来：外层没有 package.json、内层有 → 仍然只认内层
+  rmSync(join(outer, 'package.json'), { force: true });
+  eq(profileDirFromModuleUrl(url), outerPkg, 'C6：外层没有清单也不影响内层判定：');
+});
+
 await test('Windows 路径：file:///C:/... → C:\\...\\profiles\\desktop（反斜杠/盘符大小写/%20/UNC 都认）', () => {
   // 1) 最常见的 Windows registry 安装布局（用户名用变量拼，避免 CI 隐私闸门把示例当真实家目录）
   const user = 'u';
@@ -2351,7 +2827,8 @@ await test('Windows 执行器：pnpm 必须走 node(pnpm.mjs) 或 pnpm.cmd+shell
 await test('Windows 原子写：rename 覆盖失败 → 先删目标再 rename；仍失败 → 明确报错且不留半文件', () => {
   const dir = mkdtempSync(join(tmpdir(), 'worktodo-win-atomic-'));
   const file = join(dir, 'package.json');
-  const tmpFiles = () => readdirSync(dir).filter((name) => name.includes('.worktodo-tmp-'));
+  // 同时盯临时文件与 win32 回退的 .bak：成功/失败收口后都不许把内部文件留在用户目录里
+  const tmpFiles = () => readdirSync(dir).filter((name) => name.includes('.worktodo-'));
   try {
     writeFileSync(file, 'old-content');
 
@@ -2406,6 +2883,48 @@ await test('Windows 原子写：rename 覆盖失败 → 先删目标再 rename�
     eq(String(posixError?.message).includes('Windows 原子写失败'), false, 'POSIX 不该走 Windows 专用错误文案：');
     eq(readFileSync(file, 'utf8'), 'posix-old', 'POSIX 失败时原文件不动：');
     eq(tmpFiles(), [], 'POSIX 失败后也要清临时文件：');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('C1（严重）：win32 二次 rename 失败 → 目标仍存在且内容等于原值（从备份恢复，绝不消失）', () => {
+  // 审查实跑过的数据丢失路径：旧实现「先 unlink 目标、再 rename」，第二次 rename 失败时
+  // 目标已经被删、临时文件也被外层 catch 清掉 → targetExists=false。
+  // 修复后：删目标前必须已有同目录 .bak；二次失败必须从备份恢复，最后才报错。
+  const dir = mkdtempSync(join(tmpdir(), 'worktodo-win-atomic-restore-'));
+  const file = join(dir, 'package.json');
+  const original = `${JSON.stringify({ name: 'profile', dependencies: { 'dsh-worktodo': `^${PKG_VERSION}` } })}\n`;
+  try {
+    writeFileSync(file, original);
+    let backupAtUnlink = false;
+    let unlinkTargetCalls = 0;
+    let threw = null;
+    try {
+      writeFileAtomicSync(file, 'NEW-CONTENT', {
+        platform: 'win32',
+        // 两次 rename 都失败：第一次触发回退，第二次触发「从备份恢复」
+        rename: () => { const error = new Error('EPERM: operation not permitted, rename'); error.code = 'EPERM'; throw error; },
+        unlink: (target) => {
+          if (target === file) {
+            unlinkTargetCalls += 1;
+            // 删目标的那一刻，同目录必须已经有完整的 .bak
+            backupAtUnlink = readdirSync(dir).some((name) => name.includes('.worktodo-bak-'));
+          }
+          unlinkSync(target);
+        },
+      });
+    } catch (error) {
+      threw = error;
+    }
+    eq(Boolean(threw), true, '两次 rename 都失败时必须抛错（不能假装写成功）：');
+    eq(unlinkTargetCalls, 1, '回退只应删除目标一次：');
+    eq(backupAtUnlink, true, 'C1：删除目标之前必须已经在同目录写好 .bak 备份（任何瞬间都不许「目标不存在且没有备份」）：');
+    eq(existsSync(file), true, 'C1：二次 rename 失败后目标文件必须仍然存在（旧实现会把它删没）：');
+    eq(readFileSync(file, 'utf8'), original, 'C1：目标内容必须逐字节等于原值：');
+    eq(String(threw?.message).includes('已从备份恢复目标原内容'), true,
+      `C1：错误必须说明已从备份恢复（实际：${threw?.message}）：`);
+    eq(readdirSync(dir), ['package.json'], 'C1：恢复成功后不许留下临时文件或 .bak：');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -2501,24 +3020,26 @@ await test('自升级（Windows 模拟端到端）：假 pnpm 真的换掉落盘
   }
 });
 
-await test('自升级：配置默认值——autoUpdate/autoInstall 默认 true（显式 false 才关）、官方源、180s，非法值一律回落', async () => {
-  // 纯函数层先钉死：这是「默认就要自动更新」这条用户诉求的第一道闸
+await test('自升级：配置默认值——autoUpdate 默认 true / autoInstall 默认 false、官方源、180s，非法值一律回落', async () => {
+  // 纯函数层先钉死：autoUpdate 默认开（只查+下载）；autoInstall 默认关（安装必须用户点）。
+  // 稳定性复审 A1/A2：默认 autoInstall:true 会让新用户第一次启动就被后台改 profile。
   eq(normalizeUpdateConfig(undefined), {
     autoUpdate: true,
-    autoInstall: true,
+    autoInstall: false,
     updateRegistry: 'https://registry.npmjs.org/',
     updateTimeoutMs: 180000,
     restartCommand: '',
-  }, '无配置时必须默认自动更新 + 后台自动安装（沿用旧行为）：');
+  }, '无配置时必须默认自动更新，但**不**自动安装：');
   eq(normalizeUpdateConfig({}).autoUpdate, true, '空配置也必须默认自动更新：');
   eq(normalizeUpdateConfig({ autoUpdate: false }).autoUpdate, false, '显式 false 必须完全关掉：');
   eq(normalizeUpdateConfig({ autoUpdate: 'yes' }).autoUpdate, true, '只有**字面量** false 才关（配置里一个手滑的 falsy 值不该静默关掉用户要的自动更新）：');
   eq(normalizeUpdateConfig({ autoUpdate: 'false' }).autoUpdate, true, '字符串 "false" 不是字面量 false：');
   eq(normalizeUpdateConfig({ autoUpdate: 0 }).autoUpdate, true, '数字 0 不是字面量 false：');
-  // autoInstall：默认 true = 沿用「后台下完就装」的旧行为；只有字面 false 才停在「已下载」
-  eq(normalizeUpdateConfig(undefined).autoInstall, true, 'autoInstall 默认必须 true（默认沿用旧行为，不是让后台停在半路）：');
-  eq(normalizeUpdateConfig({ autoInstall: false }).autoInstall, false, '显式 false 才让后台停在「已下载」：');
-  eq(normalizeUpdateConfig({ autoInstall: 'no' }).autoInstall, true, '只有字面 false 才关（与 autoUpdate 同一把口径）：');
+  // autoInstall：默认 false = 后台只下到「已下载」，安装必须用户点；只有字面 true 才自动安装
+  eq(normalizeUpdateConfig(undefined).autoInstall, false, 'autoInstall 默认必须 false（后台不许自动改 profile）：');
+  eq(normalizeUpdateConfig({ autoInstall: true }).autoInstall, true, '显式 true 才恢复「后台下完就装」：');
+  eq(normalizeUpdateConfig({ autoInstall: 'yes' }).autoInstall, false, '非布尔真值不算开启（与 autoUpdate 同一把口径）：');
+  eq(normalizeUpdateConfig({ autoInstall: 1 }).autoInstall, false, '数字 1 不算开启：');
   // restartCommand 是显式 opt-in：不配就是空串（= 没有重启能力）
   eq(normalizeUpdateConfig(undefined).restartCommand, '', '没配 restartCommand 时必须是空串（不能凭空造一个重启命令）：');
   eq(normalizeUpdateConfig({ restartCommand: '  open -a DSH  ' }).restartCommand, 'open -a DSH', 'restartCommand 要 trim：');
@@ -2531,7 +3052,7 @@ await test('自升级：配置默认值——autoUpdate/autoInstall 默认 true�
     const defaults = (await readUpdateState(host)).json().data;
     // 面板/GET 状态要能看出「自动更新已开启」，否则用户没法解释「它怎么自己升级了」
     eq(defaults.autoUpdate, true, 'GET /worktodo/update 必须报出 autoUpdate: true：');
-    eq(defaults.autoInstall, true, 'GET 状态必须报出 autoInstall: true（默认沿用旧行为）：');
+    eq(defaults.autoInstall, false, 'GET 状态必须报出 autoInstall: false（默认不自动安装）：');
     eq(defaults.restartSupported, false, 'DSH 没给插件留重启入口 → 默认必须报 restartSupported: false（不假装能重启）：');
     // 没注入 latest 且关掉了查询：阶段就是 idle（available 由下面的注入用例钉）
     eq(defaults.phase, 'idle', `没有可用新版本时阶段必须是 idle（实际 ${defaults.phase}）：`);
@@ -2614,9 +3135,12 @@ await test('自动更新（默认开）：同一个新版本只自动尝试一�
       WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-auto-once.json'),
     }, async () => {
       const host = makeCtx();
-      await apply(host.ctx, { storePath: join(dir, 'todos.json') }); // 不传 autoUpdate → 默认 true
+      // autoUpdate 默认 true；autoInstall 现在默认 false，这条用例专门测「自动安装的节流」，
+      // 所以显式打开 autoInstall（否则后台只下载、根本不会有子进程可数）。
+      await apply(host.ctx, { storePath: join(dir, 'todos.json'), autoInstall: true });
       const status = await waitForUpdateSettled(host, 5000);
       eq(status?.autoUpdate, true, 'GET 状态必须显示自动更新已开启：');
+      eq(status?.autoInstall, true, '显式打开后 GET 必须报 autoInstall: true：');
       eq(status?.state, 'failed', `假 pnpm no-op 时自动升级应当失败（实际 ${status?.state}）：`);
       eq(status?.reason, 'version-unchanged', `失败原因是版本没变：${status?.reason}`);
       const afterFirst = invokeCount(capture);
@@ -2676,7 +3200,8 @@ await test('自动更新：link: 安装即使默认开启也一个子进程都�
       WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-auto-linked.json'),
     }, async () => {
       const host = makeCtx();
-      await apply(host.ctx, { storePath: join(dir, 'todos.json') }); // 默认 autoUpdate: true
+      // autoUpdate 默认 true；显式 autoInstall:true 才会走到 startInstall 的 linked 守卫
+      await apply(host.ctx, { storePath: join(dir, 'todos.json'), autoInstall: true });
       await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
       await new Promise((resolve) => setTimeout(resolve, 300));
       eq(invokeCount(capture), 0, `link: 场景自动更新也必须零子进程（实际 ${invokeCount(capture)}）：`);
@@ -2686,6 +3211,88 @@ await test('自动更新：link: 安装即使默认开启也一个子进程都�
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('A1：启动检查默认延后 20–30s（绝不是 apply 后立刻抢跑），测试缝可设 0', () => {
+  const fallback = resolveStartupCheckDelayMs({});
+  eq(fallback >= 20000 && fallback <= 30000, true,
+    `默认延后必须落在 20–30s（实际 ${fallback}ms）：`);
+  eq(resolveStartupCheckDelayMs({ WORKTODO_STARTUP_CHECK_DELAY_MS: '0' }), 0,
+    '测试缝 0 = 立刻检查：');
+  eq(resolveStartupCheckDelayMs({ WORKTODO_STARTUP_CHECK_DELAY_MS: 'abc' }), fallback,
+    '非法值必须回落默认：');
+  eq(resolveStartupCheckDelayMs({ WORKTODO_STARTUP_CHECK_DELAY_MS: '-5' }), fallback,
+    '负数必须回落默认：');
+});
+
+await test('A1/A2（高）：默认配置启动 —— 不自动安装、不写 profile（后台最多下载）', async () => {
+  // 审查实跑：默认 autoInstall:true + 无状态文件时，apply 返回约 50ms 后就 spawn CLI 并改 profile。
+  // 修复后默认 autoInstall:false：后台只允许把产物下载到插件自己的暂存区。
+  const profile = makeFakeProfile('startup-default', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const manifest = join(profile, 'package.json');
+  const originalBytes = readFileSync(manifest, 'utf8');
+  const mtime = statSync(manifest).mtimeMs;
+  const capture = join(selfUpdateRoot, 'capture-startup-default.txt');
+  const bin = join(selfUpdateRoot, 'bin-startup-default');
+  writeFakePnpm(bin, { capture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any' });
+  const stageDir = join(selfUpdateRoot, 'stage-startup-default');
+  const statePath = join(selfUpdateRoot, 'update-state-startup-default.json');
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_STAGE_DIR: stageDir, WORKTODO_UPDATE_STATE_PATH: statePath,
+    }, async () => {
+      ({ host, dir } = await makeUpdateHost()); // 不传任何配置 = 默认值（必须在上面的 env 里 apply）
+      const status = await waitForUpdatePhase(host, (state) => state.phase === 'downloaded', 5000);
+      eq(status?.phase, 'downloaded', `默认配置后台只该下到 downloaded（实际 ${status?.phase}，error=${status?.error}）：`);
+      eq(status?.autoInstall, false, 'A1：默认 autoInstall 必须报 false：');
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      eq(invokeCount(capture), 0,
+        `A1：默认配置下启动绝不允许自动安装（实际起了 ${invokeCount(capture)} 个 pnpm 子进程）：`);
+      eq(readFileSync(manifest, 'utf8'), originalBytes, 'A1：默认配置启动后 profile 清单必须逐字节不变：');
+      eq(statSync(manifest).mtimeMs, mtime, 'A1：连 mtime 都不许变（= 零写盘）：');
+      eq(existsSync(status?.download?.artifact), true, '后台允许下载到暂存区（不碰 profile）：');
+      eq(existsSync(statePath), true, 'A1：状态文件记录 downloaded（面板据此显示「已下载」）：');
+      const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
+      eq(persisted.result, 'downloaded', `A1：状态文件结论必须是 downloaded：${JSON.stringify(persisted)}`);
+    });
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('A1/A2：启动检查确实延后 —— apply 返回后先 idle，延时到了才 available', async () => {
+  const profile = makeFakeProfile('startup-delayed', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const statePath = join(selfUpdateRoot, 'update-state-startup-delayed.json');
+  const started = Date.now();
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_STARTUP_CHECK_DELAY_MS: '350', WORKTODO_UPDATE_STATE_PATH: statePath,
+    }, async () => {
+      ({ host, dir } = await makeUpdateHost({ autoUpdate: false }));
+      const immediate = (await readUpdateState(host)).json().data;
+      eq(immediate.phase, 'idle',
+        `A1：apply 刚返回时检查必须还没跑（实际 ${immediate.phase}）；旧实现约 50ms 就抢跑：`);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      eq((await readUpdateState(host)).json().data.phase, 'idle',
+        'A1：延后窗口内阶段必须仍是 idle：');
+      const arrived = await waitForUpdatePhase(host, (state) => state.phase === 'available', 3000);
+      eq(arrived?.phase, 'available', `A1：延时到了必须真的检查（实际 ${arrived?.phase}）：`);
+      const elapsed = Date.now() - started;
+      eq(elapsed >= 300, true, `A1：检查必须被延后（实际 ${elapsed}ms，配置 350ms）：`);
+    });
+  } finally {
+    if (dir) rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -2708,7 +3315,7 @@ await test('A4：跨重启节流 —— 第二次「启动」同一 latest 时�
     }, async () => {
       // —— 第 1 次「启动」——
       const first = makeCtx();
-      await apply(first.ctx, { storePath: join(storeDir, 'a.json') });
+      await apply(first.ctx, { storePath: join(storeDir, 'a.json'), autoInstall: true });
       const firstStatus = await waitForUpdateSettled(first, 5000);
       eq(firstStatus?.state, 'failed', `第一次启动必须真的尝试过（实际 ${firstStatus?.state}）：`);
       eq(invokeCount(capture), 2, `一次自动尝试 = update + add（实际 ${invokeCount(capture)}）：`);
@@ -2720,7 +3327,7 @@ await test('A4：跨重启节流 —— 第二次「启动」同一 latest 时�
 
       // —— 第 2 次「启动」（新的 apply = 新的进程生命周期）——
       const second = makeCtx();
-      await apply(second.ctx, { storePath: join(storeDir, 'b.json') });
+      await apply(second.ctx, { storePath: join(storeDir, 'b.json'), autoInstall: true });
       await call(second.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
       await new Promise((resolve) => setTimeout(resolve, 400));
       eq(invokeCount(capture), callsAfterFirst, `A4：第二次启动不许再起子进程（实际 ${invokeCount(capture)}）：`);
@@ -2750,7 +3357,7 @@ await test('A4：节流状态文件损坏/缺失时安全地当作「未尝试�
       WORKTODO_UPDATE_STATE_PATH: statePath,
     }, async () => {
       const host = makeCtx();
-      await apply(host.ctx, { storePath: join(dir, 'todos.json') }); // 默认 autoUpdate: true
+      await apply(host.ctx, { storePath: join(dir, 'todos.json'), autoInstall: true }); // 默认 autoUpdate: true
       const status = await waitForUpdateSettled(host, 5000);
       eq(status?.state, 'failed', `损坏的状态文件不能把升级也一起弄坏（实际 ${status?.state}）：`);
       eq(invokeCount(capture), 2, `损坏状态要当作「没试过」→ 该升级还是升级（实际 ${invokeCount(capture)} 次）：`);
@@ -2852,7 +3459,8 @@ await test('小问题 1：自动升级尝试真的失败时，状态文件如实
       WORKTODO_UPDATE_STATE_PATH: statePath,
     }, async () => {
       const host = makeCtx();
-      await apply(host.ctx, { storePath: join(dir, 'todos.json') }); // 不传 autoUpdate → 默认 true
+      // autoUpdate 默认 true；autoInstall 默认 false，这里显式打开以覆盖「自动尝试的结论回写」
+      await apply(host.ctx, { storePath: join(dir, 'todos.json'), autoInstall: true });
       const status = await waitForUpdateSettled(host, 5000);
       eq(status?.state, 'failed', `这次尝试其实是失败（实际 ${status?.state}）：`);
       eq(status?.reason, 'version-unchanged', `失败原因是版本没变：${status?.reason}`);
@@ -2892,7 +3500,7 @@ await test('小问题 1：自动升级真的成功时，状态文件写 done（�
       WORKTODO_UPDATE_STATE_PATH: statePath,
     }, async () => {
       const host = makeCtx();
-      await apply(host.ctx, { storePath: join(dir, 'todos.json') });
+      await apply(host.ctx, { storePath: join(dir, 'todos.json'), autoInstall: true });
       const status = await waitForUpdateSettled(host, 5000);
       eq(status?.state, 'done', `版本真变了就该 done（实际 ${status?.state}，error=${status?.error}）：`);
       const wrote = await waitFor(() => {
@@ -3412,7 +4020,7 @@ await test('自升级：config.autoInstall 两种取值——true=后台下完�
     rmSync(stageOff, { recursive: true, force: true });
   }
 
-  // —— 默认（autoInstall 缺省 = true）：后台下完直接装，与旧行为一致 ——
+  // —— 显式 autoInstall:true：后台下完直接装（显式 opt-in 的旧行为） ——
   const profileOn = makeFakeProfile('autoinstall-default', '^0.2.0');
   seedInstalledVersion(profileOn, '0.2.0');
   const onPnpm = makeInstallingPnpm('autoinstall-default', profileOn);
@@ -3427,11 +4035,11 @@ await test('自升级：config.autoInstall 两种取值——true=后台下完�
       // 专用节流文件：否则前面用例留下的「已试过 9.9.9」会把这次自动更新节流掉
       WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-autoinstall-default.json'),
     }, async () => {
-      on = await makeUpdateHost();
+      on = await makeUpdateHost({ autoInstall: true });
       const settled = await waitForUpdateSettled(on.host, 6000);
-      eq(settled?.phase, 'installed', `默认（autoInstall:true）后台要一路装完（实际 ${settled?.phase}，error=${settled?.error}）：`);
-      eq(settled?.autoInstall, true, 'GET 状态要如实报出默认 autoInstall:true：');
-      eq(invokeCount(onPnpm.capture) >= 1, true, '默认行为要真的起安装子进程（沿用旧行为）：');
+      eq(settled?.phase, 'installed', `显式 autoInstall:true 后台要一路装完（实际 ${settled?.phase}，error=${settled?.error}）：`);
+      eq(settled?.autoInstall, true, 'GET 状态要如实报出 autoInstall:true：');
+      eq(invokeCount(onPnpm.capture) >= 1, true, '显式开启后要真的起安装子进程：');
       // 后台自动装完**不**会自动请求重启：重启永远是用户动作
       eq(settled?.restart, null, '后台自动安装不许自己请求重启（重启只能由用户点）：');
     });
