@@ -1509,6 +1509,53 @@ await test('自升级：link: 安装被跳过，一个子进程都不起（reaso
   }
 });
 
+await test('自升级：启动检查在飞时点升级不能被「已在运行」吞掉，且检查晚到不许冲掉结论', async () => {
+  // 直接复现 CI 的失败形态：apply() 的启动检查还在等 registry（慢），用户这时点了升级。
+  // 旧实现把 phase=checking 当成「已在安装」，回 ok:true running 却一个子进程都不起；
+  // 更糟的是检查晚到后会用 await 之前的 idleBefore 快照把阶段改回 available/idle。
+  const profile = makeFakeProfile('linked-during-check', 'link:/tmp/fake/dsh-worktodo');
+  let sawCheck;
+  const checkArrived = new Promise((resolve) => { sawCheck = resolve; });
+  const slowRegistry = createServer((request, response) => {
+    sawCheck();
+    setTimeout(() => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ 'dist-tags': { latest: bumpPatch(pkgVersion, 1) }, versions: {} }));
+    }, 400);
+  });
+  await new Promise((resolve) => slowRegistry.listen(0, '127.0.0.1', resolve));
+  slowRegistry.unref();
+  try {
+    await withEnv({
+      WORKTODO_NO_UPDATE_CHECK: undefined,
+      WORKTODO_UPDATE_LATEST: undefined,
+      WORKTODO_PROFILE_DIR: profile,
+    }, async () => {
+      const { host, dir } = await makeUpdateHost({
+        autoUpdate: false,
+        updateRegistry: `http://127.0.0.1:${slowRegistry.address().port}/`,
+      });
+      try {
+        eq((await readUpdateState(host)).json().data.phase, 'checking',
+          '前置条件：启动检查必须真的在飞（否则这条用例没有牙齿）：');
+        const body = (await triggerUpdate(host)).json();
+        eq(body.ok, false, '检查在飞不是「已在安装」：手动升级必须继续走守卫，link: 要拒绝：');
+        eq(body.reason, 'linked', `link: 的稳定原因不能被吞成 running（实际 ${body.reason}）：`);
+        await checkArrived;
+        await new Promise((resolve) => setTimeout(resolve, 500)); // 等检查真的返回并收口
+        const status = (await readUpdateState(host)).json().data;
+        eq(status.phase, 'failed', `检查晚到不许把已定论的 link: 冲成 available/idle（实际 ${status.phase}）：`);
+        eq(status.reason, 'linked', `结论仍必须是 linked（实际 ${status.reason}）：`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    slowRegistry.closeAllConnections?.();
+    slowRegistry.close();
+  }
+});
+
 await test('自升级（核心）：pnpm update no-op → 第 2 步交 pnpm add 精确版本，仍不变则 failed 且提「版本未变」+ 逐字节回滚', async () => {
   // 真机复现：spec pin 在 ^0.2.0，落盘 0.2.0，registry latest 0.2.7，
   // 而 `plugin add`/`pnpm update` 退出码 0 却「added 0」。修复后必须

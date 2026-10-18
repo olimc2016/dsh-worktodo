@@ -20,6 +20,16 @@ const here = dirname(fileURLToPath(import.meta.url));
  */
 const repoRoot = join(here, '..');
 
+/**
+ * 全量测试不联网：在 spawn 之前把测试缝放进**子进程环境**。
+ *
+ * 为什么必须在这里设：各测试文件顶部虽然也写了同一行，但 ESM 的静态 import 会被提升到
+ * 模块体之前执行，`lib/index.js` 求值时那行还没跑。CI（干净环境、registry 较慢）因此会
+ * 真的发一次 registry 请求，phase 停在 `checking`，自升级用例被「已在运行」守卫静默吞掉。
+ * 这里设进父进程环境后，所有 suite 子进程从**第一行**就带着它。
+ */
+process.env.WORKTODO_NO_UPDATE_CHECK = '1';
+
 /** 顺序很重要：后面的烟测依赖前面模块的行为。 */
 const SUITES = [
   ['verify-records.mjs', '数据模型'],
