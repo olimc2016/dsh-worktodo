@@ -28,6 +28,7 @@
 - [ ] 真机重启 + 面板实际数据对账一次（§4）
 
 ---
+- [ ] **平台包仍是 optional peer**、`dependencies` 里没有 `@deepseek-ai/*`、profile 模拟安装后没有第二份平台包（`verify-submission` 会拦）
 
 ## 1. 项目结构约定
 
@@ -131,6 +132,27 @@
 
 ---
 
+### 2.7 宿主平台包：只能 optional peer，绝不 dependencies（2026-10-18 事故）
+
+**规则**：`@deepseek-ai/*` 这类**宿主提供的平台包**（`dsh-tools`、`dsh-storage-domain`、`dsh-home-paths` 等）**只能**声明为
+`peerDependencies` + `peerDependenciesMeta: { optional: true }`；**`dependencies` 里不得出现任何 `@deepseek-ai/*`**。
+
+**为什么（真实事故）**：插件把平台包写成 `dependencies` 后，装进 profile 会多出**第二份**平台包；DSH 的 profile 解析**优先本层副本**
+→ 旧版副本顶掉宿主版本 → 宿主一个 **required** 的 `@deepseek-ai/dsh-storage-domain` 条目激活失败 → `storageDomain` 缺失 →
+`tools` / `workspaceRegistry` 等十几个插件一直等待 → **桌面版直接启动失败**（`dsh web` 不受影响，因为 web profile 没装该插件）。
+症状长这样：`startup failed: 1 required plugin did not activate` + 一长串 `Plugins waiting for services`。
+
+**代码要求**：**不得在模块顶层静态 import 平台包** → 必须在函数内**动态 import + 失败降级**；
+平台包缺失/版本不符时**只允许降级本插件**（工具不注册、回退 JSON 存储），**绝不连累宿主启动**。
+
+**自动防线（已固化，发布阻断）**：`tools/verify-submission.mjs` 断言四条 ——
+①`dependencies` 无 `@deepseek-ai/*`；②三个平台包为 optional peer；③服务端源码顶层无静态 import 平台包；④动态 import 集合等于这三个包。
+`prepublishOnly` 会跑它，`pnpm test` / CI 也会跑 —— **违反即发不出去**。
+
+**装进 profile 后的手工核验**：profile 顶层只应出现自己的包；插件目录内**不得**存在 `node_modules/@deepseek-ai`。
+
+**升级模拟**：宿主大版本升级后平台包版本会变 —— 必须重新做一次"profile 模拟安装"再发版。
+
 ## 3. 测试规范
 
 ### 3.1 分层（每层职责单一）
@@ -160,6 +182,8 @@
 4. **回归样例要能离开这台机器跑**：禁止硬编码 `/Users/<你>`；用 fixture 或环境变量，缺失则跳过。
 
 5. **网络全部打桩**：烟测里出现真实 fetch 就是缺陷（会偶发失败、泄露 token、拖慢 CI）。
+
+- **宿主提供的包一律 optional peer + 函数内动态 import**；写成 `dependencies` 会让**宿主启动失败**（2026-10-18 事故：第二份平台包顶掉宿主版本 → required 条目激活失败 → 十几个插件等待 → 桌面版起不来）。发布面断言会阻断 ✓
 
 ### 3.3 已知缺口（必须补，验收标准写死）
 
@@ -218,6 +242,8 @@ npm pack --dry-run     # 看 files 白名单命中了什么
 ```
 
 必须满足：只含 `lib/`、`src/`、`cordis.patch.yml`、README/CHANGELOG/LICENSE；**不含** `node_modules`、截图、`docs/marketplace-research.md` 类内部笔记、任何 `.npmrc`/凭据。
+
+- **平台包依赖面**：`node tools/verify-submission.mjs` 必须绿（`dependencies` 无 `@deepseek-ai/*`、三包为 optional peer、顶层无静态 import）；另做一次 profile 模拟：把 tarball 装进临时目录后，`ls node_modules/@deepseek-ai` **只应有宿主那份**，插件目录内**不得**出现 `node_modules/@deepseek-ai`。
 
 ### 5.4 发布后核验
 

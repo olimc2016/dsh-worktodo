@@ -53,6 +53,8 @@ trust relationship（OIDC）或"不带 bypass 的 GAT + stage publish"。所以�
 
 ## 每次发版（绑定之后）
 
+> 发布前必查：**平台包仍是 optional peer**（`dependencies` 里不得有 `@deepseek-ai/*`，顶层不得静态 import 平台包）。`pnpm test` / `prepublishOnly` / CI 都会跑 `verify-submission` 拦截 ✓
+
 ```bash
 cd <本仓库目录>
 
