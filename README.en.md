@@ -3,7 +3,7 @@
 
 **A work todo list that belongs to you, not to a session.** A dedicated DSH sidebar panel, plus `worktodo_*` tools so the agent reads and writes **the same** list you do.
 
-> Works with **DSH 0.2.x** (tested on 0.2.0-rc.2) · runtime deps are **3 official platform packages only** (no third-party deps) · community plugin, unofficial
+> Works with **DSH 0.2.x** (tested on 0.2.0-rc.2) · **no runtime npm dependencies**; the 3 official platform packages are optional peers supplied by DSH · community plugin, unofficial
 
 > **About the paths in this file**: references to `docs/`, `tools/` and similar point into the **repository** —
 > those files are not part of the npm package. Repository: <https://github.com/olimc2016/dsh-worktodo>
@@ -36,10 +36,18 @@ dsh plugin --profile desktop add github:olimc2016/dsh-worktodo
 ```
 
 This path is verified (see `docs/verification.md`): the browser half's build output `lib/client.js` is committed,
-and the package declares no `prepare`/`install` build script, so a git install needs **no build authorization**
-measurement (install from GitHub): **1 top-level package** plus the 3 official platform packages, about **12 MB** installed
-(~8 MB of that is zod, pulled in by the official `@deepseek-ai/dsh-tools`), and no development dependencies.
-no nested `node_modules`, and the installed tree matches the npm tarball file for file.
+and the package declares no `prepare`/`install` build script, so a git install needs **no build authorization**.
+Measured (installed from GitHub): **1 top-level package** (this plugin only). The 3 official platform packages are
+supplied by the DSH installation, so no second copy is installed into the profile and no development dependencies
+are pulled in; there is no nested `node_modules`, and the installed tree matches the npm tarball file for file.
+
+> **Why the platform packages are optional peers, not `dependencies`**: with peer-only declarations, DSH before
+> 0.2.1 had no installation interception layer, so an installed plugin could not resolve them and failed to load
+> entirely; 0.1.1 switched them to `dependencies`. Since 0.2.1 the host provides those packages, and carrying a
+> copy installs a **second** one into the profile that mixes with the host's version (the 2026-10-17 desktop
+> "required plugin did not activate" failure). 0.2.7 moves them back to optional peers: they resolve from the DSH
+> installation, and if one is genuinely missing the plugin degrades to panel-only instead of dragging the host
+> down (all three are loaded through guarded dynamic imports inside functions).
 
 **Option 2: from npm** (once the package is published)
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-worktodo",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "DSH 工作待办面板（社区插件，非官方）：归你所有、跨会话持久的工作待办——优先级 / 截止日期 / 项目 / 逾期与本周视图，agent 通过 worktodo_* 工具读写同一份列表。官方 todo_write 属于单个会话且只能整表替换，这份列表属于人。Human-owned cross-session work todo list for DeepSeek Harness: priorities, due dates, projects, overdue/week views and worktodo_* tools the agent shares with you.",
   "type": "module",
   "main": "lib/index.js",
@@ -75,22 +75,31 @@
       ]
     }
   },
-  "dependencies": {
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-home-paths": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-storage-domain": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-tools": "^0.2.0-rc.2"
   },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2"
-  },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-home-paths": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-storage-domain": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
       "optional": true
     }
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.4",
     "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-home-paths": "0.2.0-rc.2",
     "@deepseek-ai/dsh-invariants": "0.2.0-rc.2",
     "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
     "@deepseek-ai/dsh-ptc-runtime": "0.2.0-rc.2",
@@ -99,7 +108,9 @@
     "@deepseek-ai/dsh-scope": "0.2.0-rc.2",
     "@deepseek-ai/dsh-session": "0.2.0-rc.2",
     "@deepseek-ai/dsh-storage": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "0.2.0-rc.2",
     "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
     "@deepseek-ai/dsh-user-approval": "0.2.0-rc.2",
     "@deepseek-ai/dsh-util-values": "0.2.0-rc.2",
     "esbuild": "^0.28.2"

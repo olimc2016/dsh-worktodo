@@ -27,7 +27,7 @@
 
 **分类**：任务管理 / 侧栏面板 / Web UI
 
-**安装**（两条；GitHub 那条**已实测**可用，见 `docs/verification.md`——顶层 1 个包 + 3 个官方平台包、约 12 MB、无需构建授权）：
+**安装**（两条；GitHub 那条**已实测**可用，见 `docs/verification.md`——顶层只有本插件 1 个包、平台包由 DSH 提供、无需构建授权）：
 
 ```bash
 dsh plugin --profile desktop add github:olimc2016/dsh-worktodo   # 不依赖 npm 包
@@ -36,7 +36,7 @@ dsh plugin --profile desktop add dsh-worktodo                    # npm 包发布
 
 **亮点**：
 1. **装得上**：兼容 DSH 0.2.x（0.2.0-rc.2 实测）；同类插件不少仍锁在 0.1.x 会被版本闸门拒绝
-2. **运行期只依赖 3 个官方平台包**（`@deepseek-ai/dsh-tools` / `dsh-storage-domain` / `dsh-home-paths`），**无任何第三方依赖**
+2. **运行期只用 3 个官方平台包**（`@deepseek-ai/dsh-tools` / `dsh-storage-domain` / `dsh-home-paths`，都是 optional peer、由 DSH 提供），**无任何第三方依赖、也不会在 profile 里装第二份**
 3. **归人所有**：跨会话、跨项目持久，重启与换会话都还在——与「会话一关就翻篇」的 `todo_write` 互补
 4. **逐项编辑**：按 id / 完整标题 / 唯一标题前缀定位单条修改，不会像整表替换那样动到其他条目
 5. **富字段**：优先级（高/普通/低）、截止日期（支持 `today` / `tomorrow` / `+3d` 这类相对写法）、项目、备注

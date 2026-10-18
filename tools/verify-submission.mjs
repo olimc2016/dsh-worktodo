@@ -18,7 +18,7 @@
  *   - 法定分类：该仓库 README 的分节标题（11 个）
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import path from 'node:path';
@@ -53,6 +53,76 @@ function eq(actual, expected, hint = '') {
   const a = JSON.stringify(actual);
   const b = JSON.stringify(expected);
   if (a !== b) throw new Error(`${hint}期望 ${b}，实际 ${a}`);
+}
+
+/**
+ * 运行期必须由宿主/DSH 提供的平台包。
+ *
+ * 为什么它们只能是 peer：pnpm 会把 `dependencies` 真的装进 profile，
+ * 而 DSH 的 profile resolution 对「从 profile 里发出的 import」优先选本层副本——
+ * 于是插件带进来的一份旧版本会盖住宿主自带的那份（详见
+ * `docs/reviews/duplicate-platform-packages.md` 与 `docs/verification.md`）。
+ */
+const PLATFORM_PACKAGES = [
+  '@deepseek-ai/dsh-tools',
+  '@deepseek-ai/dsh-storage-domain',
+  '@deepseek-ai/dsh-home-paths',
+];
+
+/**
+ * 发布清单里的平台包声明是否合规。
+ *
+ * 返回违规项而不是直接抛错，是为了让下面的「反向自检」能拿一份故意改坏的清单
+ * 验证这套判定真的会红——没有反向验证的测试不算测试。
+ * @param {object} manifest
+ * @returns {string[]} 违规描述；空数组 = 合规
+ */
+function platformDependencyViolations(manifest) {
+  const violations = [];
+  const deps = manifest.dependencies ?? {};
+  const peers = manifest.peerDependencies ?? {};
+  const meta = manifest.peerDependenciesMeta ?? {};
+  for (const name of PLATFORM_PACKAGES) {
+    if (Object.hasOwn(deps, name)) violations.push(`${name} 出现在 dependencies（安装时会多出第二份）`);
+    if (!Object.hasOwn(peers, name)) violations.push(`${name} 未声明为 peerDependencies`);
+    if (meta[name]?.optional !== true) violations.push(`${name} 未在 peerDependenciesMeta 里标 optional`);
+  }
+  for (const name of Object.keys(deps)) {
+    if (name.startsWith('@deepseek-ai/')) violations.push(`dependencies 里还有 @deepseek-ai/* 包：${name}`);
+  }
+  return violations;
+}
+
+/**
+ * 服务端源码（`lib/index.js` + `src/*.mjs`）的 import 清单。
+ *
+ * 只按行扫，避免正则跨语句把注释/多行字符串误当成 import。
+ * @returns {{ staticBare: string[], dynamicBare: string[] }} 已剔除相对路径与 node: 内建模块
+ */
+function serverImportSpecifiers() {
+  const files = [
+    'lib/index.js',
+    ...readdirSync(join(root, 'src'))
+      .filter((name) => name.endsWith('.mjs'))
+      .map((name) => `src/${name}`),
+  ];
+  const staticBare = [];
+  const dynamicBare = [];
+  const isBare = (specifier) => !specifier.startsWith('.')
+    && !specifier.startsWith('/')
+    && !specifier.startsWith('#')
+    && !specifier.startsWith('node:');
+  for (const file of files) {
+    const text = readFileSync(join(root, file), 'utf8');
+    for (const line of text.split('\n')) {
+      const staticMatch = line.match(/^\s*(?:import|export)\s+(?:[^'"]*?\s+from\s+)?['"]([^'"]+)['"]/);
+      if (staticMatch && isBare(staticMatch[1])) staticBare.push(`${file}: ${staticMatch[1]}`);
+      for (const dynamicMatch of line.matchAll(/\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g)) {
+        if (isBare(dynamicMatch[1])) dynamicBare.push(dynamicMatch[1]);
+      }
+    }
+  }
+  return { staticBare, dynamicBare };
 }
 
 /** git 跟踪的文件清单（git 安装能拿到的就是这些）。 */
@@ -213,13 +283,41 @@ test('dsh.client 声明完整（缺了面板不会被组合进 bundle）', () =>
   eq(Array.isArray(pkg.dsh?.client?.inject) && pkg.dsh.client.inject.length > 0, true, 'dsh.client.inject 为空：');
 });
 
-test('运行期依赖必须且只能是被 import 的平台包', () => {
-  // 这条曾经断言"零运行期依赖"——那个设计是错的：只声明 peer 时，npm/git 装出来的插件
-  // 解析不到平台包，DSH 启动时会直接加载失败（实测：unknown tool "worktodo_list"）。
-  const required = ['@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-storage-domain', '@deepseek-ai/dsh-home-paths'];
-  const deps = Object.keys(pkg.dependencies ?? {});
-  eq(required.filter((d) => !deps.includes(d)), [], '缺少运行期 import 的平台包（装出来会启动失败）：');
-  eq(deps.filter((d) => !required.includes(d)), [], '出现了非平台包的运行期依赖（应当为零）：');
+test('平台包只能是可选 peer：dependencies 里出现 @deepseek-ai/* 即红', () => {
+  // 这条曾经反过来要求三个平台包必须进 dependencies（0.1.1 的修法）。那个修法在
+  // 当时是必要的（旧版 DSH 没有 profile resolution），但它让 pnpm 把平台包装进
+  // profile，产生第二份副本；0.2.1 起 DSH 有 installation/profile 两层解析，
+  // 自带一份就够了，再带一份会与宿主版本混用（2026-10-17 桌面版启动失败的根因）。
+  // 现在：dependencies 必须为空，三个平台包必须声明为 optional peer。
+  eq(platformDependencyViolations(pkg), [], '平台包声明不合规：');
+
+  // 解析失败只该让「工具/官方存储」降级，绝不能在 import 阶段把宿主一起拖下水：
+  // 顶层静态 import 平台包 = 模块求值即失败；必须是函数内的动态 import（有 catch）。
+  const { staticBare, dynamicBare } = serverImportSpecifiers();
+  eq(staticBare, [], '服务端源码在模块顶层静态 import 了非 node: 包（平台包缺失时会连累宿主加载）：');
+  eq([...new Set(dynamicBare)].sort(), [...PLATFORM_PACKAGES].sort(),
+    '运行期动态 import 的平台包集合必须与 peer 声明一致：');
+});
+
+test('反向自检：把平台包塞回 dependencies，上面的校验必须变红', () => {
+  // 只加回 dependencies、保留 peer 的「悄悄多带一份」形态
+  const shadow = {
+    ...pkg,
+    dependencies: { ...(pkg.dependencies ?? {}), '@deepseek-ai/dsh-tools': pkg.peerDependencies['@deepseek-ai/dsh-tools'] },
+  };
+  const shadowViolations = platformDependencyViolations(shadow);
+  eq(shadowViolations.some((item) => item.includes('@deepseek-ai/dsh-tools') && item.includes('dependencies')), true,
+    `把 dsh-tools 塞回 dependencies 却没被抓住：${JSON.stringify(shadowViolations)}`);
+
+  // 「从 peer 移走」的形态：两个方向都必须红
+  const moved = {
+    ...pkg,
+    dependencies: { ...(pkg.dependencies ?? {}), '@deepseek-ai/dsh-tools': pkg.peerDependencies['@deepseek-ai/dsh-tools'] },
+    peerDependencies: Object.fromEntries(Object.entries(pkg.peerDependencies ?? {}).filter(([name]) => name !== '@deepseek-ai/dsh-tools')),
+  };
+  const movedViolations = platformDependencyViolations(moved);
+  eq(movedViolations.some((item) => item.includes('未声明为 peerDependencies')), true,
+    `把 dsh-tools 从 peerDependencies 移走却没被抓住：${JSON.stringify(movedViolations)}`);
 });
 
 test('git 安装分类与上游一致：入口已提交、且不需要构建授权', () => {

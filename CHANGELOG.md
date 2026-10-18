@@ -2,6 +2,28 @@
 
 > 本文提到的 `tools/`、`docs/` 等路径都在**仓库**里，不在 npm 发布包内：<https://github.com/olimc2016/dsh-worktodo>
 
+## 0.2.8
+
+> **紧急修复**：0.2.5–0.2.7 会把宿主平台包装成插件私有副本，**导致 DSH 桌面版启动失败** ✗。
+
+### 致命修复（会阻止 DSH 启动）
+
+- **不再自带宿主平台包**：`@deepseek-ai/dsh-tools` / `dsh-storage-domain` / `dsh-home-paths` 从 `dependencies` 改为
+  **optional `peerDependencies`**。之前它们被装进 profile，形成**第二份**平台包；DSH 的 profile 解析优先用 profile 内那份
+  （例如 `dsh-storage-domain@0.2.0-rc.2` 顶掉宿主的 `0.2.1-rc.2`）→ 宿主一个 **required** 的 `@deepseek-ai/dsh-storage-domain`
+  条目激活失败 → `storageDomain` 缺失 → `tools`/`workspaceRegistry` 等 **16 个插件一直等待** → **桌面版启动失败**
+  （`dsh web` 不受影响：web profile 没装该插件）。修复后 profile 里只会有 `dsh-worktodo` 本身。
+- **平台包全部为函数内动态 import**（现以测试钉死）：即使缺失/版本不符，也**只降级本插件**（工具不注册、回退 JSON 存储），
+  **绝不连累宿主启动**。
+- 新增发布面断言：**`dependencies` 不得出现任何 `@deepseek-ai/*`**；三个平台包必须是 optional peer；顶层不得静态 import 平台包。
+
+### 一并包含
+
+- 0.2.7 的 Windows 自更新修复（`node + pnpm.mjs` 优先、`pnpm.cmd` 兜底、失败 `diagnostics` 可见）。
+- 6 条稳定性修复（原子写永不删目标 / 杀进程树 + 跨进程锁 / `autoInstall` 默认关 + 启动检查延后 / 回滚带 lockfile / 路径推导 / 后台 catch）。
+
+> **升级方式（重要）**：先 `pnpm remove dsh-worktodo`（清掉旧的重复平台包），再装 0.2.8，然后重启 DSH。
+
 ## 0.2.7
 
 ### 修复（Windows 自更新点更新无效）

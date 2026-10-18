@@ -336,7 +336,13 @@ granular token」，而现在这个 token 两者都不是。
 **当时的处理（❌ 错的，已在 0.1.1 更正）**：我判断"那棵 `node_modules` 只是开发依赖、运行时用不到"，
 于是把它删掉，以为顺便造出了"真 registry 形态"（包内零依赖）。**这个判断是错的**——见下面那节：
 删掉之后 DSH 重启时**插件直接加载失败**，因为那三个官方平台包正是运行期 import 的东西。
-真正的修法是把它们从 `peerDependencies` 改成 `dependencies`（0.1.1），不是删本地副本。
+当时的修法是把它们从 `peerDependencies` 改成 `dependencies`（0.1.1），不是删本地副本。
+
+> **0.2.7 更正（结论已反转）**：`dependencies` 这个修法只对 0.2.1 之前的 DSH 成立。
+> 0.2.1 起宿主有 installation/profile 两层 runtime resolution，平台包由宿主提供；
+> 插件再带一份会在 profile 里产生**第二份副本**，并盖住宿主自带的那份（2026-10-17 桌面版
+> 启动失败的根因）。0.2.7 已把三个平台包移回 **optional peer**，并把 import 改成可失败的惰性加载。
+> 完整证据见 `docs/reviews/duplicate-platform-packages.md`；下一节的结论同样以该更正为准。
 
 ## ⚠️ ⚠️ 用 `dsh plugin remove` 卸载 link 安装的插件，会清空被链接仓库的 `node_modules`
 
@@ -570,6 +576,13 @@ npm error 404  'dsh-worktodo@0.1.1' is not in this registry.
 <https://www.npmjs.com/package/dsh-worktodo/access>。
 
 ## ❌→✅ 插件启动失败：只声明 `peerDependencies` 是错的（0.1.1 修复）
+
+> **0.2.7 更正**：本节是**历史记录**，只在 0.2.1 之前的 DSH 上成立。当时的真根因是
+> 「模块顶层静态 import 平台包 + 该 DSH 版本不提供 installation 拦截层」，所以缺包 =
+> 模块求值失败 = 插件整个不激活。0.2.1 起宿主会提供 installation 层，且本插件已把所有平台包
+> import 改成函数内动态 import + catch；因此**现在正确的是 optional peer**（见文件顶部
+> 「平台包在发布形态下怎么解析」与 `docs/reviews/duplicate-platform-packages.md`）。
+> 不要照本节把平台包改回 `dependencies`——那会装出第二份，正是 2026-10-17 启动失败的原因。
 
 **用户报告**：「代办启动失败了」。实测确认插件确实没加载——我自己的工具调用直接报
 `Error: unknown tool "worktodo_list"`（工具全没了）。

@@ -15,7 +15,7 @@ process.env.WORKTODO_NO_UPDATE_CHECK = '1';
 import { Readable } from 'node:stream';
 import { createServer } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
 // DSH 判定「工具返回值是否 lossless JSON」用的就是这一个函数（见 assertLossless 的说明）
@@ -4183,6 +4183,84 @@ await test('面板配置随 /list 载荷下发：默认 celebrate:true，config.
   } finally {
     rmSync(on.dir, { recursive: true, force: true });
     rmSync(off.dir, { recursive: true, force: true });
+  }
+});
+
+await test('平台包全部不可解析：apply 不抛、只降级（工具/官方存储失败，宿主不受影响）', () => {
+  // 真实场景：插件在 profile 里，但 @deepseek-ai/dsh-tools / dsh-storage-domain 解析不到
+  // （宿主版本太旧、拦截层没提供、profile 装坏了）。这时**不能**让 apply 抛异常——
+  // 插件是 bundle 里的一层，apply 抛会被宿主记成「required plugin did not activate」。
+  //
+  // 做法：把插件源码复制到没有 node_modules 的 /tmp 目录，父目录链上也没有平台包；
+  // 子进程里用假 ctx 走一遍 apply。这是**真实解析失败**，不是打桩。
+  const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const copyDir = mkdtempSync(join(tmpdir(), 'worktodo-no-platform-'));
+  try {
+    for (const entry of ['lib', 'src', 'package.json']) {
+      cpSync(join(pluginRoot, entry), join(copyDir, entry), { recursive: true });
+    }
+    const childSource = String.raw`import { apply } from './lib/index.js';
+
+const logs = [];
+const services = {
+  storageDomain: { async open() { throw new Error('平台包缺失时不应走到 open'); } },
+  tools: { register() { return () => {}; } },
+};
+const ctx = {
+  logger: () => ({ info: (message) => logs.push('info ' + message), warn: (message) => logs.push('warn ' + message) }),
+  get: (name) => services[name],
+  on: () => () => {},
+  emit: () => {},
+  inject: (deps, callback) => {
+    if (deps.every((dep) => services[dep])) callback(ctx);
+    return () => {};
+  },
+  effect: (callback) => { callback(); return { dispose() {} }; },
+  systemPrompt: { section: () => () => {} },
+};
+
+let thrown = null;
+try {
+  await apply(ctx, { autoUpdate: false });
+} catch (error) {
+  thrown = error;
+}
+await new Promise((resolve) => setTimeout(resolve, 300));
+
+if (thrown) {
+  console.error('APPLY_THREW ' + (thrown && thrown.stack ? thrown.stack : thrown));
+  process.exit(2);
+}
+const text = logs.join('\n');
+const checks = [
+  ['工具未注册降级', text.includes('工具未注册')],
+  ['官方存储打开失败', text.includes('打开失败')],
+  ['回退到 JSON 文件', text.includes('待办数据使用 JSON 文件')],
+];
+const missing = checks.filter(([, ok]) => !ok).map(([name]) => name);
+if (missing.length) {
+  console.error('MISSING_LOGS ' + missing.join(',') + '\n' + text);
+  process.exit(3);
+}
+console.log('RESILIENT_OK');
+`;
+    writeFileSync(join(copyDir, 'child.mjs'), childSource);
+    const run = spawnSync(process.execPath, [join(copyDir, 'child.mjs')], {
+      cwd: copyDir,
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: {
+        ...process.env,
+        DSH_HOME: join(copyDir, 'home'),
+        WORKTODO_NO_UPDATE_CHECK: '1',
+        WORKTODO_STARTUP_CHECK_DELAY_MS: '0',
+      },
+    });
+    eq(run.error, undefined, `子进程启动失败：${run.error}`);
+    eq(run.status, 0, `应正常退出（实际 ${run.status}）\nstdout:\n${run.stdout}\nstderr:\n${run.stderr}`);
+    eq(run.stdout.includes('RESILIENT_OK'), true, `缺少成功标记\nstdout:\n${run.stdout}\nstderr:\n${run.stderr}`);
+  } finally {
+    rmSync(copyDir, { recursive: true, force: true });
   }
 });
 

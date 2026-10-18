@@ -38,14 +38,16 @@ dsh plugin --profile desktop add github:olimc2016/dsh-worktodo
 
 这条路是实测过的（见 `docs/verification.md`）：仓库里提交了浏览器半侧的构建产物 `lib/client.js`，
 包内没有 `prepare`/`install` 这类构建脚本，所以 **git 安装不需要任何构建授权**，也不会把开发依赖装进来
-——实测（从 GitHub 安装）：顶层解析 **1 个包** + 3 个官方平台包，安装约 **12 MB**（其中约 8 MB 是官方 `@deepseek-ai/dsh-tools` 依赖的 zod），
-包内含已构建的 `lib/client.js`，**无需构建授权**。
+——实测（从 GitHub 安装）：顶层只解析 **1 个包**（本插件本身），三个官方平台包由 DSH 运行时从安装目录提供、
+不会在 profile 里再装一份；包内含已构建的 `lib/client.js`，**无需构建授权**。
 
-> **为什么平台包必须是 `dependencies` 而不是 peer**：0.1.0 曾只声明 peer，结果从 npm/GitHub 装出来的包里
-> **没有任何可解析的平台包**，DSH 启动时该插件直接加载失败（工具全部消失）。0.1.1 起改为 `dependencies`——
-> 实测安装后从插件自身位置三个包都能解析。
-（注意：DSH 的插件安装器会额外在包目录里装一次开发依赖，本机观察到 22 MB；那是安装器行为、与包本身无关，
-删掉不影响运行——见 `docs/verification.md`。）
+> **为什么平台包是 optional peer 而不是 `dependencies`**：0.1.0 只声明 peer 时，旧版 DSH（0.2.1 之前）
+> 没有 installation 拦截层，装出来解析不到平台包、插件整个加载失败（工具全部消失）；0.1.1 因此改成了
+> `dependencies`。但 0.2.1 起宿主自己提供这些包，插件再带一份就会在 profile 里装出**第二份**、与宿主版本
+> 混用（2026-10-17 桌面版「required plugin did not activate」正是它）。0.2.7 起改回 **optional peer**：
+> 平台包从 DSH 安装目录解析，解析不到时只降级成「只有面板」，不会连累宿主
+> （三个平台包全部是函数内动态 import + catch，模块求值阶段不碰它们）。
+> 证据与实测见 `docs/reviews/duplicate-platform-packages.md`。
 
 **方式二：从 npm 装**（包发布后可用）
 
