@@ -15,6 +15,7 @@
   },
   "files": [
     "lib",
+    "tools/apply-update.mjs",
     "src",
     "locale",
     "cordis.patch.yml",

@@ -128,7 +128,14 @@ process.stdout.write(`\n目标 ① npm 发布包（${dist.length} 个文件）\n
 process.stdout.write(`目标 ② git 跟踪文件（${tracked.length} 个文件）\n\n`);
 
 process.stdout.write('发布包内容边界\n');
-check('发布包里没有 tools/（构建与测试脚本不该上传）', !dist.some((f) => f.startsWith('tools/')));
+// tools/ 默认不上传（构建与测试脚本）；**唯一例外**是运行时独立安装器：
+// 宿主在安装时必须 spawn 本包自带的 tools/apply-update.mjs，所以它必须进发布包。
+// 这里不放宽成「允许 tools/」：除这一个文件外出现任何 tools/* 仍然判红。
+check(
+  '发布包里 tools/ 只允许运行时安装器 tools/apply-update.mjs',
+  dist.filter((f) => f.startsWith('tools/')).every((f) => f === 'tools/apply-update.mjs'),
+  dist.filter((f) => f.startsWith('tools/')).join(', '),
+);
 check(
   '发布包里没有 docs/ 与 .github/（内部文档与 CI 配置不该上传）',
   !dist.some((f) => f.startsWith('docs/') || f.startsWith('.github/')),

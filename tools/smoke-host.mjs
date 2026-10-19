@@ -18,10 +18,11 @@ import { spawn, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, renameSync, rmSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
+import { gzipSync } from 'node:zlib';
 // DSH 判定「工具返回值是否 lossless JSON」用的就是这一个函数（见 assertLossless 的说明）
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, detectUnsupportedInstall, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged, resolveUpdateLockPath, resolveStartupCheckDelayMs, acquireUpdateLock, releaseUpdateLock, classifyCliFailure, killProcessTree, UPDATE_CHECK_TIMEOUT_MS, UPDATE_CHECK_RETRY_DELAY_MS, UPDATE_CHECK_TOTAL_BUDGET_MS, UPDATE_CHECK_BACKOFF_BASE_MS, UPDATE_CHECK_BACKOFF_MAX_MS, resolveCheckTimeoutMs, resolveCheckRetryDelayMs, resolveCheckBackoffMs, UPDATE_MODES, DEFAULT_UPDATE_MODE, normalizeUpdateMode, defaultUpdateModeFromConfig, effectiveUpdatePolicy, resolveSettingsPath, parseUpdateSettings, readUpdateSettings, writeUpdateSettings } from '../lib/index.js';
+import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, detectUnsupportedInstall, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged, resolveUpdateLockPath, resolveStartupCheckDelayMs, acquireUpdateLock, releaseUpdateLock, classifyCliFailure, killProcessTree, resolveApplyResultPath, resolveApplyLogPath, resolveApplyTimeoutMs, resolveApplyUpdatePath, buildApplyInstallerSpec, extractTarballToDir, UPDATE_CHECK_TIMEOUT_MS, UPDATE_CHECK_RETRY_DELAY_MS, UPDATE_CHECK_TOTAL_BUDGET_MS, UPDATE_CHECK_BACKOFF_BASE_MS, UPDATE_CHECK_BACKOFF_MAX_MS, resolveCheckTimeoutMs, resolveCheckRetryDelayMs, resolveCheckBackoffMs, UPDATE_MODES, DEFAULT_UPDATE_MODE, normalizeUpdateMode, defaultUpdateModeFromConfig, effectiveUpdatePolicy, resolveSettingsPath, parseUpdateSettings, readUpdateSettings, writeUpdateSettings } from '../lib/index.js';
 
 /**
  * 「模拟版本」的**唯一**来源：全部从 package.json 派生；本文件里不许再出现当前版本号的字面量。
@@ -55,17 +56,74 @@ process.env.WORKTODO_UPDATE_STATE_PATH = join(mkdtempSync(join(tmpdir(), 'workto
 process.env.WORKTODO_STARTUP_CHECK_DELAY_MS = '0';
 
 /**
- * 假的 tarball 分发源（本轮新增的「下载」这一步要有东西可下）。
+ * 造一个**合法的 npm tarball**（gzip + ustar，条目以 `package/` 开头）。
  *
- * 为什么必须有：自升级被拆成「下载 → 安装」两步之后，**后台自动更新**也会真的去取一次 tarball。
- * 这里起一个只监听 127.0.0.1 的一次性 HTTP 服务，按 npm registry 的路径约定返回一段确定性字节，
- * 让 `downloadUpdate` 走完整的流式下载 + 进度 + 校验链路，而不是被 mock 掉。
+ * 为什么要真的造 tar：下载这一步现在要解包成「完整包目录」再交给安装器；
+ * 只回一段随机字节只能测到「下载完成」，测不到解包、包身份校验与真实文件替换。
+ */
+function tarHeader(name, size, { mode = 0o644, type = '0' } = {}) {
+  const buffer = Buffer.alloc(512);
+  buffer.write(name, 0, 100, 'utf8');
+  buffer.write(`${mode.toString(8).padStart(7, '0')}\0`, 100, 8, 'ascii');
+  buffer.write('0000000\0', 108, 8, 'ascii');
+  buffer.write('0000000\0', 116, 8, 'ascii');
+  buffer.write(`${size.toString(8).padStart(11, '0')}\0`, 124, 12, 'ascii');
+  buffer.write(`${Math.floor(Date.now() / 1000).toString(8).padStart(11, '0')}\0`, 136, 12, 'ascii');
+  buffer.write('        ', 148, 8, 'ascii');
+  buffer.write(type, 156, 1, 'ascii');
+  buffer.write('ustar\0', 257, 6, 'ascii');
+  buffer.write('00', 263, 2, 'ascii');
+  let sum = 0;
+  for (const byte of buffer) sum += byte;
+  buffer.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 8, 'ascii');
+  return buffer;
+}
+
+function buildFakeTarball(version, { marker = null } = {}) {
+  const packageJson = JSON.stringify({
+    name: 'dsh-worktodo',
+    version,
+    type: 'module',
+    main: 'lib/index.js',
+    '//': marker ?? `staged-${version}`,
+  }, null, 2);
+  const entries = [
+    ['package/package.json', Buffer.from(packageJson)],
+    ['package/lib/index.js', Buffer.from(`export const APPLIED = ${JSON.stringify(version)};\n`)],
+    ['package/lib/client.js', Buffer.from(`// client ${version}\n`)],
+    ['package/src/client/index.js', Buffer.from(`// src client ${version}\n`)],
+    ['package/cordis.patch.yml', Buffer.from(`# patch ${version}\n`)],
+    ['package/locale/zh.json', Buffer.from('{"name":"工作待办"}\n')],
+    ['package/CHANGELOG.md', Buffer.from(`# ${version}\n`)],
+    ['package/README.md', Buffer.from('# dsh-worktodo\n')],
+    ['package/icon.svg', Buffer.from('<svg></svg>\n')],
+    ['package/assets/blob.bin', Buffer.from([0, 1, 2, 3, 254, 255])],
+  ];
+  const blocks = [];
+  for (const [name, data] of entries) {
+    blocks.push(tarHeader(name, data.length));
+    blocks.push(data);
+    const pad = (512 - (data.length % 512)) % 512;
+    if (pad) blocks.push(Buffer.alloc(pad));
+  }
+  blocks.push(Buffer.alloc(1024));
+  return gzipSync(Buffer.concat(blocks));
+}
+
+/**
+ * 假的 tarball 分发源：按 npm registry 的路径约定返回**合法 tarball**。
  * 需要注入下载失败的用例会自己再起一个坏服务去覆盖 `WORKTODO_UPDATE_TARBALL_BASE`。
  */
-const fakeTarball = Buffer.alloc(2048, 0x51);
+const fakeTarballCache = new Map();
+function fakeTarballFor(version) {
+  if (!fakeTarballCache.has(version)) fakeTarballCache.set(version, buildFakeTarball(version));
+  return fakeTarballCache.get(version);
+}
 const tarballServer = createServer((request, response) => {
-  response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(fakeTarball.length) });
-  response.end(fakeTarball);
+  const match = /dsh-worktodo-(\d+\.\d+\.\d+)\.tgz/.exec(String(request.url ?? ''));
+  const body = fakeTarballFor(match?.[1] ?? FAKE_NEXT_VERSION);
+  response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(body.length) });
+  response.end(body);
 });
 await new Promise((resolve) => tarballServer.listen(0, '127.0.0.1', resolve));
 tarballServer.unref();
@@ -1234,7 +1292,7 @@ await test('S6-2：同名工具重复注册 → apply 不崩、面板照常，he
   }
 });
 
-console.log('\n自升级（自己升级自己）：link 跳过 / @latest+官方源 / 并发只跑一次 / 失败有原因 / 超时可杀 / 不阻塞请求');
+console.log('\n自升级（自己升级自己）：link 跳过 / 下载解包 / detached 安装器 / 回滚 / 零 pnpm/CLI / 不阻塞请求');
 
 /**
  * 自升级测试的隔离根目录。
@@ -1284,6 +1342,51 @@ function snapshotTree(root) {
   };
   walk(root);
   return entries;
+}
+
+/**
+ * 快照 profile，但**排除本包自己的目录**与安装器留下的备份/临时目录。
+ *
+ * 安装会替换 `node_modules/dsh-worktodo`（pnpm 下是 `.pnpm/.../node_modules/dsh-worktodo`），
+ * 这些本来就要变；其余文件/目录必须逐字节不变，用来证明「只碰自己的目录」。
+ * @param {string} root
+ * @param {string[]} [extraExcludes] 额外的相对路径前缀
+ */
+function snapshotOutsideOwnPackage(root, extraExcludes = []) {
+  const all = snapshotTree(root);
+  const excluded = [
+    'node_modules/dsh-worktodo',
+    'node_modules/.worktodo-backup-',
+    'node_modules/.worktodo-new-',
+    'node_modules/.worktodo-broken-',
+    ...extraExcludes,
+  ];
+  const out = {};
+  for (const [key, value] of Object.entries(all)) {
+    if (excluded.some((prefix) => key === prefix || key.startsWith(prefix))) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * 写一组「绊线」可执行文件：pnpm / npm / dsh CLI 一旦被启动就写 capture。
+ * 安装路径的硬要求是 capture 必须为 0（零 pnpm/CLI）。
+ * @param {string} dir
+ * @param {string[]} names
+ * @param {string} capture
+ */
+function writeTripwires(dir, names, capture) {
+  mkdirSync(dir, { recursive: true });
+  for (const name of names) {
+    const file = join(dir, name);
+    writeFileSync(file, [
+      '#!/bin/sh',
+      `printf 'INVOKE\\n' >> ${shQuote(capture)}`,
+      'exit 0',
+      '',
+    ].join('\n'), { mode: 0o755 });
+  }
 }
 
 /** 在假 profile 里放一份「已落盘」的安装版本（模拟升级后 node_modules 里的真版本）。 */
@@ -1766,6 +1869,309 @@ await test('预判：link:/file:/workspace: 都算本地链接安装；pnpm 的 
     '正常 pnpm 安装（链接指向自己的 .pnpm 目录）必须返回 null，交给正常升级流程：');
 });
 
+/* ------------------------------------------------------------------ *
+ * 独立安装器（本轮核心）：下载 → 解包 → detached 安装器替换自己的目录
+ *
+ * 这些用例替代旧的「在 live profile 里跑 pnpm/CLI」路径。按约束：
+ *   - 假 profile / 临时 DSH_HOME / 本地假 tarball，不碰真实数据、不联网；
+ *   - 绊线 bin（pnpm/npm/dsh CLI）任何一次调用都记为红灯；
+ *   - 安装后对 profile「除本包目录外」做逐字节快照比对。
+ * ------------------------------------------------------------------ */
+
+await test('独立安装器（核心）：下载→解包→detached 安装；零 pnpm/CLI、版本替换、其它文件逐字节不变', async () => {
+  const profile = makeFakeProfile('installer-core', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  mkdirSync(join(profile, 'node_modules', 'dsh-worktodo', 'lib'), { recursive: true });
+  writeFileSync(join(profile, 'node_modules', 'dsh-worktodo', 'lib', 'old-marker.txt'), 'OLD\n');
+  const manifestBytes = readFileSync(join(profile, 'package.json'), 'utf8');
+  const lockBytes = "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      dsh-worktodo:\n        specifier: ^0.2.0\n        version: 0.2.0\n";
+  writeFileSync(join(profile, 'pnpm-lock.yaml'), lockBytes);
+  const outsideBefore = snapshotOutsideOwnPackage(profile);
+
+  const capture = join(selfUpdateRoot, 'capture-installer-core.txt');
+  const bin = join(selfUpdateRoot, 'bin-installer-core');
+  writeTripwires(bin, ['pnpm', 'npm', 'pnpm.cmd', 'npm.cmd'], capture);
+  const fakeCli = join(selfUpdateRoot, 'trip-cli-core.mjs');
+  writeFileSync(fakeCli, [
+    "import { appendFileSync } from 'node:fs';",
+    `appendFileSync(${JSON.stringify(capture)}, 'INVOKE cli\\n');`,
+    '',
+  ].join('\n'));
+
+  const stageDir = join(selfUpdateRoot, 'stage-installer-core');
+  const statePath = join(selfUpdateRoot, 'update-state-installer-core.json');
+  const tarball = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 4, delayMs: 25 });
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile,
+      PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: join(bin, 'pnpm'),
+      WORKTODO_UPDATE_CLI: fakeCli,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base,
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+      // 安装器开工前等 700ms：宿主必须立刻返回 installing，而不是等它退出
+      WORKTODO_APPLY_DELAY_MS: '700',
+    }, async () => {
+      host = await makeUpdateHost({ autoUpdate: false });
+      dir = host.dir;
+
+      // —— 第 1 步：下载 + 解包（只落暂存区，不动 profile） ——
+      const download = await triggerUpdate(host.host, { action: 'plugin-update-download' });
+      eq(download.json().ok, true, `下载应当成功：${JSON.stringify(download.json())}`);
+      const downloaded = await waitForUpdatePhase(host.host, (state) => state.phase === 'downloaded', 5000);
+      eq(downloaded?.phase, 'downloaded', `下载后必须到 downloaded（实际 ${downloaded?.phase}，error=${downloaded?.error}）：`);
+      eq(downloaded?.download?.version, FAKE_NEXT_VERSION);
+      eq(existsSync(downloaded.download.stagedDir), true, `必须落成解包后的完整包目录：${downloaded.download.stagedDir}`);
+      const stagedPkg = JSON.parse(readFileSync(join(downloaded.download.stagedDir, 'package.json'), 'utf8'));
+      eq(stagedPkg.version, FAKE_NEXT_VERSION, '解包目录里的 package.json 必须已经是新版本：');
+      eq(existsSync(join(downloaded.download.stagedDir, 'lib', 'index.js')), true, '解包目录必须含 lib/index.js：');
+      eq(existsSync(join(downloaded.download.stagedDir, 'src', 'client', 'index.js')), true, '解包目录必须含 src/client：');
+      eq(existsSync(join(downloaded.download.stagedDir, 'cordis.patch.yml')), true, '解包目录必须含 cordis.patch.yml：');
+      eq(invokeCount(capture), 0, `下载阶段绝不允许碰 pnpm/CLI（实际 ${invokeCount(capture)} 次）：`);
+
+      // —— 第 2 步：安装。宿主只负责 spawn detached，立即返回；安装器在后台干活 ——
+      const startedAt = Date.now();
+      const install = await triggerUpdate(host.host, { action: 'plugin-update-install' });
+      const elapsed = Date.now() - startedAt;
+      eq(install.json().ok, true, `安装应当被接受：${JSON.stringify(install.json())}`);
+      eq(elapsed < 500, true, `宿主绝不许等安装器退出（实际 ${elapsed}ms；旧实现会等整条 pnpm 序列）：`);
+      eq(install.json().data.phase, 'installing', `返回时必须已经是 installing（实际 ${install.json().data.phase}）：`);
+
+      const settled = await waitForUpdateSettled(host.host, 8000);
+      eq(settled?.phase, 'installed', `安装器成功后必须落在 installed（实际 ${settled?.phase}，error=${settled?.error}）：`);
+      eq(settled?.state, 'done', '老字段 state 也要是 done：');
+      eq(settled?.installed, FAKE_NEXT_VERSION, '要报出落盘的新版本：');
+      eq(readInstalledVersionText(profile).includes(FAKE_NEXT_VERSION), true, 'node_modules 里的版本必须真的换了：');
+      eq(existsSync(join(profile, 'node_modules', 'dsh-worktodo', 'lib', 'old-marker.txt')), false,
+        '旧目录必须被新目录整体替换（旧文件不该残留在新包里）：');
+
+      // 零 pnpm/CLI：绊线一次都不许响
+      eq(invokeCount(capture), 0,
+        `安装路径必须零 pnpm/npm/CLI 调用（实际 ${invokeCount(capture)} 次）：${existsSync(capture) ? readFileSync(capture, 'utf8') : '（capture 不存在 = 零调用）'}`);
+
+      // 只碰自己的目录：profile 其余文件逐字节不变
+      eq(snapshotOutsideOwnPackage(profile), outsideBefore, 'profile 除本包目录外必须逐字节不变：');
+      eq(readFileSync(join(profile, 'package.json'), 'utf8'), manifestBytes, 'profile 清单绝不许被改写：');
+      eq(readFileSync(join(profile, 'pnpm-lock.yaml'), 'utf8'), lockBytes, 'lockfile 绝不许被改写：');
+
+      // 安装器结果与日志：诊断可查
+      const resultFile = resolveApplyResultPath(statePath);
+      const result = JSON.parse(readFileSync(resultFile, 'utf8'));
+      eq(result.ok, true, `安装器结果必须是 ok：${JSON.stringify(result)}`);
+      eq(result.phase, 'installed');
+      eq(typeof result.pid, 'number', '结果里要有安装器 pid（证明真的起了一个独立进程）：');
+      eq(existsSync(result.log) || existsSync(downloaded.download.manifestFile), true, '安装日志/清单应当可查：');
+      const backups = readdirSync(join(profile, 'node_modules')).filter((name) => name.startsWith('.worktodo-backup-'));
+      eq(backups.length >= 1, true, `成功后至少保留一份备份：${JSON.stringify(backups)}`);
+    });
+  } finally {
+    await tarball.close();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('独立安装器：pnpm 的 .pnpm symlink 布局 → 替换真实目录，symlink 本身与其它文件不变', async () => {
+  const profile = makeFakeProfile('installer-symlink', '^0.2.0');
+  const storeDir = join(profile, 'node_modules', '.pnpm', 'dsh-worktodo@0.2.0', 'node_modules', 'dsh-worktodo');
+  mkdirSync(join(storeDir, 'lib'), { recursive: true });
+  writeFileSync(join(storeDir, 'package.json'), JSON.stringify({ name: 'dsh-worktodo', version: '0.2.0' }, null, 2));
+  writeFileSync(join(storeDir, 'lib', 'old.js'), 'OLD\n');
+  symlinkSync('.pnpm/dsh-worktodo@0.2.0/node_modules/dsh-worktodo', join(profile, 'node_modules', 'dsh-worktodo'), 'dir');
+  const manifestBytes = readFileSync(join(profile, 'package.json'), 'utf8');
+  const outsideBefore = snapshotOutsideOwnPackage(profile, [
+    'node_modules/.pnpm/dsh-worktodo@0.2.0/node_modules/dsh-worktodo',
+    'node_modules/.pnpm/dsh-worktodo@0.2.0/node_modules/.worktodo-backup-',
+    'node_modules/.pnpm/dsh-worktodo@0.2.0/node_modules/.worktodo-new-',
+    'node_modules/.pnpm/dsh-worktodo@0.2.0/node_modules/.worktodo-broken-',
+  ]);
+  const linkBefore = readlinkSync(join(profile, 'node_modules', 'dsh-worktodo'));
+  const stageDir = join(selfUpdateRoot, 'stage-installer-symlink');
+  const statePath = join(selfUpdateRoot, 'update-state-installer-symlink.json');
+  const tarball = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 2 });
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base,
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+    }, async () => {
+      host = await makeUpdateHost({ autoUpdate: false });
+      dir = host.dir;
+      eq((await triggerUpdate(host.host, { action: 'plugin-update-download' })).json().ok, true);
+      await waitForUpdatePhase(host.host, (state) => state.phase === 'downloaded', 5000);
+      eq((await triggerUpdate(host.host, { action: 'plugin-update-install' })).json().ok, true);
+      const settled = await waitForUpdateSettled(host.host, 8000);
+      eq(settled?.phase, 'installed', `symlink 布局也必须装成功（实际 ${settled?.phase}，error=${settled?.error}）：`);
+      // 替换的是 realpath 指向的真实目录；profile 里的 symlink 原样保留
+      eq(readlinkSync(join(profile, 'node_modules', 'dsh-worktodo')), linkBefore, 'symlink 本身绝不许被替换/改指向：');
+      eq(JSON.parse(readFileSync(join(storeDir, 'package.json'), 'utf8')).version, FAKE_NEXT_VERSION,
+        '真实目录（.pnpm/...）里的版本必须换成新版本：');
+      eq(existsSync(join(storeDir, 'lib', 'old.js')), false, '真实目录里的旧文件必须被整体替换：');
+      eq(snapshotOutsideOwnPackage(profile, [
+        'node_modules/.pnpm/dsh-worktodo@0.2.0/node_modules/dsh-worktodo',
+        'node_modules/.pnpm/dsh-worktodo@0.2.0/node_modules/.worktodo-backup-',
+        'node_modules/.pnpm/dsh-worktodo@0.2.0/node_modules/.worktodo-new-',
+        'node_modules/.pnpm/dsh-worktodo@0.2.0/node_modules/.worktodo-broken-',
+      ]), outsideBefore, '除本包真实目录外，profile 必须逐字节不变：');
+      eq(readFileSync(join(profile, 'package.json'), 'utf8'), manifestBytes, '清单不变：');
+    });
+  } finally {
+    await tarball.close();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('独立安装器：rename 目标失败 → 从备份回滚旧版本、failed + 原因、备份可用、日志尾部进 diagnostics', async () => {
+  const profile = makeFakeProfile('installer-rollback', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const target = join(profile, 'node_modules', 'dsh-worktodo');
+  mkdirSync(join(target, 'lib'), { recursive: true });
+  writeFileSync(join(target, 'lib', 'old-marker.txt'), 'KEEP-ME\n');
+  const oldPkg = readFileSync(join(target, 'package.json'), 'utf8');
+  const manifestBytes = readFileSync(join(profile, 'package.json'), 'utf8');
+  const stageDir = join(selfUpdateRoot, 'stage-installer-rollback');
+  const statePath = join(selfUpdateRoot, 'update-state-installer-rollback.json');
+  const tarball = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 1 });
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base,
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+      // 注入：备份完成后、把新目录 rename 成目标时失败
+      WORKTODO_APPLY_FAIL_STEP: 'rename-target',
+    }, async () => {
+      host = await makeUpdateHost({ autoUpdate: false });
+      dir = host.dir;
+      eq((await triggerUpdate(host.host, { action: 'plugin-update-download' })).json().ok, true);
+      await waitForUpdatePhase(host.host, (state) => state.phase === 'downloaded', 5000);
+      eq((await triggerUpdate(host.host, { action: 'plugin-update-install' })).json().ok, true);
+      const settled = await waitForUpdateSettled(host.host, 8000);
+      eq(settled?.phase, 'failed', `注入 rename 失败必须 failed（实际 ${settled?.phase}）：`);
+      eq(settled?.reason, 'replace-failed', `失败原因要是 replace-failed（实际 ${settled?.reason}）：`);
+      eq(String(settled?.error).includes('已从备份恢复'), true, `错误必须说明已从备份恢复：${settled?.error}`);
+      eq(settled?.installed, '0.2.0', `回滚后落盘版本必须还是旧版（实际 ${settled?.installed}）：`);
+      eq(readFileSync(join(target, 'package.json'), 'utf8'), oldPkg, '目标 package.json 必须逐字节恢复：');
+      eq(readFileSync(join(target, 'lib', 'old-marker.txt'), 'utf8'), 'KEEP-ME\n', '旧目录里的文件也必须回来：');
+      eq(readFileSync(join(profile, 'package.json'), 'utf8'), manifestBytes, 'profile 清单绝不许变：');
+      const backups = readdirSync(join(profile, 'node_modules')).filter((name) => name.startsWith('.worktodo-backup-'));
+      eq(backups.length >= 1, true, `回滚后必须保留一份可用备份：${JSON.stringify(backups)}`);
+      const backupPkg = JSON.parse(readFileSync(join(profile, 'node_modules', backups[0], 'package.json'), 'utf8'));
+      eq(backupPkg.version, '0.2.0', '备份里必须是旧版本（可用于人工回退）：');
+      eq(Array.isArray(settled?.diagnostics?.logTail), true, '失败必须有日志尾部：');
+      eq(settled.diagnostics.logTail.length > 0, true, '日志尾部不能为空：');
+      eq(settled.diagnostics.logTail.length <= 40, true, `日志尾部最多 40 行（实际 ${settled.diagnostics.logTail.length}）：`);
+      eq(settled.diagnostics.logTail.some((line) => String(line).includes('injected rename-target')), true,
+        `日志尾部必须含失败原因：${JSON.stringify(settled.diagnostics.logTail)}`);
+      eq(settled?.steps?.some((step) => step.step === 'rollback' && step.ok === true), true,
+        `steps 里必须留下回滚成功的记录：${JSON.stringify(settled?.steps)}`);
+      // 安装器退出码非 0，但宿主已经通过结果文件收口
+      eq(existsSync(resolveApplyResultPath(statePath)), true, '结果文件必须落盘（宿主靠它收口）：');
+    });
+  } finally {
+    await tarball.close();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('独立安装器：幂等（已达标直接成功）+ Windows rename 占用退避重试', async () => {
+  const runInstaller = (profile, stagedVersion, env = {}) => {
+    const node = process.execPath;
+    const apply = resolveApplyUpdatePath({ env: {} });
+    const statePath = join(selfUpdateRoot, `state-direct-${Math.random().toString(16).slice(2)}.json`);
+    const logPath = join(selfUpdateRoot, `apply-direct-${Math.random().toString(16).slice(2)}.log`);
+    const result = spawnSync(node, [
+      apply,
+      '--staged', stagedVersion,
+      '--target', join(profile, 'node_modules', 'dsh-worktodo'),
+      '--version', FAKE_NEXT_VERSION,
+      '--state', statePath,
+      '--log', logPath,
+    ], { env: { ...process.env, ...env }, encoding: 'utf8' });
+    return { status: result.status, stderr: result.stderr, stdout: result.stdout, statePath, logPath };
+  };
+
+  // 直接调安装器需要一份「解包后的 staged 目录」：用临时目录 + 最小合法包
+  const staged = join(selfUpdateRoot, 'staged-direct');
+  mkdirSync(join(staged, 'lib'), { recursive: true });
+  writeFileSync(join(staged, 'package.json'), JSON.stringify({ name: 'dsh-worktodo', version: FAKE_NEXT_VERSION }, null, 2));
+  writeFileSync(join(staged, 'lib', 'index.js'), 'export default 1;\n');
+  writeFileSync(join(staged, 'cordis.patch.yml'), '# patch\n');
+
+  const profile = makeFakeProfile('installer-idempotent', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const first = runInstaller(profile, staged);
+  eq(first.status, 0, `第一次直接运行安装器应当成功（stderr=${String(first.stderr).slice(-300)}）：`);
+  let result = JSON.parse(readFileSync(join(dirname(first.statePath), 'apply-result.json'), 'utf8'));
+  eq(result.ok, true);
+  eq(result.alreadyInstalled, false);
+  eq(JSON.parse(readFileSync(join(profile, 'node_modules', 'dsh-worktodo', 'package.json'), 'utf8')).version, FAKE_NEXT_VERSION);
+
+  const beforeSecond = snapshotTree(join(profile, 'node_modules', 'dsh-worktodo'));
+  const second = runInstaller(profile, staged);
+  eq(second.status, 0, `重复运行必须幂等成功（stderr=${String(second.stderr).slice(-300)}）：`);
+  result = JSON.parse(readFileSync(join(dirname(second.statePath), 'apply-result.json'), 'utf8'));
+  eq(result.ok, true);
+  eq(result.alreadyInstalled, true, '第二次必须识别出「已达标」而不是再搬一次目录：');
+  eq(snapshotTree(join(profile, 'node_modules', 'dsh-worktodo')), beforeSecond, '幂等路径不许改动目标目录：');
+
+  // Windows 占用模拟：前两次 rename 以 EPERM 失败 → 退避重试后成功
+  const retryProfile = makeFakeProfile('installer-rename-retry', '^0.2.0');
+  seedInstalledVersion(retryProfile, '0.2.0');
+  const retried = runInstaller(retryProfile, staged, { WORKTODO_APPLY_RENAME_FAILS: '2' });
+  eq(retried.status, 0, `rename 短暂失败必须退避重试成功（stderr=${String(retried.stderr).slice(-300)}）：`);
+  const retryResult = JSON.parse(readFileSync(join(dirname(retried.statePath), 'apply-result.json'), 'utf8'));
+  eq(retryResult.ok, true);
+  eq(JSON.parse(readFileSync(join(retryProfile, 'node_modules', 'dsh-worktodo', 'package.json'), 'utf8')).version, FAKE_NEXT_VERSION);
+  eq(readFileSync(retried.logPath, 'utf8').includes('重试'), true, '日志里必须留下 rename 重试记录：');
+});
+
+await test('独立安装器：spawn 规格必须是 detached + stdio ignore + unref；结果/日志/超时路径纯函数', () => {
+  const statePath = '/tmp/fake-home/worktodo/update-state.json';
+  eq(resolveApplyResultPath(statePath), '/tmp/fake-home/worktodo/apply-result.json', '结果文件固定在状态文件同目录：');
+  eq(resolveApplyResultPath(null), null, '没有状态文件时宁可不写：');
+  eq(resolveApplyTimeoutMs({ env: {} }), 120000, '默认超时 120s：');
+  eq(resolveApplyTimeoutMs({ env: { WORKTODO_APPLY_TIMEOUT_MS: '1500' } }), 1500, '测试缝可覆盖：');
+  eq(resolveApplyTimeoutMs({ env: { WORKTODO_APPLY_TIMEOUT_MS: '-1' } }), 120000, '非法值回落默认：');
+  eq(/apply-\d{8}-\d{6}-\d{3}\.log$/.test(resolveApplyLogPath({ stageDir: '/tmp/fake-home/worktodo/updates' })), true,
+    `日志文件名必须是 apply-<ts>.log：${resolveApplyLogPath({ stageDir: '/tmp/x' })}`);
+  eq(resolveApplyLogPath({ stageDir: null }), null);
+  eq(existsSync(resolveApplyUpdatePath({ env: {} })), true, '默认安装器必须真的在包里（package.json files 要包含它）：');
+
+  const spec = buildApplyInstallerSpec({
+    stagedDir: '/tmp/staged/1.2.3',
+    targetDir: '/tmp/profile/node_modules/dsh-worktodo',
+    version: '1.2.3',
+    statePath,
+    logPath: '/tmp/fake-home/worktodo/updates/apply-x.log',
+    env: {},
+    execPath: '/usr/local/bin/node',
+  });
+  eq(spec.options.detached, true, '必须 detached（真正脱离宿主）：');
+  eq(spec.options.stdio, 'ignore', '必须 stdio:ignore（不继承宿主管道）：');
+  eq(spec.unref, true, '必须显式 unref（宿主不等待它退出）：');
+  eq(spec.options.windowsHide, true, 'Windows 上不弹窗：');
+  eq(spec.command, '/usr/local/bin/node', '用 node 可执行文件跑安装器：');
+  eq(spec.args[0], resolveApplyUpdatePath({ env: {} }), '第一个参数是我们自己的安装器脚本：');
+  for (const key of ['--staged', '--target', '--version', '--state', '--log']) {
+    eq(spec.args.includes(key), true, `参数必须包含 ${key}：${JSON.stringify(spec.args)}`);
+  }
+  eq(spec.resultPath, '/tmp/fake-home/worktodo/apply-result.json', 'spawn 规格里也要带结果路径：');
+});
+
 await test('自升级：启动检查在飞时点升级不能被「已在运行」吞掉，且检查晚到不许冲掉结论', async () => {
   // 直接复现 CI 的失败形态：apply() 的启动检查还在等 registry（慢），用户这时点了升级。
   // 旧实现把 phase=checking 当成「已在安装」，回 ok:true running 却一个子进程都不起；
@@ -1816,324 +2222,6 @@ await test('自升级：启动检查在飞时点升级不能被「已在运行�
   }
 });
 
-await test('自升级（核心）：pnpm update no-op → 第 2 步交 pnpm add 精确版本，仍不变则 failed 且提「版本未变」+ 逐字节回滚', async () => {
-  // 真机复现：spec pin 在 ^0.2.0，落盘 0.2.0，registry latest = 当前版本 + 1，
-  // 而 `plugin add`/`pnpm update` 退出码 0 却「added 0」。修复后必须
-  //   第 1 步 pnpm update → 版本没变 → 第 2 步 pnpm add dsh-worktodo@<新版本> --save-exact（规格由 pnpm 改）
-  //   → 版本还是没变 → failed，并把 pnpm 改过的清单**逐字节**还原
-  const profile = makeFakeProfile('noop', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const originalBytes = readFileSync(join(profile, 'package.json'), 'utf8');
-  const capture = join(selfUpdateRoot, 'capture-noop.txt');
-  const specDir = join(selfUpdateRoot, 'spec-noop');
-  const bin = join(selfUpdateRoot, 'bin-noop');
-  // 模拟真实 pnpm add：不换 node_modules 版本（所以序列最终失败），但**真的**把规格写进清单
-  writeFakePnpm(bin, {
-    capture, specDir, specProfile: profile,
-    addSpecText: `${JSON.stringify({ name: 'dsh-profile-noop', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } }, null, 2)}\n`,
-    addSpecProfile: profile,
-  });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      const response = await triggerUpdate(host);
-      eq(response.json().ok, true, `触发升级应当成功启动：${JSON.stringify(response.json())}`);
-      const status = await waitForUpdateEnd(host, 5000);
-      eq(status?.state, 'failed', `命令成功但版本没变必须落 failed（实际 ${status?.state}）：`);
-      eq(status?.reason, 'version-unchanged', `失败原因要是稳定的 version-unchanged：${status?.reason}`);
-      eq(String(status?.error).includes('版本未变'), true, `error 必须说清「落盘版本未变」：${status?.error}`);
-      eq(String(status?.error).includes('镜像缓存'), true, `error 要提到镜像缓存/规格锁定这条线索：${status?.error}`);
-      eq(status?.state === 'done', false, '绝不允许把 no-op 报成 done：');
-
-      // 两条命令都带官方 registry；第 2 步是 pnpm add（**不是**插件手写规格 + install）
-      const invocations = readInvocations(capture);
-      eq(invocations.length, 2, `必须依次尝试 pnpm update 与 pnpm add（实际 ${invocations.length} 次）：${JSON.stringify(invocations)}`);
-      eq(invocations[0][0], 'update', `第 1 步应当是 pnpm update：${JSON.stringify(invocations[0])}`);
-      eq(invocations[0].includes('dsh-worktodo'), true, `update 必须指名要升的包：${JSON.stringify(invocations[0])}`);
-      eq(invocations[1][0], 'add', `第 2 步应当让 pnpm 去改规格（add）：${JSON.stringify(invocations[1])}`);
-      eq(invocations[1].includes(`dsh-worktodo@${FAKE_NEXT_VERSION}`), true, `add 必须指名精确版本：${JSON.stringify(invocations[1])}`);
-      eq(invocations[1].includes('--save-exact'), true, `add 必须带 --save-exact（写死精确版本）：${JSON.stringify(invocations[1])}`);
-      for (const argv of invocations) {
-        eq(argv.includes('--registry'), true, `每条命令都要显式带 --registry：${JSON.stringify(argv)}`);
-        eq(argv.includes('https://registry.npmjs.org/'), true, `registry 必须是官方源：${JSON.stringify(argv)}`);
-      }
-      // 第 1 步（update）时规格还没被改写 —— 改写只发生在第 2 步的 pnpm add 里
-      eq(readSpecFromSpecDir(specDir, 'update'), '^0.2.0', '第 1 步（update）时规格还没被改写：');
-      eq(readSpecFromSpecDir(specDir, 'add'), '^0.2.0', 'add 执行**之前**规格仍是旧值（改写由 pnpm 自己做）：');
-      // A1/A3：失败收口必须把 pnpm 改过的清单**逐字节**还原（不是「按字段重写」）
-      eq(readProfileSpec(profile), '^0.2.0', '失败收口必须把规格回滚为原值：');
-      eq(readFileSync(join(profile, 'package.json'), 'utf8') === originalBytes, true,
-        'A3：回滚必须逐字节等于改动前的清单（不得按段位重写、不得改变协议值/缩进）：');
-      eq(String(status?.error).includes('回滚'), true, `error 要说明已回滚：${status?.error}`);
-      // 面板能看出「卡在哪一步、每步退出码多少」
-      eq(status?.steps?.map((step) => step.kind), ['pnpm-update', 'pnpm-add-exact', 'rollback-profile-spec'],
-        `状态里要能看出尝试过哪几步、以及回滚：${JSON.stringify(status?.steps)}`);
-      eq(status?.steps?.[0]?.kind, 'pnpm-update');
-      eq(status?.steps?.[1]?.kind, 'pnpm-add-exact');
-      eq(status?.steps?.[2]?.ok, true, `回滚步骤要标成功：${JSON.stringify(status?.steps?.[2])}`);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('A1（严重）：写盘失败（ulimit -f，等价 ENOSPC）时 profile 仍是合法 JSON、绝不被截断；状态 failed 且明说回滚失败', async () => {
-  // 审查实跑过的路径：`writeFileSync` 先 O_TRUNC 再写，中途 EFBIG 会把 user 的 package.json
-  // 截成 1024 字节 → JSON.parse 报 Unterminated string → **下次 DSH 启动解析该 profile 直接失败**。
-  // 这里把整条序列放进一个 `ulimit -f 1` 的子进程（真实 fs 失败，不是打桩），检查盘上文件。
-  const profile = join(selfUpdateRoot, 'write-fail');
-  mkdirSync(profile, { recursive: true });
-  // 原始清单 > 1024 字节：超过 ulimit -f 1 的单文件上限，于是「还原整份清单」必然 EFBIG
-  const original = `{\n  "name": "dsh-profile-write-fail",\n  "private": true,\n  "//": "${'x'.repeat(1900)}",\n  "dependencies": { "dsh-worktodo": "^0.2.0" }\n}\n`;
-  writeFileSync(join(profile, 'package.json'), original);
-  seedInstalledVersion(profile, '0.2.0');
-  // 假 pnpm 在 add 时把清单换成一份**小**的合法 JSON（< 1024 字节，写得进去）：
-  // 相当于「pnpm 改过规格、但升级没成功」，事务收尾必须还原它，而这一步会撞 EFBIG。
-  const smallSpec = JSON.stringify({ name: 'dsh-profile-write-fail', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } });
-  eq(Buffer.byteLength(smallSpec) < 1024, true, '测试自身的假清单必须小于 ulimit 上限，否则场景不成立：');
-  const bin = join(selfUpdateRoot, 'bin-write-fail');
-  writeFakePnpm(bin, {
-    capture: join(selfUpdateRoot, 'capture-write-fail.txt'),
-    addSpecText: smallSpec, addSpecProfile: profile,
-  });
-  const child = spawnSync('/bin/sh', ['-c',
-    `ulimit -f 1 2>/dev/null; exec ${shQuote(process.execPath)} ${shQuote(fileURLToPath(import.meta.url))} --selfupdate-writefail-child`], {
-    env: {
-      ...process.env,
-      WORKTODO_PROFILE_DIR: profile,
-      PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: '',
-      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-      WORKTODO_CHILD_STORE: join(selfUpdateRoot, 'write-fail-store.json'),
-      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-write-fail.json'),
-    },
-    encoding: 'utf8',
-  });
-  const stdout = String(child.stdout ?? '');
-  const line = stdout.split('\n').find((entry) => entry.startsWith('A1CHILD_STATUS '));
-  eq(child.status, 0, `A1 子场景必须正常收口（exit=${child.status}）：${String(child.stderr ?? '').slice(-400)}`);
-  eq(Boolean(line), true, `A1 子场景要打印状态机结果：${stdout.slice(-400)}`);
-  const status = JSON.parse(line.slice('A1CHILD_STATUS '.length));
-  const text = readFileSync(join(profile, 'package.json'), 'utf8');
-  // ★ 硬断言：不管回滚成没成，盘上都**必须仍是合法 JSON**（裸 writeFileSync 会在这里留下半截内容）
-  const parsed = JSON.parse(text);
-  eq(parsed.dependencies['dsh-worktodo'], FAKE_NEXT_VERSION, '原子写失败时原文件必须原样不动：');
-  eq(text, smallSpec, 'A1：还原写盘失败时目标文件绝不能出现半截内容（writeFileSync 会把它截断成 1024 字节）：');
-  eq(status.state, 'failed', `写失败 + 版本未变必须落 failed（实际 ${status?.state}）：`);
-  eq(status.reason, 'version-unchanged', `失败原因是版本没变（回滚失败只体现在 error 里）：${status?.reason}`);
-  eq(String(status.error).includes('回滚失败，请人工检查'), true, `error 必须明确写「回滚失败，请人工检查」：${status.error}`);
-  eq(status.steps.some((step) => step.kind === 'rollback-profile-spec' && step.ok === false), true,
-    `steps 里要留下回滚失败的记录：${JSON.stringify(status.steps)}`);
-});
-
-await test('A1：pnpm 把清单写成非法 JSON 且版本已换 → 插件逐字节还原原清单（绝不留非法 JSON 给下次启动）', async () => {
-  const profile = makeFakeProfile('corrupt-by-pnpm', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const originalBytes = readFileSync(join(profile, 'package.json'), 'utf8');
-  const capture = join(selfUpdateRoot, 'capture-corrupt.txt');
-  const bin = join(selfUpdateRoot, 'bin-corrupt');
-  // 假 pnpm 在 add 时把清单截断成非法 JSON，同时真的换掉落盘版本（这一步「成功」）
-  writeFakePnpm(bin, {
-    capture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'add',
-    addSpecText: '{"name":"dsh-profile-corrupt-by-pnpm","dependencies":{"dsh-worktodo":', addSpecProfile: profile,
-  });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 5000);
-      const text = readFileSync(join(profile, 'package.json'), 'utf8');
-      JSON.parse(text); // 还原失败 = 这里直接抛 → 用例变红
-      eq(text, originalBytes, 'A1：非法清单必须被逐字节还原：');
-      eq(status?.state, 'failed', `清单被写坏必须如实报失败（实际 ${status?.state}）：`);
-      eq(status?.reason, 'manifest-corrupted', `要有稳定 reason：${status?.reason}`);
-      eq(String(status?.error).includes('还原'), true, `error 要说清已还原：${status?.error}`);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('A2：第 3 步 pnpm add 挂起到超时 → 规格逐字节回滚，error/steps 明确写「已回滚」', async () => {
-  // 审查实跑：超时后规格留在「新版本」、node_modules 还是 0.2.0，error 完全不提「已改写规格」。
-  const profile = makeFakeProfile('timeout-rollback', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const originalBytes = readFileSync(join(profile, 'package.json'), 'utf8');
-  const capture = join(selfUpdateRoot, 'capture-timeout-rollback.txt');
-  const bin = join(selfUpdateRoot, 'bin-timeout-rollback');
-  // add 先把规格写成精确版本，再挂起 5s（远长于 3s 超时）→ 序列在 add 上超时被杀
-  writeFakePnpm(bin, {
-    capture, addSleepSec: 5,
-    addSpecText: `${JSON.stringify({ name: 'dsh-profile-timeout-rollback', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } }, null, 2)}\n`,
-    addSpecProfile: profile,
-  });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 3000 });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      const started = Date.now();
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 10000);
-      const elapsed = Date.now() - started;
-      eq(status?.state, 'failed', `超时必须落 failed（实际 ${status?.state}）：`);
-      eq(status?.reason, 'timeout', `失败原因是 timeout：${status?.reason}`);
-      eq(elapsed < 8000, true, `超时后必须尽快收口（实际 ${elapsed}ms，子进程本来要睡 5s）：`);
-      // ★ A2 核心：超时路径也必须回滚规格，且回到**原值**
-      eq(readProfileSpec(profile), '^0.2.0', 'A2：超时后规格必须回到原值：');
-      eq(readFileSync(join(profile, 'package.json'), 'utf8') === originalBytes, true,
-        'A2：超时回滚必须逐字节等于改动前的清单：');
-      eq(String(status?.error).includes('回滚'), true, `A2：error 必须明确写「已回滚」：${status?.error}`);
-      eq(status?.steps?.some((step) => step.kind === 'rollback-profile-spec' && step.ok === true), true,
-        `A2：steps 里要有「已回滚」这一步：${JSON.stringify(status?.steps)}`);
-      // 落盘的 node_modules 版本仍是旧的（升级确实没成功）
-      const installed = JSON.parse(readFileSync(join(profile, 'node_modules', 'dsh-worktodo', 'package.json'), 'utf8')).version;
-      eq(installed, '0.2.0', 'A2：升级没成功时 node_modules 版本不该变：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('C2（中）：失败回滚把 package.json + pnpm-lock.yaml 当同一事务 —— 两者都逐字节还原', async () => {
-  // 审查实跑：旧 journal 只还原 package.json，lockfile 留在新规格 → profile 三方不一致。
-  // 修复后两者进同一个快照，任何非 done 出口都一起回滚。
-  const profile = makeFakeProfile('lockfile-rollback', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const manifest = join(profile, 'package.json');
-  const lock = join(profile, 'pnpm-lock.yaml');
-  const manifestBytes = readFileSync(manifest, 'utf8');
-  const lockBytes = [
-    "lockfileVersion: '9.0'",
-    '',
-    'importers:',
-    '  .:',
-    '    dependencies:',
-    `      dsh-worktodo:`,
-    '        specifier: ^0.2.0',
-    '        version: 0.2.0',
-    '',
-  ].join('\n');
-  writeFileSync(lock, lockBytes);
-  const capture = join(selfUpdateRoot, 'capture-lockfile-rollback.txt');
-  const bin = join(selfUpdateRoot, 'bin-lockfile-rollback');
-  // 假 pnpm add：两个文件都改成新版本规格，但 node_modules 版本不变（→ 序列失败 → 必须回滚两者）
-  writeFakePnpm(bin, {
-    capture,
-    addSpecText: `${JSON.stringify({ name: 'dsh-profile-lockfile-rollback', private: true, dependencies: { 'dsh-worktodo': `^${FAKE_NEXT_VERSION}` } }, null, 2)}\n`,
-    addLockText: `lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      dsh-worktodo:\n        specifier: ^${FAKE_NEXT_VERSION}\n        version: ${FAKE_NEXT_VERSION}\n`,
-    addSpecProfile: profile,
-    addLockProfile: profile,
-  });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 5000);
-      eq(status?.state, 'failed', `版本没变必须 failed（实际 ${status?.state}）：`);
-      eq(status?.reason, 'version-unchanged', `失败原因是 version-unchanged：${status?.reason}`);
-      // ★ 核心：两个文件都逐字节回到原值
-      eq(readFileSync(manifest, 'utf8') === manifestBytes, true, 'C2：package.json 必须逐字节回滚：');
-      eq(readFileSync(lock, 'utf8') === lockBytes, true,
-        `C2：pnpm-lock.yaml 也必须逐字节回滚（旧实现会把它留在新版本）；实际：\n${readFileSync(lock, 'utf8')}`);
-      eq(readFileSync(lock, 'utf8').includes(FAKE_NEXT_VERSION), false, 'C2：lockfile 里不许残留新版本号：');
-      const rollbackStep = status?.steps?.find((step) => step.kind === 'rollback-profile-spec');
-      eq(Boolean(rollbackStep), true, `要有回滚步骤：${JSON.stringify(status?.steps)}`);
-      eq(rollbackStep?.ok, true, `回滚必须标成功：${JSON.stringify(rollbackStep)}`);
-      eq(String(rollbackStep?.note).includes('pnpm-lock.yaml'), true,
-        `C2：回滚说明要提到 lockfile（让用户知道两者一起还原）：${rollbackStep?.note}`);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('C2：原本没有 pnpm-lock.yaml，pnpm 新建后失败 → 回滚把它删掉（恢复原状）', async () => {
-  const profile = makeFakeProfile('lockfile-created', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const manifestBytes = readFileSync(join(profile, 'package.json'), 'utf8');
-  const lock = join(profile, 'pnpm-lock.yaml');
-  eq(existsSync(lock), false, '前置条件：原 profile 没有 lockfile：');
-  const capture = join(selfUpdateRoot, 'capture-lockfile-created.txt');
-  const bin = join(selfUpdateRoot, 'bin-lockfile-created');
-  writeFakePnpm(bin, {
-    capture,
-    addLockText: `lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      dsh-worktodo:\n        specifier: ^${FAKE_NEXT_VERSION}\n        version: ${FAKE_NEXT_VERSION}\n`,
-    addLockProfile: profile,
-  });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 5000);
-      eq(status?.state, 'failed', `版本没变必须 failed（实际 ${status?.state}）：`);
-      eq(existsSync(lock), false, 'C2：本次新建的 lockfile 必须被删掉（恢复「原本没有」的状态）：');
-      eq(readFileSync(join(profile, 'package.json'), 'utf8') === manifestBytes, true, 'C2：manifest 仍逐字节不变：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('A3：dependencies 与 devDependencies 同名不同值 → 回滚逐字节还原原文件（段位/协议值不得被冲掉）', async () => {
-  // 审查实跑复现：旧回滚把「第一个字段的原值」写回**所有**字段，
-  // `devDependencies.dsh-worktodo = "link:…"` 被静默改成 `"^0.2.0"`。
-  const profile = join(selfUpdateRoot, 'two-sections');
-  mkdirSync(profile, { recursive: true });
-  const originalBytes = [
-    '{',
-    '  "name": "dsh-profile-two-sections",',
-    '  "private": true,',
-    '  "dependencies": {',
-    '    "dsh-worktodo": "^0.2.0"',
-    '  },',
-    '  "devDependencies": {',
-    '    "dsh-worktodo": "~0.1.0"',
-    '  }',
-    '}',
-    '',
-  ].join('\n');
-  writeFileSync(join(profile, 'package.json'), originalBytes);
-  seedInstalledVersion(profile, '0.2.0');
-  // 最坏情况：pnpm 的 add 把两个段位都改成新版本（于是回滚必须同时照顾两个段位的原值）
-  const rewritten = originalBytes.replaceAll('"^0.2.0"', `"${FAKE_NEXT_VERSION}"`).replaceAll('"~0.1.0"', `"${FAKE_NEXT_VERSION}"`);
-  eq(rewritten !== originalBytes, true, 'fixture 自检：两个段位都要被假 pnpm 改到：');
-  const capture = join(selfUpdateRoot, 'capture-two-sections.txt');
-  const bin = join(selfUpdateRoot, 'bin-two-sections');
-  writeFakePnpm(bin, { capture, addSpecText: rewritten, addSpecProfile: profile });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 5000);
-      eq(status?.state, 'failed', `版本没变要落 failed（实际 ${status?.state}）：`);
-      const text = readFileSync(join(profile, 'package.json'), 'utf8');
-      eq(text === originalBytes, true, 'A3：回滚必须逐字节等于原文件（缩进/段位/键序都不能动）：');
-      const parsed = JSON.parse(text);
-      eq(parsed.dependencies['dsh-worktodo'], '^0.2.0', 'dependencies 要回原值：');
-      eq(parsed.devDependencies['dsh-worktodo'], '~0.1.0', 'A3：devDependencies 的原值不得被 dependencies 的原值覆盖：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 await test('A3：任一段位是 link:/file:/workspace: 就整体跳过 —— 零子进程、零写盘、zero 字节改动', async () => {
   const profile = join(selfUpdateRoot, 'dev-linked');
   mkdirSync(profile, { recursive: true });
@@ -2164,39 +2252,6 @@ await test('A3：任一段位是 link:/file:/workspace: 就整体跳过 —— �
       await new Promise((resolve) => setTimeout(resolve, 200));
       eq(invokeCount(capture), 0, `本地协议场景一个子进程都不许起（实际 ${invokeCount(capture)}）：`);
       eq(readFileSync(join(profile, 'package.json'), 'utf8') === bytes, true, '零写盘：清单逐字节不变：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('自升级（核心）：第 1 步 pnpm update 真的换掉落盘版本 → done + 新版本 + restartRequired', async () => {
-  const profile = makeFakeProfile('swapped-by-update', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-swap1.txt');
-  const bin = join(selfUpdateRoot, 'bin-swap1');
-  // 假 pnpm 在**任意**子命令上真的把 node_modules 版本换成本用例的目标版本
-  writeFakePnpm(bin, { capture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any' });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 5000);
-      eq(status?.state, 'done', `版本真变了就该 done（实际 ${status?.state}，error=${status?.error}）：`);
-      eq(status?.to, FAKE_NEXT_VERSION, 'done 要用落盘版本，而不是 registry 的 latest：');
-      eq(status?.installed, FAKE_NEXT_VERSION, '已安装版本要报给面板：');
-      eq(invokeCount(capture), 1, `第 1 步成功就不该再跑第 2 步（实际 ${invokeCount(capture)} 次）：`);
-      eq(readInvocations(capture)[0][0], 'update', '成功的这条就是用户实测有效的 pnpm update：');
-      // hasUpdate 的语义没变：registry latest vs **运行版本**。装完但进程还没重启时它仍是 true，
-      // 面板必须先看 restartRequired（客户端对应用例在 smoke-client）。
-      const list = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
-      eq(list.data.update.hasUpdate, true, `升级落盘后 hasUpdate 仍按 runningVersion 比较（装好 ≠ 已生效）：${JSON.stringify(list.data.update)}`);
-      eq(list.data.update.installedVersion, FAKE_NEXT_VERSION, '落盘版本要报给面板：');
-      eq(list.data.update.installed, FAKE_NEXT_VERSION, '老字段 installed 保留（兼容旧面板）：');
-      eq(list.data.update.restartRequired, true, '落盘版本比运行版本新 → 提示重启 DSH 生效：');
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -2325,362 +2380,6 @@ await test('hasUpdate 语义不变：latest 比 runningVersion 新，而不是�
   }
 });
 
-await test('自升级（核心）：第 1 步 no-op、第 2 步改写规格后 install 真的换版本 → 从 failed 边缘救回 done', async () => {
-  const profile = makeFakeProfile('swap-by-install', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-swap2.txt');
-  const bin = join(selfUpdateRoot, 'bin-swap2');
-  // 只在 add 这一步才换版本：模拟「update 被旧规格挡住、pnpm 改成精确规格后才真的装上」
-  writeFakePnpm(bin, {
-    capture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'add',
-    addSpecText: `${JSON.stringify({ name: 'dsh-profile-swap-by-install', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } }, null, 2)}\n`,
-    addSpecProfile: profile,
-  });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 5000);
-      eq(status?.state, 'done', `第 2 步生效就该 done（实际 ${status?.state}，error=${status?.error}）：`);
-      eq(status?.to, FAKE_NEXT_VERSION);
-      eq(invokeCount(capture), 2, `应当先 update 再 add（实际 ${invokeCount(capture)} 次）：`);
-      // 升级成功 = 保留 pnpm 写下的精确规格（不回滚），并显式记一步
-      eq(readProfileSpec(profile), FAKE_NEXT_VERSION, '成功升级后规格应当保留 pnpm 写下的精确版本：');
-      eq(status?.steps?.some((step) => step.kind === 'profile-manifest'), true,
-        `成功路径要有一步说明「规格由 pnpm 改写并保留」：${JSON.stringify(status?.steps)}`);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('自升级：连续两次 POST 只启动一个子进程（幂等，不并发）', async () => {
-  const profile = makeFakeProfile('concurrent', '^0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-concurrent.txt');
-  const bin = join(selfUpdateRoot, 'bin-concurrent');
-  writeFakePnpm(bin, { capture, sleepSec: 3 });
-  // 超时压到 1500ms（远小于 3s 的 sleep，又远大于两次 POST 之间的间隔）：
-  // 序列的第 1 步会因超时被杀，第 2 步绝不启动 —— 计数确定，且不依赖毫秒级时序
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 1500 });
-  try {
-    await withEnv({ WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`, WORKTODO_PNPM_PATH: undefined }, async () => {
-      const first = await triggerUpdate(host);
-      const second = await triggerUpdate(host);
-      eq(first.json().ok, true);
-      eq(first.json().data.state, 'running', '第一次应当进入 running：');
-      eq(second.json().ok, true, '已在跑时的第二次调用要幂等返回，而不是报错：');
-      eq(second.json().data.state, 'running', '第二次也必须看到 running：');
-
-      const started = await waitFor(() => existsSync(capture), 3000);
-      eq(started, true, '假 pnpm 应当被调用：');
-      const invocations = invokeCount(capture);
-      eq(invocations, 1, `并发两次 POST 只能启动一个子进程（实际 ${invocations} 个）：`);
-      await waitForUpdateEnd(host, 4000);
-      eq(invokeCount(capture), 1, `升级失败后也不该继续启动新子进程（实际 ${invokeCount(capture)} 个）：`);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('自升级：子进程退出码非 0 → state=failed 且面板拿得到原因与日志尾部', async () => {
-  const profile = makeFakeProfile('failing', '^0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-failing.txt');
-  const bin = join(selfUpdateRoot, 'bin-failing');
-  writeFakePnpm(bin, { capture, exitCode: 3, stderrText: 'ERR_PNPM_NO_MATCHING_VERSION 假装的安装失败原因' });
-  const { host, dir } = await makeUpdateHost();
-  try {
-    await withEnv({ WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`, WORKTODO_PNPM_PATH: undefined }, async () => {
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host);
-      eq(status?.state, 'failed', `非 0 退出必须落到 failed（实际 ${status?.state}）：`);
-      eq(status?.reason, 'exit-nonzero');
-      eq(typeof status?.error === 'string' && status.error.length > 0, true, `失败必须带原因：${JSON.stringify(status)}`);
-      eq(String(status.error).includes('3'), true, `原因里要带退出码：${status.error}`);
-      // 退出码非 0 也不许掩盖「版本没变」这件事：两个事实都要写进 error
-      eq(String(status.error).includes('版本未变'), true, `失败原因也要说清落盘版本没变：${status.error}`);
-      eq(status.logTail.join('\n').includes('假装的安装失败原因'), true, `stderr 要回传尾部日志：${JSON.stringify(status.logTail)}`);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('自升级：子进程不退出 → 到 updateTimeoutMs 被杀并落 failed（用短超时实测）', async () => {
-  const profile = makeFakeProfile('hanging', '^0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-hanging.txt');
-  const bin = join(selfUpdateRoot, 'bin-hanging');
-  writeFakePnpm(bin, { capture, sleepSec: 5 }); // 远长于下面的 300ms 超时
-  const { host, dir } = await makeUpdateHost({ updateTimeoutMs: 300 });
-  try {
-    await withEnv({ WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`, WORKTODO_PNPM_PATH: undefined }, async () => {
-      const started = Date.now();
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 3000);
-      const elapsed = Date.now() - started;
-      eq(status?.state, 'failed', `超时必须落 failed（实际 ${status?.state}）：`);
-      eq(status?.reason, 'timeout');
-      eq(String(status?.error).includes('300'), true, `原因里要带生效的超时值：${status?.error}`);
-      // 卡死的子进程不能等到自己睡醒：5 秒的 sleep 必须在 ~300ms 就被杀掉
-      eq(elapsed < 2500, true, `超时后必须尽快收口（实际 ${elapsed}ms，子进程本来要睡 5s）：`);
-      console.log(`      [timeout] updateTimeoutMs=300ms 生效，实测 ${elapsed}ms 判定失败`);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('B1（严重）：超时杀整棵进程树 —— 孙进程不再存活、心跳停止增长', async () => {
-  // 审查实跑：600ms 超时只杀直接子进程，孙进程心跳从 50 字节涨到 165 字节。
-  // 修复后 POSIX 用独立进程组 + kill(-pid)，Windows 用 taskkill /T /F。
-  if (process.platform === 'win32') {
-    console.log('      [skip] 本机不是 Windows；Windows 分支由 killProcessTree 的 taskkill /T 覆盖');
-    return;
-  }
-  const profile = makeFakeProfile('tree-kill', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-tree.txt');
-  const heartbeat = join(selfUpdateRoot, 'tree-heartbeat.txt');
-  const pidFile = join(selfUpdateRoot, 'tree-grandchild.pid');
-  const bin = join(selfUpdateRoot, 'bin-tree');
-  writeFakeTreePnpm(join(bin, 'pnpm'), { capture, heartbeat, pidFile });
-  const statePath = join(selfUpdateRoot, 'update-state-tree-kill.json');
-  let host;
-  let dir;
-  let grandchild = null;
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-      // 独立状态/锁路径：避免和其它用例共享锁文件（否则可能撞上 busy，子进程根本不会起）
-      WORKTODO_UPDATE_STATE_PATH: statePath,
-    }, async () => {
-      // 1.5s 足够让 node 孙进程完成冷启动并开始写心跳，又远短于脚本的 sleep 30
-      ({ host, dir } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 1500 }));
-      await triggerUpdate(host);
-      eq(await waitFor(() => existsSync(pidFile), 3000), true,
-        `前置条件：假 pnpm 必须先派生一个长命孙进程（bin=${readdirSync(bin).join(',')}）：`);
-      grandchild = Number(readFileSync(pidFile, 'utf8').trim());
-      eq(isPidAlive(grandchild), true, `前置条件：孙进程（pid=${grandchild}）应当活着：`);
-      const wroteHeartbeat = await waitFor(() => existsSync(heartbeat), 3000);
-      eq(wroteHeartbeat, true, `前置条件：孙进程必须已经在写心跳（bin=${readdirSync(bin).join(',')}；capture=${existsSync(capture) ? readFileSync(capture, 'utf8') : '无'}）：`);
-      const status = await waitForUpdateEnd(host, 5000);
-      eq(status?.reason, 'timeout', `应当以 timeout 收口（实际 ${status?.reason}）：`);
-      eq(await waitFor(() => !isPidAlive(grandchild), 2000), true,
-        `B1：超时后孙进程必须已经不存在（pid=${grandchild}）；旧实现只杀直接子进程，孙进程会继续写 profile：`);
-      const before = statSync(heartbeat).size;
-      await new Promise((resolve) => setTimeout(resolve, 350));
-      const after = statSync(heartbeat).size;
-      eq(after, before, `B1：超时后心跳文件不许再增长（${before} → ${after} 字节）：`);
-      console.log(`      [tree] 超时 1500ms 后孙进程 pid=${grandchild} 已退出，心跳停在 ${after} 字节`);
-    });
-  } finally {
-    if (grandchild && isPidAlive(grandchild)) {
-      try { process.kill(grandchild, 'SIGKILL'); } catch { /* 已退出 */ }
-    }
-    if (dir) rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('B4（高）：CLI 明确拒绝（active-run / 兼容性）→ failed，且绝不降级 pnpm（零 pnpm 写盘）', async () => {
-  // 审查实跑/静态：旧实现把 CLI 的任何非 0 都当成「这一步失败」，随后 pnpm 直接写 profile，
-  // 绕开 DSH 的 active-run 锁与兼容性预检。现在必须直接 failed、后面 pnpm 一步都不跑。
-  const cases = [
-    { name: 'active-run', stderr: 'error: another install is already running for this profile (active-run)', reason: 'active-run' },
-    { name: 'incompatible', stderr: 'error: plugin compatibility check failed: dsh-worktodo@99 is incompatible with this DSH build', reason: 'incompatible' },
-  ];
-  for (const item of cases) {
-    const profile = makeFakeProfile(`cli-refuse-${item.name}`, '^0.2.0');
-    seedInstalledVersion(profile, '0.2.0');
-    const manifest = join(profile, 'package.json');
-    const originalBytes = readFileSync(manifest, 'utf8');
-    const cliCapture = join(selfUpdateRoot, `capture-cli-refuse-${item.name}.txt`);
-    const pnpmCapture = join(selfUpdateRoot, `capture-cli-refuse-${item.name}-pnpm.txt`);
-    const fakeCli = join(selfUpdateRoot, `fake-cli-refuse-${item.name}.mjs`);
-    writeFileSync(fakeCli, [
-      "import { appendFileSync } from 'node:fs';",
-      `appendFileSync(${JSON.stringify(cliCapture)}, 'INVOKE\\n' + process.argv.slice(2).join('\\n') + '\\n');`,
-      `console.error(${JSON.stringify(item.stderr)});`,
-      'process.exit(1);',
-      '',
-    ].join('\n'));
-    const bin = join(selfUpdateRoot, `bin-cli-refuse-${item.name}`);
-    // 如果实现错误地降级，这个假 pnpm 会立刻改写 profile（版本 + 规格）→ 断言会抓到
-    writeFakePnpm(bin, {
-      capture: pnpmCapture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any',
-      addSpecText: `${JSON.stringify({ name: 'dsh-profile-cli-refuse', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } }, null, 2)}\n`,
-      addSpecProfile: profile,
-    });
-    const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-    try {
-      await withEnv({
-        WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_CLI: fakeCli,
-        PATH: `${bin}:${process.env.PATH}`, WORKTODO_PNPM_PATH: undefined,
-        WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-      }, async () => {
-        await triggerUpdate(host);
-        const status = await waitForUpdateEnd(host, 5000);
-        eq(status?.state, 'failed', `B4（${item.name}）：CLI 拒绝必须 failed（实际 ${status?.state}）：`);
-        eq(status?.reason, item.reason, `B4（${item.name}）：失败原因要能区分拒绝类型（实际 ${status?.reason}）：`);
-        eq(String(status?.error).includes('不会降级'), true,
-          `B4（${item.name}）：error 必须明确写「不会降级到 pnpm」：${status?.error}`);
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        eq(invokeCount(cliCapture), 1, `B4（${item.name}）：CLI 只许调用一次（不许重试）：`);
-        eq(invokeCount(pnpmCapture), 0,
-          `B4（${item.name}）：CLI 明确拒绝后一个 pnpm 子进程都不许起（否则会绕过宿主事务）：`);
-        eq(status?.steps?.some((step) => step.kind === 'pnpm-update' || step.kind === 'pnpm-add-exact'), false,
-          `B4（${item.name}）：pnpm 步骤根本不该出现在状态里：${JSON.stringify(status?.steps)}`);
-        eq(readFileSync(manifest, 'utf8'), originalBytes,
-          `B4（${item.name}）：零 pnpm 写盘，清单逐字节不变：`);
-      });
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }
-});
-
-await test('B4：只有 CLI 不可用（找不到脚本）才允许降级 pnpm —— 正对照', async () => {
-  const profile = makeFakeProfile('cli-unavailable-fallback', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-cli-unavailable-pnpm.txt');
-  const bin = join(selfUpdateRoot, 'bin-cli-unavailable');
-  // 假 pnpm 真的换版本 → 序列应当从 CLI 降级到 pnpm 并成功
-  writeFakePnpm(bin, { capture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any' });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile,
-      // 指向一个不存在的脚本：node 会以退出码 1 + Cannot find module 失败
-      WORKTODO_UPDATE_CLI: join(selfUpdateRoot, 'no-such-cli.mjs'),
-      PATH: `${bin}:${process.env.PATH}`, WORKTODO_PNPM_PATH: undefined,
-      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 5000);
-      eq(status?.state, 'done', `CLI 只是找不到、pnpm 能装时应当 done（实际 ${status?.state}，error=${status?.error}；steps=${JSON.stringify(status?.steps)}）：`);
-      eq(invokeCount(capture) >= 1, true, `B4：CLI 不可用时必须降级到 pnpm（实际 ${invokeCount(capture)} 次）：`);
-      eq(status?.steps?.some((step) => step.kind === 'pnpm-update'), true, '降级后应当真的跑 pnpm 步骤：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('B2（高）：dispose 取消在飞安装 —— 子进程被杀、之后零 spawn、零写盘', async () => {
-  const profile = makeFakeProfile('dispose-inflight', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const manifest = join(profile, 'package.json');
-  const originalBytes = readFileSync(manifest, 'utf8');
-  const capture = join(selfUpdateRoot, 'capture-dispose-inflight.txt');
-  const pidFile = join(selfUpdateRoot, 'dispose-inflight.pid');
-  const marker = join(selfUpdateRoot, 'dispose-inflight-wrote.txt');
-  const bin = join(selfUpdateRoot, 'bin-dispose-inflight');
-  writeSlowWritingPnpm(join(bin, 'pnpm'), {
-    capture, pidFile, profile, marker, newSpec: FAKE_NEXT_VERSION, sleepSec: 1.2,
-  });
-  const stageDir = join(selfUpdateRoot, 'stage-dispose-inflight');
-  const statePath = join(selfUpdateRoot, 'update-state-dispose-inflight.json');
-  let host;
-  let dir;
-  let pid = null;
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-      WORKTODO_UPDATE_STAGE_DIR: stageDir, WORKTODO_UPDATE_STATE_PATH: statePath,
-    }, async () => {
-      ({ host, dir } = await makeUpdateHost({ autoInstall: true, updateTimeoutMs: 5000 }));
-      eq(await waitFor(() => existsSync(capture), 5000), true,
-        '前置条件：autoInstall:true 必须真的起了一个安装子进程：');
-      // capture 与 pid 文件是假 pnpm 分两行写的：只等 capture 会偶发读到还没写出的 pid（CI 抖动）。
-      eq(await waitFor(() => existsSync(pidFile), 2000), true,
-        '前置条件：假 pnpm 必须已经写出自己的 pid：');
-      const beforeDispose = (await readUpdateState(host)).json().data;
-      eq(beforeDispose.phase, 'installing', `前置条件：dispose 时应当正在安装（实际 ${beforeDispose.phase}）：`);
-      pid = Number(readFileSync(pidFile, 'utf8').trim());
-      eq(isPidAlive(pid), true, `前置条件：安装子进程（pid=${pid}）应当活着：`);
-
-      // 模拟插件卸载：调用所有 effect 的 dispose
-      for (const effect of [...host.effects].reverse()) {
-        try { await effect.dispose?.(); } catch { /* 单个清理失败不打断 */ }
-      }
-
-      eq(await waitFor(() => !isPidAlive(pid), 2000), true,
-        `B2：dispose 必须杀掉在飞子进程（pid=${pid}）；旧实现卸载后子进程还会跑完并写 profile：`);
-      const invocationsAtDispose = invokeCount(capture);
-      await new Promise((resolve) => setTimeout(resolve, 1700)); // 远长于假 pnpm 的 1.2s
-      eq(invokeCount(capture), invocationsAtDispose,
-        `B2：dispose 后不许再起新的子进程（${invocationsAtDispose} → ${invokeCount(capture)}）：`);
-      eq(existsSync(marker), false, 'B2：dispose 后子进程不许再写 profile（WROTE 标记不该出现）：');
-      eq(readFileSync(manifest, 'utf8'), originalBytes, 'B2：dispose 后 profile 必须逐字节不变（零写盘）：');
-      eq(existsSync(join(dirname(statePath), 'update.lock')), false,
-        'B2：dispose 必须释放跨进程锁（否则下次更新永远 busy）：');
-    });
-  } finally {
-    if (pid && isPidAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* 已退出 */ } }
-    if (dir) rmSync(dir, { recursive: true, force: true });
-    rmSync(stageDir, { recursive: true, force: true });
-    // 若本用例中途失败，锁文件会留在共享的 selfUpdateRoot 里，让下一条 B3 被误判成 busy；
-    // 这里无条件回收，保证用例失败不会污染后续用例。
-    rmSync(join(dirname(statePath), 'update.lock'), { force: true });
-  }
-});
-
-await test('B3（高）：两个实例并发 → 只有一个拿到跨进程锁，另一个 busy 且零 pnpm 写盘', async () => {
-  const profile = makeFakeProfile('lock-concurrent', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-lock-concurrent.txt');
-  const bin = join(selfUpdateRoot, 'bin-lock-concurrent');
-  // 假 pnpm 睡 1.2s：第一个实例持锁期间，第二个实例必须被挡住
-  writeFakePnpm(bin, {
-    capture, sleepSec: 1.2, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any',
-  });
-  const statePath = join(selfUpdateRoot, 'update-state-lock-concurrent.json');
-  const lockFile = join(dirname(statePath), 'update.lock');
-  let hostA;
-  let hostB;
-  let dirA;
-  let dirB;
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-      WORKTODO_UPDATE_STATE_PATH: statePath,
-    }, async () => {
-      ({ host: hostA, dir: dirA } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 5000 }));
-      ({ host: hostB, dir: dirB } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 5000 }));
-      const first = (await triggerUpdate(hostA)).json();
-      eq(first.ok, true, `第一个实例应当开始安装：${JSON.stringify(first)}`);
-      eq(await waitFor(() => existsSync(capture), 3000), true, '前置条件：第一个实例必须已经起了子进程（= 已持锁）：');
-      // 确认锁真的写在约定的位置、内容带 pid/token
-      eq(existsSync(lockFile), true, 'B3：安装期间必须有跨进程锁文件：');
-      const owner = JSON.parse(readFileSync(lockFile, 'utf8'));
-      eq(owner.pid, process.pid, 'B3：锁内容要记录 pid：');
-      eq(typeof owner.token === 'string' && owner.token.length > 0, true, 'B3：锁内容要记录 token：');
-
-      const second = (await triggerUpdate(hostB)).json();
-      eq(second.ok, false, `B3：第二个实例必须 busy 失败而不是并发写（实际 ${JSON.stringify(second)}）：`);
-      eq(second.reason, 'busy', `B3：reason 要是 busy（实际 ${second.reason}）：`);
-      eq(String(second.error).includes('未做任何写操作'), true,
-        `B3：busy 要说明零写盘：${second.error}`);
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      eq(invokeCount(capture), 1,
-        `B3：并发时只允许一个安装子进程（实际 ${invokeCount(capture)}；旧实现每个实例各起一个）：`);
-      eq((await readUpdateState(hostB)).json().data.phase, 'failed', 'B3：第二个实例的状态必须是 failed(busy)：');
-
-      const settled = await waitForUpdateEnd(hostA, 7000);
-      eq(settled?.state, 'done', `B3：第一个实例应当正常装完（实际 ${settled?.state}，error=${settled?.error}）：`);
-      eq(existsSync(lockFile), false, 'B3：序列结束后锁必须释放：');
-    });
-  } finally {
-    if (dirA) rmSync(dirA, { recursive: true, force: true });
-    if (dirB) rmSync(dirB, { recursive: true, force: true });
-  }
-});
-
 await test('B3：跨进程锁纯函数 —— 第二次 busy、>10min 可回收、release 只删自己的锁', () => {
   const dir = mkdtempSync(join(tmpdir(), 'worktodo-lock-'));
   const file = join(dir, 'update.lock');
@@ -2726,97 +2425,6 @@ await test('B1/B3：killProcessTree 在 POSIX 用独立进程组（负 pid），
     eq(await waitFor(() => !isPidAlive(proc.pid), 2000), true, 'B1：直接子进程也必须真的退出：');
   } finally {
     try { process.kill(-proc.pid, 'SIGKILL'); } catch { /* 已退出 */ }
-  }
-});
-
-await test('自升级：升级进行中 GET /list 仍然及时返回（不阻塞请求，给出实测耗时）', async () => {
-  const profile = makeFakeProfile('nonblocking', '^0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-nonblocking.txt');
-  const bin = join(selfUpdateRoot, 'bin-nonblocking');
-  writeFakePnpm(bin, { capture, sleepSec: 1 });
-  const { host, dir } = await makeUpdateHost();
-  try {
-    await withEnv({ WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`, WORKTODO_PNPM_PATH: undefined }, async () => {
-      const triggered = await triggerUpdate(host);
-      eq(triggered.json().data.state, 'running', '先确保升级确实在进行中：');
-
-      const started = Date.now();
-      const listResponse = await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
-      const elapsed = Date.now() - started;
-      eq(listResponse.json().ok, true, '升级进行中列表也要照常可读：');
-      eq(elapsed < 500, true, `升级不能阻塞 /list（实测 ${elapsed}ms）：`);
-      console.log(`      [nonblocking] 升级进行中 GET /list 实测 ${elapsed}ms`);
-      await waitForUpdateEnd(host, 4000);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('自升级：空体 POST /update 也算升级（面板/脚本不用懂 action 字段）', async () => {
-  const profile = makeFakeProfile('emptybody', '^0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-emptybody.txt');
-  const bin = join(selfUpdateRoot, 'bin-emptybody');
-  writeFakePnpm(bin, { capture });
-  const { host, dir } = await makeUpdateHost();
-  try {
-    await withEnv({ WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`, WORKTODO_PNPM_PATH: undefined }, async () => {
-      const response = await triggerUpdate(host, {});
-      const body = response.json();
-      eq(body.ok, true, '空体应当被当成升级请求：');
-      eq(['running', 'done'].includes(body.data?.state), true, `空体要真的触发升级：${JSON.stringify(body)}`);
-      await waitForUpdateEnd(host);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('自升级：拿得到官方 CLI 时走 dsh plugin --profile <name> add …@latest --registry（首选路径）', async () => {
-  const profile = makeFakeProfile('cli-profile', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-cli.txt');
-  // 假 CLI 必须是 Node 脚本：真实现会用 process.execPath 去跑它。
-  // 它必须**真的换掉落盘版本**（模拟 CLI 这次真的装上了），否则修复后的代码会（正确地）
-  // 认为第 1 步 no-op 并继续走 pnpm 兜底 —— 那正是另一个用例要钉住的行为。
-  const fakeCli = join(selfUpdateRoot, 'fake-dsh-cli.mjs');
-  const cliPkgDir = join(profile, 'node_modules', 'dsh-worktodo');
-  writeFileSync(fakeCli, [
-    "import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';",
-    `appendFileSync(${JSON.stringify(capture)}, 'INVOKE\\n' + process.argv.slice(2).join('\\n') + '\\n');`,
-    `mkdirSync(${JSON.stringify(cliPkgDir)}, { recursive: true });`,
-    `writeFileSync(${JSON.stringify(join(cliPkgDir, 'package.json'))}, JSON.stringify({ name: 'dsh-worktodo', version: ${JSON.stringify(FAKE_NEXT_VERSION)} }, null, 2));`,
-    '',
-  ].join('\n'));
-  // 兜底用假 pnpm 一起塞进 PATH：真出问题时也绝不打网络/真装
-  const fallbackCapture = join(selfUpdateRoot, 'capture-cli-fallback.txt');
-  const bin = join(selfUpdateRoot, 'bin-cli');
-  writeFakePnpm(bin, { capture: fallbackCapture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any' });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false, updateRegistry: 'https://registry.npmjs.org/' });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, WORKTODO_UPDATE_CLI: fakeCli,
-      WORKTODO_PNPM_PATH: undefined, PATH: `${bin}:${process.env.PATH}`, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      const response = await triggerUpdate(host);
-      eq(response.json().ok, true, `CLI 路径也该能触发：${JSON.stringify(response.json())}`);
-      const status = await waitForUpdateEnd(host, 5000);
-      eq(status?.state, 'done', `CLI 真换掉版本就该 done（实际 ${status?.state}，error=${status?.error}）：`);
-      eq(invokeCount(fallbackCapture), 0, 'CLI 第 1 步成功就不该再去跑 pnpm 兜底：');
-      const invocations = readInvocations(capture);
-      eq(invocations.length, 1, `官方 CLI 只应被调用一次（实际 ${invocations.length}）：`);
-      const argv = invocations[0];
-      eq(argv[0], 'plugin', `必须走 plugin 子命令：${argv.join(' ')}`);
-      eq(argv[1], '--profile', '必须显式指定 profile：');
-      eq(argv[2], 'cli-profile', 'profile 名要来自定位到的目录名：');
-      eq(argv[3], 'add');
-      eq(argv.includes('dsh-worktodo@latest'), true, `CLI 路径也必须带 @latest：${argv.join(' ')}`);
-      eq(argv.includes('--registry'), true, `CLI 路径也必须带 --registry：${argv.join(' ')}`);
-      eq(argv.includes('https://registry.npmjs.org/'), true, `CLI 路径也必须用官方源：${argv.join(' ')}`);
-      eq(status?.steps?.[0]?.kind, 'cli-add-latest', `状态里第一步应当标成 CLI：${JSON.stringify(status?.steps)}`);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -3091,88 +2699,6 @@ await test('Windows 假成功护栏：落盘版本没变（含 null）绝不算�
   eq(installedVersionChanged('0.2.5', '0.2.4'), true, '版本变了（即使是降级）也要如实判定「变了」，由上层比对目标：');
 });
 
-await test('自升级（Windows 模拟端到端）：pnpm 由 node 跑 pnpm.mjs；命令成功但版本没变 → failed + 可读诊断', async () => {
-  const profile = makeFakeProfile('win32-noop', '^0.2.5');
-  seedInstalledVersion(profile, '0.2.5');
-  const capture = join(selfUpdateRoot, 'capture-win32-noop.txt');
-  const fakePnpm = writeFakePnpmMjs(join(selfUpdateRoot, 'fake-pnpm-win32-noop.mjs'), { capture });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      // 关键：命令形状按 Windows 解析，但 profile 仍是临时 POSIX 目录（不碰真实数据）
-      WORKTODO_PLATFORM: 'win32',
-      WORKTODO_PROFILE_DIR: profile,
-      WORKTODO_PNPM_PATH: fakePnpm,
-      WORKTODO_UPDATE_LATEST: '0.2.6',
-    }, async () => {
-      const response = await triggerUpdate(host);
-      eq(response.json().ok, true, `触发升级不该被拒：${JSON.stringify(response.json())}`);
-      const status = await waitForUpdateEnd(host, 8000);
-      eq(status?.state, 'failed', `版本没变绝不能报 done（实际 ${status?.state}）：`);
-      eq(status?.reason, 'version-unchanged', `原因必须是 version-unchanged：${status?.reason}`);
-      eq(String(status?.error).includes('落盘版本未变'), true, `error 必须说清版本没变：${status?.error}`);
-
-      // 真子进程证据：只有 node 真的跑起了 pnpm.mjs，capture 里才会有 INVOKE
-      const invocations = readInvocations(capture);
-      eq(invocations.length > 0, true, `必须真的用 node 跑了 pnpm.mjs（capture=${JSON.stringify(invocations)}）：`);
-      eq(invocations[0][0], 'update', `假 pnpm 收到的第一个参数应是 update：${JSON.stringify(invocations[0])}`);
-      const added = invocations.find((argv) => argv[0] === 'add');
-      eq(Boolean(added), true, `版本没变时必须继续尝试 pnpm add：${JSON.stringify(invocations)}`);
-
-      // 诊断：失败步骤 + 命令 + 退出码 + 目标/当前版本 + 日志尾部，GET 状态里必须可读
-      const d = status?.diagnostics;
-      eq(Boolean(d), true, `失败状态必须带 diagnostics：${JSON.stringify(status)}`);
-      eq(d.step, 'pnpm-add-exact', `诊断要指出最后失败在 add 这一步：${d.step}`);
-      eq(String(d.command).includes('pnpm add'), true, `诊断要带命令：${d.command}`);
-      eq(d.exitCode, 0, `命令退出码要如实记录（0 也要显示，才能证明「命令成功≠升级成功」）：${d.exitCode}`);
-      eq(d.target, '0.2.6', `诊断要有目标版本：${d.target}`);
-      eq(d.currentVersion, '0.2.5', `诊断要有当前版本：${d.currentVersion}`);
-      eq(d.installedVersion, '0.2.5', `诊断要有落盘版本：${d.installedVersion}`);
-      eq(d.platform, 'win32', `诊断要标明模拟的平台：${d.platform}`);
-      eq(d.pnpm.command, process.execPath, `Windows 模拟下 pnpm 必须由 node 执行：${d.pnpm.command}`);
-      eq(d.pnpm.source, 'override-script', `诊断要能看出执行器来源：${d.pnpm.source}`);
-      eq(d.pnpm.shell, false, '首选路径不该经 shell：');
-      eq(Array.isArray(d.logTail), true, '诊断要带日志尾部数组：');
-      eq(Array.isArray(d.argv) && d.argv.includes('add'), true, `诊断要带真实 argv：${JSON.stringify(d.argv)}`);
-
-      // GET /worktodo/update（面板轮询/排查走这条）同样要带诊断
-      const viaGet = (await readUpdateState(host)).json().data;
-      eq(viaGet?.diagnostics?.step, 'pnpm-add-exact', `GET /update 也要能读到失败步骤：${JSON.stringify(viaGet?.diagnostics)}`);
-      eq(Array.isArray(viaGet?.diagnostics?.logTail), true, 'GET /update 要带完整日志尾部：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('自升级（Windows 模拟端到端）：假 pnpm 真的换掉落盘版本 → done（正对照，证明护栏不是永远失败）', async () => {
-  const profile = makeFakeProfile('win32-success', '^0.2.5');
-  seedInstalledVersion(profile, '0.2.5');
-  const capture = join(selfUpdateRoot, 'capture-win32-success.txt');
-  const fakePnpm = writeFakePnpmMjs(join(selfUpdateRoot, 'fake-pnpm-win32-success.mjs'), {
-    capture, installVersion: '0.2.6', installProfile: profile,
-  });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PLATFORM: 'win32',
-      WORKTODO_PROFILE_DIR: profile,
-      WORKTODO_PNPM_PATH: fakePnpm,
-      WORKTODO_UPDATE_LATEST: '0.2.6',
-    }, async () => {
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 8000);
-      eq(status?.state, 'done', `版本真的变了就必须 done（实际 ${status?.state}，error=${status?.error}）：`);
-      eq(status?.installed, '0.2.6', `done 必须报落盘的新版本：${status?.installed}`);
-      eq(status?.diagnostics ?? null, null, '成功时不该留失败诊断：');
-      const onDisk = JSON.parse(readFileSync(join(profile, 'node_modules', 'dsh-worktodo', 'package.json'), 'utf8')).version;
-      eq(onDisk, '0.2.6', '成功判定只认落盘 node_modules 里的版本：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 await test('自升级：配置默认值——autoUpdate 默认 true / autoInstall 默认 false、官方源、180s，非法值一律回落', async () => {
   // 纯函数层先钉死：autoUpdate 默认开（只查+下载）；autoInstall 默认关（安装必须用户点）。
   // 稳定性复审 A1/A2：默认 autoInstall:true 会让新用户第一次启动就被后台改 profile。
@@ -3427,47 +2953,6 @@ await test('自升级：buildUpdateSteps 的步骤顺序——CLI 优先，再 p
   }
 });
 
-await test('自动更新（默认开）：同一个新版本只自动尝试一次 —— 连续 tick 不再启动子进程', async () => {
-  const profile = makeFakeProfile('auto-once', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-auto-once.txt');
-  const bin = join(selfUpdateRoot, 'bin-auto-once');
-  // 故意让假 pnpm 什么都不做：自动升级会失败，落盘版本停在 0.2.0（仍 < 9.9.9）。
-  // 这样「连续 tick 不再起子进程」就只可能是**节流**（autoAttempted）挡住的，
-  // 而不是「已经升到最新」或「正在跑」这两个无关原因 —— 用例才有牙齿。
-  writeFakePnpm(bin, { capture });
-  const dir = mkdtempSync(join(tmpdir(), 'worktodo-autohost-'));
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
-      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-auto-once.json'),
-    }, async () => {
-      const host = makeCtx();
-      // autoUpdate 默认 true；autoInstall 现在默认 false，这条用例专门测「自动安装的节流」，
-      // 所以显式打开 autoInstall（否则后台只下载、根本不会有子进程可数）。
-      await apply(host.ctx, { storePath: join(dir, 'todos.json'), autoInstall: true });
-      const status = await waitForUpdateSettled(host, 5000);
-      eq(status?.autoUpdate, true, 'GET 状态必须显示自动更新已开启：');
-      eq(status?.autoInstall, true, '显式打开后 GET 必须报 autoInstall: true：');
-      eq(status?.state, 'failed', `假 pnpm no-op 时自动升级应当失败（实际 ${status?.state}）：`);
-      eq(status?.reason, 'version-unchanged', `失败原因是版本没变：${status?.reason}`);
-      const afterFirst = invokeCount(capture);
-      eq(afterFirst, 2, `一次自动尝试 = update + add 两条命令（实际 ${afterFirst}）：`);
-
-      // 连续两次 tick（注入 latest 时每次 /list 都 tick 一次）：节流必须挡住
-      await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
-      await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      eq(invokeCount(capture), afterFirst, `同一个 latest 连续 tick 不许再启动子进程（实际 ${invokeCount(capture)}）：`);
-      const afterTicks = (await readUpdateState(host)).json().data;
-      eq(afterTicks.state, 'failed', 'tick 不该把已收口的状态改回 running：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 await test('自动更新：显式 autoUpdate:false → 有新版本（已注入）也零子进程', async () => {
   const profile = makeFakeProfile('auto-off', '^0.2.0');
   seedInstalledVersion(profile, '0.2.0');
@@ -3607,78 +3092,6 @@ await test('A1/A2：启动检查确实延后 —— apply 返回后先 idle，�
   }
 });
 
-await test('A4：跨重启节流 —— 第二次「启动」同一 latest 时零子进程、零写盘（状态写进插件自己的文件）', async () => {
-  const profile = makeFakeProfile('auto-persist', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-auto-persist.txt');
-  const bin = join(selfUpdateRoot, 'bin-auto-persist');
-  // no-op pnpm：自动升级必然失败，落盘版本停在 0.2.0（仍 < 9.9.9）。
-  // 于是「第二次启动什么都不做」只可能是**持久化的节流**挡住的，而不是「已经升上去了」。
-  writeFakePnpm(bin, { capture });
-  const statePath = join(selfUpdateRoot, 'update-state-auto-persist.json');
-  const manifest = join(profile, 'package.json');
-  const storeDir = mkdtempSync(join(tmpdir(), 'worktodo-autopersist-'));
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
-      WORKTODO_UPDATE_STATE_PATH: statePath,
-    }, async () => {
-      // —— 第 1 次「启动」——
-      const first = makeCtx();
-      await apply(first.ctx, { storePath: join(storeDir, 'a.json'), autoInstall: true });
-      const firstStatus = await waitForUpdateSettled(first, 5000);
-      eq(firstStatus?.state, 'failed', `第一次启动必须真的尝试过（实际 ${firstStatus?.state}）：`);
-      eq(invokeCount(capture), 2, `一次自动尝试 = update + add（实际 ${invokeCount(capture)}）：`);
-      eq(existsSync(statePath), true, 'A4：节流状态必须持久化（旧实现只在内存里，重启就忘）：');
-      eq(JSON.parse(readFileSync(statePath, 'utf8')).attempted, '9.9.9', 'A4：要记下已经试过的 latest：');
-      const bytesAfterFirst = readFileSync(manifest, 'utf8');
-      const mtimeAfterFirst = statSync(manifest).mtimeMs;
-      const callsAfterFirst = invokeCount(capture);
-
-      // —— 第 2 次「启动」（新的 apply = 新的进程生命周期）——
-      const second = makeCtx();
-      await apply(second.ctx, { storePath: join(storeDir, 'b.json'), autoInstall: true });
-      await call(second.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
-      await new Promise((resolve) => setTimeout(resolve, 400));
-      eq(invokeCount(capture), callsAfterFirst, `A4：第二次启动不许再起子进程（实际 ${invokeCount(capture)}）：`);
-      eq(readFileSync(manifest, 'utf8'), bytesAfterFirst, 'A4：第二次启动不许再写 profile 清单：');
-      eq(statSync(manifest).mtimeMs, mtimeAfterFirst, 'A4：连 mtime 都不许变（= 零写盘）：');
-      const secondStatus = (await readUpdateState(second)).json().data;
-      eq(secondStatus.state, 'idle', `A4：第二次启动不该有任何升级动作（实际 ${secondStatus.state}）：`);
-    });
-  } finally {
-    rmSync(storeDir, { recursive: true, force: true });
-  }
-});
-
-await test('A4：节流状态文件损坏/缺失时安全地当作「未尝试过」（宁可多试一次，也不能永远不升级）', async () => {
-  const profile = makeFakeProfile('auto-corrupt-state', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-auto-corrupt-state.txt');
-  const bin = join(selfUpdateRoot, 'bin-auto-corrupt-state');
-  writeFakePnpm(bin, { capture });
-  const statePath = join(selfUpdateRoot, 'update-state-corrupt.json');
-  writeFileSync(statePath, '{ 这不是 JSON'); // 损坏的状态文件
-  const dir = mkdtempSync(join(tmpdir(), 'worktodo-autocorrupt-'));
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
-      WORKTODO_UPDATE_STATE_PATH: statePath,
-    }, async () => {
-      const host = makeCtx();
-      await apply(host.ctx, { storePath: join(dir, 'todos.json'), autoInstall: true }); // 默认 autoUpdate: true
-      const status = await waitForUpdateSettled(host, 5000);
-      eq(status?.state, 'failed', `损坏的状态文件不能把升级也一起弄坏（实际 ${status?.state}）：`);
-      eq(invokeCount(capture), 2, `损坏状态要当作「没试过」→ 该升级还是升级（实际 ${invokeCount(capture)} 次）：`);
-      eq(JSON.parse(readFileSync(statePath, 'utf8')).attempted, '9.9.9', '试过之后状态文件要被修好：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 await test('A4：节流状态文件默认落在 $DSH_HOME/worktodo/update-state.json（插件自己的目录，不是待办数据文件）', () => {
   eq(resolveUpdateStatePath({ env: {}, home: '/tmp/fake-home' }), '/tmp/fake-home/worktodo/update-state.json');
   eq(resolveUpdateStatePath({ env: { WORKTODO_UPDATE_STATE_PATH: ' /tmp/x.json ' }, home: '/tmp/fake-home' }), '/tmp/x.json',
@@ -3763,86 +3176,6 @@ await test('A5：反推不出本实例 profile → unsupported/profile-undetermi
   }
 });
 
-await test('小问题 1：自动升级尝试真的失败时，状态文件如实写 failed + reason（旧实现恒 done）', async () => {
-  // 复核实测：第一次尝试其实是 failed/version-unchanged，而状态文件里写的是 result:"done"。
-  // 原因：startUpdate() 在**序列刚起步时**就 resolve，.then 把「过了守卫」记成了 done。
-  const profile = makeFakeProfile('state-result-failed', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-state-result-failed.txt');
-  const bin = join(selfUpdateRoot, 'bin-state-result-failed');
-  // no-op pnpm：退出码 0 但落盘版本不变 → 序列必然 failed/version-unchanged
-  writeFakePnpm(bin, { capture });
-  const statePath = join(selfUpdateRoot, 'update-state-result-failed.json');
-  const dir = mkdtempSync(join(tmpdir(), 'worktodo-stateresult-'));
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
-      WORKTODO_UPDATE_STATE_PATH: statePath,
-    }, async () => {
-      const host = makeCtx();
-      // autoUpdate 默认 true；autoInstall 默认 false，这里显式打开以覆盖「自动尝试的结论回写」
-      await apply(host.ctx, { storePath: join(dir, 'todos.json'), autoInstall: true });
-      const status = await waitForUpdateSettled(host, 5000);
-      eq(status?.state, 'failed', `这次尝试其实是失败（实际 ${status?.state}）：`);
-      eq(status?.reason, 'version-unchanged', `失败原因是版本没变：${status?.reason}`);
-      const wrote = await waitFor(() => {
-        try {
-          return JSON.parse(readFileSync(statePath, 'utf8')).result === 'failed';
-        } catch {
-          return false;
-        }
-      }, 2000);
-      eq(wrote, true, `问题 1：状态文件必须写成 failed（旧实现恒 done）：${existsSync(statePath) ? readFileSync(statePath, 'utf8') : '（文件不存在）'}`);
-      const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
-      eq(persisted.result, 'failed', '问题 1：持久化的 result 必须反映真实结论：');
-      eq(persisted.reason, 'version-unchanged', '问题 1：failed 必须带稳定 reason：');
-      eq(persisted.attempted, '9.9.9', 'A4 的节流字段 attempted 必须保留（不能因为改 result 就丢）：');
-      eq(typeof persisted.at === 'number' && typeof persisted.finishedAt === 'number', true,
-        `问题 1：要记尝试时间（at / finishedAt）：${JSON.stringify(persisted)}`);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('小问题 1：自动升级真的成功时，状态文件写 done（且不再带 reason）', async () => {
-  const profile = makeFakeProfile('state-result-done', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-state-result-done.txt');
-  const bin = join(selfUpdateRoot, 'bin-state-result-done');
-  // 第 1 步 pnpm update 就真的换掉落盘版本 → done
-  writeFakePnpm(bin, { capture, installVersion: '9.9.9', installProfile: profile, installOn: 'any' });
-  const statePath = join(selfUpdateRoot, 'update-state-result-done.json');
-  const dir = mkdtempSync(join(tmpdir(), 'worktodo-stateresult-done-'));
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
-      WORKTODO_UPDATE_STATE_PATH: statePath,
-    }, async () => {
-      const host = makeCtx();
-      await apply(host.ctx, { storePath: join(dir, 'todos.json'), autoInstall: true });
-      const status = await waitForUpdateSettled(host, 5000);
-      eq(status?.state, 'done', `版本真变了就该 done（实际 ${status?.state}，error=${status?.error}）：`);
-      const wrote = await waitFor(() => {
-        try {
-          return JSON.parse(readFileSync(statePath, 'utf8')).result === 'done';
-        } catch {
-          return false;
-        }
-      }, 2000);
-      eq(wrote, true, `问题 1：成功也要写 done（而不是停在 started）：${existsSync(statePath) ? readFileSync(statePath, 'utf8') : '（文件不存在）'}`);
-      const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
-      eq(persisted.result, 'done', '问题 1：成功 → result=done：');
-      eq(persisted.reason, undefined, `done 不该再有 reason：${JSON.stringify(persisted)}`);
-      eq(persisted.attempted, '9.9.9', 'A4 的节流字段 attempted 必须保留：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 await test('小问题 2：profile 清单不是合法 JSON → 文案说准原因（不是「没有依赖」），零子进程零写盘', async () => {
   const profile = join(selfUpdateRoot, 'manifest-invalid');
   mkdirSync(profile, { recursive: true });
@@ -3904,77 +3237,6 @@ await test('小问题 2：profile 清单读不到 → 说的是「读不到」�
   }
 });
 
-await test('小问题 3：pnpm add 按原段位决定 --save-dev（纯函数 + 命令构造）', () => {
-  const pnpm = { args: [] };
-  const devOnly = buildUpdateSteps({ cli: null, pnpm, profileName: 'p', registry: 'https://r.example/', target: '1.2.3', saveDev: true });
-  eq(devOnly[1].args.includes('--save-dev'), true, `问题 3：原在 devDependencies 必须带 --save-dev：${devOnly[1].args.join(' ')}`);
-  eq(devOnly[1].args.join(' '), 'add dsh-worktodo@1.2.3 --save-exact --save-dev --registry https://r.example/',
-    '命令形状固定：--save-dev 紧跟 --save-exact，且在 --registry 之前：');
-  const depsOnly = buildUpdateSteps({ cli: null, pnpm, profileName: 'p', registry: 'https://r.example/', target: '1.2.3' });
-  eq(depsOnly[1].args.includes('--save-dev'), false, `问题 3：原在 dependencies 绝不许带 --save-dev：${depsOnly[1].args.join(' ')}`);
-  // 段位判定是纯函数：两处都有时优先 dependencies（不加 --save-dev）
-  eq(shouldSaveDev([{ section: 'devDependencies' }]), true, '只有 devDependencies → 加 --save-dev：');
-  eq(shouldSaveDev([{ section: 'dependencies' }]), false, '只有 dependencies → 不加：');
-  eq(shouldSaveDev([{ section: 'dependencies' }, { section: 'devDependencies' }]), false, '两处都有时优先 dependencies：');
-  eq(shouldSaveDev([]), false, '清单里没有本包 → 不加（由 not-installed 分支拦住）：');
-});
-
-await test('小问题 3（端到端）：只有 devDependencies 的 profile → pnpm add 真带 --save-dev', async () => {
-  const profile = join(selfUpdateRoot, 'section-dev-only');
-  mkdirSync(profile, { recursive: true });
-  writeFileSync(join(profile, 'package.json'), `${JSON.stringify({
-    name: 'dsh-profile-section-dev-only', private: true,
-    devDependencies: { 'dsh-worktodo': '^0.2.0' },
-  }, null, 2)}\n`);
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-section-dev-only.txt');
-  const bin = join(selfUpdateRoot, 'bin-section-dev-only');
-  writeFakePnpm(bin, { capture }); // no-op：序列最终 failed，但命令已经发出去了
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 5000);
-      eq(status?.state, 'failed', `no-op 必然失败（实际 ${status?.state}）：`);
-      const invocations = readInvocations(capture);
-      eq(invocations.length, 2, `update + add 两条（实际 ${invocations.length}）：${JSON.stringify(invocations)}`);
-      eq(invocations[1][0], 'add');
-      eq(invocations[1].includes('--save-dev'), true,
-        `问题 3：devDependencies 里的包必须带 --save-dev，否则 pnpm 会把它迁到 dependencies：${JSON.stringify(invocations[1])}`);
-      eq(invocations[0].includes('--save-dev'), false, 'update 那一步不带 --save-dev：');
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-await test('小问题 3（端到端）：只有 dependencies 的 profile → pnpm add 不带 --save-dev', async () => {
-  const profile = makeFakeProfile('section-deps-only', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const capture = join(selfUpdateRoot, 'capture-section-deps-only.txt');
-  const bin = join(selfUpdateRoot, 'bin-section-deps-only');
-  writeFakePnpm(bin, { capture });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
-    }, async () => {
-      await triggerUpdate(host);
-      await waitForUpdateEnd(host, 5000);
-      const invocations = readInvocations(capture);
-      eq(invocations.length, 2, `update + add 两条（实际 ${invocations.length}）：${JSON.stringify(invocations)}`);
-      eq(invocations[1].includes('--save-dev'), false,
-        `问题 3：dependencies 里的包绝不许带 --save-dev（会被误解成开发依赖）：${JSON.stringify(invocations[1])}`);
-    });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 await test('自升级：带 ref 的 POST /update 仍是「改待办」，不会被升级劫持', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'worktodo-update-edit-'));
   try {
@@ -4021,19 +3283,23 @@ async function makePanelConfigHost(config = {}) {
  * @param {{chunks?: number, chunkSize?: number, delayMs?: number, status?: number}} [options]
  * @returns {Promise<{base: string, body: Buffer, close: () => Promise<void>}>}
  */
-async function startTarballServer({ chunks = 1, chunkSize = 2048, delayMs = 0, status = 200 } = {}) {
-  const body = Buffer.alloc(chunkSize * chunks, 0x61);
+async function startTarballServer({ version = FAKE_NEXT_VERSION, chunks = 4, delayMs = 0, status = 200 } = {}) {
+  // 合法 tarball（解包后是完整包目录）；按请求 URL 里的版本生成，按 chunks 切片发送，
+  // 让「下载中」的进度可见。
   const stats = { hits: 0 };
-  const server = createServer(async (_request, response) => {
+  const server = createServer(async (request, response) => {
     stats.hits += 1;
     if (status !== 200) {
       response.writeHead(status, { 'content-length': '0' });
       response.end();
       return;
     }
+    const match = /dsh-worktodo-(\d+\.\d+\.\d+)\.tgz/.exec(String(request.url ?? ''));
+    const body = buildFakeTarball(match?.[1] ?? version);
+    const slice = Math.max(1, Math.ceil(body.length / Math.max(1, chunks)));
     response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(body.length) });
-    for (let index = 0; index < chunks; index += 1) {
-      response.write(body.subarray(index * chunkSize, (index + 1) * chunkSize));
+    for (let offset = 0; offset < body.length; offset += slice) {
+      response.write(body.subarray(offset, Math.min(body.length, offset + slice)));
       if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     response.end();
@@ -4041,7 +3307,6 @@ async function startTarballServer({ chunks = 1, chunkSize = 2048, delayMs = 0, s
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
     base: `http://127.0.0.1:${server.address().port}/`,
-    body,
     stats,
     get hits() { return stats.hits; },
     close: () => new Promise((resolve) => server.close(resolve)),
@@ -4055,93 +3320,6 @@ function makeInstallingPnpm(tag, profile) {
   writeFakePnpm(bin, { capture, installVersion: '9.9.9', installProfile: profile, installOn: 'any' });
   return { capture, bin };
 }
-
-await test('自升级（两步）：下载带进度 → 已下载 → 安装并重启 → 已安装（阶段/进度/版本/诚实重启提示）', async () => {
-  const profile = makeFakeProfile('flow-two-step', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const { capture, bin } = makeInstallingPnpm('flow-two-step', profile);
-  // 分 4 片、每片间隔 40ms：这样「下载中」这个瞬态在轮询里一定看得见（不是一帧就过去）
-  const tarball = await startTarballServer({ chunks: 4, chunkSize: 512, delayMs: 40 });
-  const stageDir = join(selfUpdateRoot, 'stage-two-step');
-  let host;
-  let dir;
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
-      WORKTODO_UPDATE_TARBALL_BASE: tarball.base, WORKTODO_UPDATE_STAGE_DIR: stageDir,
-    }, async () => {
-      // apply 必须在注入 latest 之后：启动那次检查才会把阶段推到 available（真实流程就是这样）
-      ({ host, dir } = await makeUpdateHost({ autoUpdate: false }));
-      // —— 起点：可下载（还没下，percent 必须是 null 而不是 0） ——
-      const before = (await readUpdateState(host)).json().data;
-      eq(before.phase, 'available', `注入 latest 后阶段应当是 available（实际 ${before.phase}）：`);
-      eq(before.version, '9.9.9', '状态里要给出目标版本：');
-      eq(before.percent, null, '还没开始下载时 percent 必须是 null（0 会被误读成「刚起步」）：');
-      eq(before.download, null, '还没下载时不该有 download 记录：');
-
-      // —— 第 1 步：下载（只下载，不动已安装的版本） ——
-      // 注意：POST 会一直等到下载结束才 resolve（路由 handler 是 await 的），
-      // 所以必须先发起、后采样，否则永远看不到「下载中」这个瞬态。
-      const downloadPromise = triggerUpdate(host, { action: 'plugin-update-download' });
-      const percents = [];
-      let last = null;
-      const deadline = Date.now() + 5000;
-      while (Date.now() < deadline) {
-        const state = (await readUpdateState(host)).json().data;
-        last = state;
-        if (state.phase === 'downloading' && Number.isFinite(state.percent)) percents.push(state.percent);
-        if (state.phase === 'downloaded' || state.phase === 'failed') break;
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
-      const started = (await downloadPromise).json();
-      eq(started.ok, true, `下载应当被接受：${JSON.stringify(started)}`);
-      eq(last?.phase, 'downloaded', `下载应当收口在 downloaded（实际 ${last?.phase}，error=${last?.error}）：`);
-      eq(last.percent, 100, '下完（且校验通过）时 percent 必须是 100：');
-      eq(last.download?.version, '9.9.9', 'download 记录里要有目标版本：');
-      eq(last.download?.bytes, tarball.body.length, `download 记录里的字节数要对（实际 ${last.download?.bytes}）：`);
-      eq(last.download?.totalBytes, tarball.body.length, 'content-length 要记成 totalBytes：');
-      eq(existsSync(last.download.artifact), true, `下载物必须真的落在暂存区：${last.download?.artifact}`);
-      eq(readFileSync(last.download.artifact).length, tarball.body.length, '暂存区里的字节数必须与源一致：');
-      eq(last.download?.artifact.startsWith(stageDir), true, `暂存区必须是我们指定的目录（绝不写进用户数据）：${last.download?.artifact}`);
-      eq(percents.length > 0, true, '必须能看到至少一次「下载中」的进度上报（不能一帧跳过）：');
-      eq(percents.some((value) => value > 0 && value < 100), true, `必须出现 0<percent<100 的中间进度：${JSON.stringify(percents)}`);
-      eq(percents.every((value, index) => index === 0 || value >= percents[index - 1]), true,
-        `进度必须单调不减：${JSON.stringify(percents)}`);
-      // 只下载不安装：一个安装子进程都不许起
-      eq(invokeCount(capture), 0, `下载这一步绝不允许动安装（实际起了 ${invokeCount(capture)} 个子进程）：`);
-
-      // —— 第 2 步：安装并重启 ——
-      const installStarted = (await triggerUpdate(host, { action: 'plugin-update-install' })).json();
-      eq(installStarted.ok, true, `安装应当被接受：${JSON.stringify(installStarted)}`);
-      const settled = await waitForUpdateSettled(host, 6000);
-      eq(settled?.phase, 'installed', `安装成功必须落在 installed（实际 ${settled?.phase}，error=${settled?.error}）：`);
-      eq(settled?.state, 'done', '老字段 state 必须同时是 done（旧面板还在读）：');
-      eq(settled?.version, '9.9.9', '装好之后要报出装的是哪一版：');
-      // 假 pnpm 在第一步就换掉了版本 → 序列可能只跑 1 条命令就收口，只要 >0 就说明真的装了
-      eq(invokeCount(capture) >= 1, true, `安装必须真的起过子进程（实际 ${invokeCount(capture)}）：`);
-      eq(readInstalledVersionText(profile).includes('9.9.9'), true, '落盘版本必须真的换成 9.9.9：');
-      // 装完要把暂存物清掉：否则下次启动会把「已装好的版本」重新认成「已下载待安装」
-      eq(existsSync(last.download.artifact), false, `安装成功后暂存物必须清掉：${last.download.artifact}`);
-
-      // —— 重启：DSH 没给插件重启入口，必须诚实（phase 停在 installed，绝不假装重启成功） ——
-      const withRestart = await waitForUpdatePhase(host, (state) => state.restart !== null, 3000);
-      eq(withRestart?.restart !== null && withRestart?.restart !== undefined, true,
-        `请求重启之后必须留下一条 restart 记录（实际 ${JSON.stringify(withRestart?.restart)}）：`);
-      eq(lastRestart?.supported, false, '默认必须报 supported:false（DSH 没向插件暴露重启）：');
-      eq(lastRestart?.ok, false, '绝不能把「没重启」报成成功：');
-      eq(lastRestart?.reason, 'no-plugin-restart-ipc', `要给稳定的原因码（实际 ${lastRestart?.reason}）：`);
-      eq(String(lastRestart?.error).includes('手动'), true, `文案必须明确请用户手动重启：${lastRestart?.error}`);
-      eq(settled?.restartSupported, false, 'GET 状态里的 restartSupported 也必须是 false：');
-      const finalState = (await readUpdateState(host)).json().data;
-      eq(finalState.phase === 'restarting', false, '重启不可用时绝不能进 restarting（那是假装能重启）：');
-    });
-  } finally {
-    await tarball.close();
-    rmSync(dir, { recursive: true, force: true });
-    rmSync(stageDir, { recursive: true, force: true });
-  }
-});
 
 await test('自升级（两步）：下载失败 → failed + failedOperation:download（不落半个文件），换好源后重试成功', async () => {
   const profile = makeFakeProfile('flow-download-fail', '^0.2.0');
@@ -4203,6 +3381,9 @@ await test('自升级（两步）护栏：没下载就点「安装并重启」�
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
       WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      // 独立状态/暂存目录：全局状态文件是共享的，别让别的用例下好的 9.9.9 被 restoreDownloaded 认回来
+      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-guard-not-downloaded.json'),
+      WORKTODO_UPDATE_STAGE_DIR: join(selfUpdateRoot, 'stage-guard-not-downloaded'),
     }, async () => {
       ({ host, dir } = await makeUpdateHost({ autoUpdate: false }));
       // 只有 available、没有下载物
@@ -4309,75 +3490,6 @@ await test('自升级（两步）：下好了但没安装就「重启」→ 新�
     if (first?.dir) rmSync(first.dir, { recursive: true, force: true });
     if (second?.dir) rmSync(second.dir, { recursive: true, force: true });
     rmSync(stageDir, { recursive: true, force: true });
-  }
-});
-
-await test('自升级：config 默认值映射——autoInstall:false=manual（只查，用户点才下/装）；true=auto（全自动）', async () => {
-  // —— autoInstall:false → manual：后台**只检查**，下载/安装都必须用户点 ——
-  const profileOff = makeFakeProfile('autoinstall-off', '^0.2.0');
-  seedInstalledVersion(profileOff, '0.2.0');
-  const offPnpm = makeInstallingPnpm('autoinstall-off', profileOff);
-  const tarballOff = await startTarballServer({ chunks: 1, chunkSize: 1024 });
-  const stageOff = join(selfUpdateRoot, 'stage-autoinstall-off');
-  let off;
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profileOff, PATH: `${offPnpm.bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
-      WORKTODO_UPDATE_TARBALL_BASE: tarballOff.base, WORKTODO_UPDATE_STAGE_DIR: stageOff,
-      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-autoinstall-off.json'),
-    }, async () => {
-      off = await makeUpdateHost({ autoInstall: false });
-      const status = await waitForUpdatePhase(off.host, (state) => state.phase === 'available', 5000);
-      eq(status?.phase, 'available', `autoInstall:false 映射成 manual，只该检查到 available（实际 ${status?.phase}，error=${status?.error}）：`);
-      eq(status.updateMode, 'manual', 'config.autoInstall:false 时默认档位是 manual：');
-      eq(status.autoInstall, false, 'GET 状态要如实报出 autoInstall:false：');
-      eq(status.state, 'idle', '只是「有新版本」不该显示在运行（老字段 idle）：');
-      eq(existsSync(stageOff), false, 'manual 绝不自动下载（暂存区不该出现）：');
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      eq(invokeCount(offPnpm.capture), 0, 'manual 下后台绝不允许自动安装：');
-      // 用户点「下载」→「安装并重启」之后才动 profile
-      eq((await triggerUpdate(off.host, { action: 'plugin-update-download' })).json().ok, true);
-      const downloaded = await waitForUpdatePhase(off.host, (state) => state.phase === 'downloaded', 5000);
-      eq(downloaded?.phase, 'downloaded', `用户点了下载之后要能下好（实际 ${downloaded?.phase}）：`);
-      eq((await triggerUpdate(off.host, { action: 'plugin-update-install' })).json().ok, true);
-      const settled = await waitForUpdateSettled(off.host, 6000);
-      eq(settled?.phase, 'installed', `用户点了之后要能装上（实际 ${settled?.phase}）：`);
-    });
-  } finally {
-    await tarballOff.close();
-    if (off?.dir) rmSync(off.dir, { recursive: true, force: true });
-    rmSync(stageOff, { recursive: true, force: true });
-  }
-
-  // —— 显式 autoInstall:true → auto：后台检查到新版后下载 + 安装全自动 ——
-  const profileOn = makeFakeProfile('autoinstall-default', '^0.2.0');
-  seedInstalledVersion(profileOn, '0.2.0');
-  const onPnpm = makeInstallingPnpm('autoinstall-default', profileOn);
-  const tarballOn = await startTarballServer({ chunks: 1, chunkSize: 1024 });
-  const stageOn = join(selfUpdateRoot, 'stage-autoinstall-default');
-  let on;
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profileOn, PATH: `${onPnpm.bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
-      WORKTODO_UPDATE_TARBALL_BASE: tarballOn.base, WORKTODO_UPDATE_STAGE_DIR: stageOn,
-      // 专用节流文件：否则前面用例留下的「已试过 9.9.9」会把这次自动更新节流掉
-      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-autoinstall-default.json'),
-    }, async () => {
-      on = await makeUpdateHost({ autoInstall: true });
-      const settled = await waitForUpdateSettled(on.host, 6000);
-      eq(settled?.phase, 'installed', `显式 autoInstall:true 后台要一路装完（实际 ${settled?.phase}，error=${settled?.error}）：`);
-      eq(settled?.updateMode, 'auto', 'config.autoInstall:true 时默认档位是 auto：');
-      eq(settled?.autoInstall, true, 'GET 状态要如实报出 autoInstall:true：');
-      eq(invokeCount(onPnpm.capture) >= 1, true, '显式开启后要真的起安装子进程：');
-      // 后台自动装完**不**会自动请求重启：重启永远是用户动作
-      eq(settled?.restart, null, '后台自动安装不许自己请求重启（重启只能由用户点）：');
-    });
-  } finally {
-    await tarballOn.close();
-    if (on?.dir) rmSync(on.dir, { recursive: true, force: true });
-    rmSync(stageOn, { recursive: true, force: true });
   }
 });
 
@@ -4597,49 +3709,379 @@ await test('更新方式 manual：有新版本只提示，绝不自动下载/安
   }
 });
 
-await test('更新方式 auto：自动下载 + 自动安装各一次；装好 restartRequired:true，且绝不自动重启', async () => {
+await test('detached：宿主 dispose（插件卸载）后，已在跑的安装器仍然把新版本装完', async () => {
+  const profile = makeFakeProfile('installer-detached-dispose', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const stageDir = join(selfUpdateRoot, 'stage-installer-detached-dispose');
+  const statePath = join(selfUpdateRoot, 'update-state-installer-detached-dispose.json');
+  const tarball = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 2 });
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base,
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+      // 开工前等 500ms：保证 dispose 发生在安装器「还没开始替换」的时候
+      WORKTODO_APPLY_DELAY_MS: '500',
+    }, async () => {
+      host = await makeUpdateHost({ autoUpdate: false });
+      dir = host.dir;
+      eq((await triggerUpdate(host.host, { action: 'plugin-update-download' })).json().ok, true);
+      await waitForUpdatePhase(host.host, (state) => state.phase === 'downloaded', 5000);
+      eq((await triggerUpdate(host.host, { action: 'plugin-update-install' })).json().ok, true);
+      // 模拟插件卸载 / 面板会话结束：宿主不再等这个安装
+      for (const effect of [...host.host.effects].reverse()) {
+        try { await effect.dispose?.(); } catch { /* 单个清理失败不打断 */ }
+      }
+      // 宿主已经卸载，但 detached 安装器应当继续，并最终写下 installed 结果
+      const resultFile = resolveApplyResultPath(statePath);
+      const finished = await waitFor(() => {
+        try {
+          const result = JSON.parse(readFileSync(resultFile, 'utf8'));
+          return result?.ok === true && result.phase === 'installed';
+        } catch {
+          return false;
+        }
+      }, 8000);
+      eq(finished, true, '宿主 dispose 后安装器必须继续跑完（detached 的硬证据）：');
+      eq(JSON.parse(readFileSync(join(profile, 'node_modules', 'dsh-worktodo', 'package.json'), 'utf8')).version,
+        FAKE_NEXT_VERSION, '安装器真的替换了目标目录：');
+    });
+  } finally {
+    await tarball.close();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('更新方式 auto：自动下载 + detached 安装各一次；装好 restartRequired:true，且绝不自动重启', async () => {
   const profile = makeFakeProfile('mode-auto', '^0.2.0');
   seedInstalledVersion(profile, '0.2.0');
   const capture = join(selfUpdateRoot, 'capture-mode-auto.txt');
   const bin = join(selfUpdateRoot, 'bin-mode-auto');
-  writeFakePnpm(bin, { capture, installVersion: '9.9.9', installProfile: profile, installOn: 'any' });
-  const tarball = await startTarballServer({ chunks: 2, chunkSize: 512 });
+  writeTripwires(bin, ['pnpm', 'npm', 'pnpm.cmd', 'npm.cmd'], capture);
+  const tarball = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 2, delayMs: 10 });
   const settingsDir = mkdtempSync(join(tmpdir(), 'worktodo-auto-'));
   const settingsFile = join(settingsDir, 'settings.json');
   writeFileSync(settingsFile, `${JSON.stringify({ updateMode: 'auto', updatedAt: new Date().toISOString() })}\n`);
   const stageDir = join(settingsDir, 'updates');
+  let host;
+  let dir;
   try {
     await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      WORKTODO_PROFILE_DIR: profile,
+      PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: join(bin, 'pnpm'),
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
       WORKTODO_UPDATE_TARBALL_BASE: tarball.base,
       WORKTODO_SETTINGS_PATH: settingsFile,
       WORKTODO_UPDATE_STATE_PATH: join(settingsDir, 'update-state.json'),
       WORKTODO_UPDATE_STAGE_DIR: stageDir,
     }, async () => {
-      const { host, dir } = await makeUpdateHost();
-      try {
-        const settled = await waitForUpdateSettled(host, 8000);
-        eq(settled?.phase, 'installed', `auto 要一路装完（实际 ${settled?.phase}，error=${settled?.error}）：`);
-        eq(settled?.state, 'done');
-        eq(settled?.updateMode, 'auto');
-        eq(settled?.effective, { autoCheck: true, autoInstall: true });
-        eq(settled?.restartRequired, true, '装好必须报 restartRequired:true：');
-        eq(settled?.restart, null, 'auto 也不许自动请求重启（没有插件重启入口）：');
-        eq(tarball.hits, 1, `自动下载必须恰好一次（实际 ${tarball.hits}）：`);
-        eq(invokeCount(capture) >= 1, true, `自动安装必须真的跑（实际 ${invokeCount(capture)}）：`);
-        eq(readInstalledVersionText(profile).includes('9.9.9'), true, '落盘版本必须真的变了：');
-        const list = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
-        eq(list.data.update.restartRequired, true, '/list 也要报 restartRequired:true：');
-        eq(list.data.update.installedVersion, '9.9.9');
-        eq(list.data.update.updateMode, 'auto');
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
+      host = await makeUpdateHost();
+      dir = host.dir;
+      const settled = await waitForUpdateSettled(host.host, 10000);
+      eq(settled?.phase, 'installed', `auto 要一路装完（实际 ${settled?.phase}，error=${settled?.error}）：`);
+      eq(settled?.state, 'done');
+      eq(settled?.updateMode, 'auto');
+      eq(settled?.effective, { autoCheck: true, autoInstall: true });
+      eq(settled?.restartRequired, true, '装好必须报 restartRequired:true：');
+      eq(settled?.restart, null, 'auto 也不许自动请求重启（没有插件重启入口）：');
+      eq(tarball.hits, 1, `自动下载必须恰好一次（实际 ${tarball.hits}）：`);
+      eq(readInstalledVersionText(profile).includes(FAKE_NEXT_VERSION), true, '落盘版本必须真的变了：');
+      eq(invokeCount(capture), 0, `auto 安装也必须零 pnpm/CLI（实际 ${invokeCount(capture)}）：`);
+      const list = (await call(host.host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
+      eq(list.data.update.restartRequired, true, '/list 也要报 restartRequired:true：');
+      eq(list.data.update.installedVersion, FAKE_NEXT_VERSION);
+      eq(list.data.update.updateMode, 'auto');
     });
   } finally {
     await tarball.close();
+    if (dir) rmSync(dir, { recursive: true, force: true });
     rmSync(settingsDir, { recursive: true, force: true });
+  }
+});
+
+await test('config 默认值映射：autoInstall:false=manual（用户点才下/装）；true=auto（全自动）', async () => {
+  // —— autoInstall:false → manual：后台只检查，下载/安装都必须用户点 ——
+  const profileOff = makeFakeProfile('autoinstall-off', '^0.2.0');
+  seedInstalledVersion(profileOff, '0.2.0');
+  const tarballOff = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 1 });
+  const stageOff = join(selfUpdateRoot, 'stage-autoinstall-off');
+  let off;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profileOff,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarballOff.base,
+      WORKTODO_UPDATE_STAGE_DIR: stageOff,
+      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-autoinstall-off.json'),
+    }, async () => {
+      off = await makeUpdateHost({ autoInstall: false });
+      const status = await waitForUpdatePhase(off.host, (state) => state.phase === 'available', 5000);
+      eq(status?.phase, 'available', `autoInstall:false 映射成 manual，只该检查到 available（实际 ${status?.phase}，error=${status?.error}）：`);
+      eq(status.updateMode, 'manual', 'config.autoInstall:false 时默认档位是 manual：');
+      eq(status.autoInstall, false, 'GET 状态要如实报出 autoInstall:false：');
+      eq(existsSync(stageOff), false, 'manual 绝不自动下载（暂存区不该出现）：');
+      // 用户点「下载」→「安装并重启」之后才动 profile
+      eq((await triggerUpdate(off.host, { action: 'plugin-update-download' })).json().ok, true);
+      const downloaded = await waitForUpdatePhase(off.host, (state) => state.phase === 'downloaded', 5000);
+      eq(downloaded?.phase, 'downloaded', `用户点了下载之后要能下好（实际 ${downloaded?.phase}）：`);
+      eq((await triggerUpdate(off.host, { action: 'plugin-update-install' })).json().ok, true);
+      const settled = await waitForUpdateSettled(off.host, 8000);
+      eq(settled?.phase, 'installed', `用户点了之后要能装上（实际 ${settled?.phase}）：`);
+    });
+  } finally {
+    await tarballOff.close();
+    if (off?.dir) rmSync(off.dir, { recursive: true, force: true });
+    rmSync(stageOff, { recursive: true, force: true });
+  }
+
+  // —— 显式 autoInstall:true → auto：后台检查到新版后下载 + 安装全自动 ——
+  const profileOn = makeFakeProfile('autoinstall-default', '^0.2.0');
+  seedInstalledVersion(profileOn, '0.2.0');
+  const tarballOn = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 1 });
+  const stageOn = join(selfUpdateRoot, 'stage-autoinstall-default');
+  let on;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profileOn,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarballOn.base,
+      WORKTODO_UPDATE_STAGE_DIR: stageOn,
+      // 专用节流文件：否则前面用例留下的「已试过」会把这次自动更新节流掉
+      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-autoinstall-default.json'),
+    }, async () => {
+      on = await makeUpdateHost({ autoInstall: true });
+      const settled = await waitForUpdateSettled(on.host, 10000);
+      eq(settled?.phase, 'installed', `显式 autoInstall:true 后台要一路装完（实际 ${settled?.phase}，error=${settled?.error}）：`);
+      eq(settled?.updateMode, 'auto', 'config.autoInstall:true 时默认档位是 auto：');
+      eq(settled?.autoInstall, true, 'GET 状态要如实报出 autoInstall:true：');
+      // 后台自动装完**不**会自动请求重启：重启永远是用户动作
+      eq(settled?.restart, null, '后台自动安装不许自己请求重启（重启只能由用户点）：');
+    });
+  } finally {
+    await tarballOn.close();
+    if (on?.dir) rmSync(on.dir, { recursive: true, force: true });
+    rmSync(stageOn, { recursive: true, force: true });
+  }
+});
+
+await test('A4：跨重启节流 —— 第一次自动安装失败后，第二次启动不再起安装器/不再写 profile', async () => {
+  const profile = makeFakeProfile('auto-persist', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const manifest = join(profile, 'package.json');
+  const tarball = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 1 });
+  const stageDir = join(selfUpdateRoot, 'stage-auto-persist');
+  const statePath = join(selfUpdateRoot, 'update-state-auto-persist.json');
+  const storeDir = mkdtempSync(join(tmpdir(), 'worktodo-autopersist-'));
+  let first;
+  let second;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base,
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+      // 让第一次自动安装必然失败（回滚后版本仍是旧的），这样第二次「什么都不做」
+      // 只可能是持久化节流挡住的，而不是「已经升上去了」。
+      WORKTODO_APPLY_FAIL_STEP: 'rename-target',
+    }, async () => {
+      // —— 第 1 次「启动」——
+      first = await makeUpdateHost({ autoInstall: true });
+      const firstStatus = await waitForUpdateSettled(first.host, 10000);
+      eq(firstStatus?.state, 'failed', `第一次启动必须真的尝试过（实际 ${firstStatus?.state}）：`);
+      eq(firstStatus?.reason, 'replace-failed', `失败原因是安装器回滚（实际 ${firstStatus?.reason}）：`);
+      eq(existsSync(statePath), true, 'A4：节流状态必须持久化（旧实现只在内存里，重启就忘）：');
+      eq(JSON.parse(readFileSync(statePath, 'utf8')).attempted, FAKE_NEXT_VERSION, 'A4：要记下已经试过的 latest：');
+      const applyLogsAfterFirst = readdirSync(stageDir).filter((name) => name.startsWith('apply-') && name.endsWith('.log'));
+      eq(applyLogsAfterFirst.length, 1, `一次自动尝试只该起一个安装器（实际 ${applyLogsAfterFirst.length}）：`);
+      const bytesAfterFirst = readFileSync(manifest, 'utf8');
+      const mtimeAfterFirst = statSync(manifest).mtimeMs;
+      rmSync(first.dir, { recursive: true, force: true });
+      first = null;
+
+      // —— 第 2 次「启动」（新的 apply = 新的进程生命周期）——
+      second = await makeUpdateHost({ autoInstall: true });
+      await call(second.host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      const applyLogsAfterSecond = readdirSync(stageDir).filter((name) => name.startsWith('apply-') && name.endsWith('.log'));
+      eq(applyLogsAfterSecond.length, applyLogsAfterFirst.length,
+        `A4：第二次启动不许再起安装器（${applyLogsAfterFirst.length} → ${applyLogsAfterSecond.length}）：`);
+      eq(readFileSync(manifest, 'utf8'), bytesAfterFirst, 'A4：第二次启动不许再写 profile 清单：');
+      eq(statSync(manifest).mtimeMs, mtimeAfterFirst, 'A4：连 mtime 都不许变（= 零写盘）：');
+      const secondStatus = (await readUpdateState(second.host)).json().data;
+      eq(secondStatus.state, 'idle', `A4：第二次启动不该有任何升级动作（实际 ${secondStatus.state}）：`);
+    });
+  } finally {
+    await tarball.close();
+    if (first?.dir) rmSync(first.dir, { recursive: true, force: true });
+    if (second?.dir) rmSync(second.dir, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+await test('小问题 1：自动升级失败/成功都如实写状态文件（failed+reason / done）', async () => {
+  // —— 失败：安装器回滚 → result=failed + reason ——
+  const failProfile = makeFakeProfile('state-result-failed', '^0.2.0');
+  seedInstalledVersion(failProfile, '0.2.0');
+  const failState = join(selfUpdateRoot, 'update-state-result-failed.json');
+  const failStage = join(selfUpdateRoot, 'stage-result-failed');
+  const tarball = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 1 });
+  let failHost;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: failProfile,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base,
+      WORKTODO_UPDATE_STAGE_DIR: failStage,
+      WORKTODO_UPDATE_STATE_PATH: failState,
+      WORKTODO_APPLY_FAIL_STEP: 'rename-target',
+    }, async () => {
+      failHost = await makeUpdateHost({ autoInstall: true });
+      const status = await waitForUpdateSettled(failHost.host, 10000);
+      eq(status?.state, 'failed', `这次尝试其实是失败（实际 ${status?.state}）：`);
+      eq(status?.reason, 'replace-failed', `失败原因是安装器回滚：${status?.reason}`);
+      const wrote = await waitFor(() => {
+        try {
+          const persisted = JSON.parse(readFileSync(failState, 'utf8'));
+          return persisted.result === 'failed' && persisted.reason === 'replace-failed';
+        } catch {
+          return false;
+        }
+      }, 3000);
+      eq(wrote, true, `状态文件必须写成 failed + reason：${existsSync(failState) ? readFileSync(failState, 'utf8') : '（文件不存在）'}`);
+      const persisted = JSON.parse(readFileSync(failState, 'utf8'));
+      eq(persisted.attempted, FAKE_NEXT_VERSION, 'A4 的节流字段 attempted 必须保留：');
+      eq(typeof persisted.at === 'number' && typeof persisted.finishedAt === 'number', true,
+        `要记尝试时间（at / finishedAt）：${JSON.stringify(persisted)}`);
+    });
+  } finally {
+    await tarball.close();
+    if (failHost?.dir) rmSync(failHost.dir, { recursive: true, force: true });
+    rmSync(failStage, { recursive: true, force: true });
+  }
+
+  // —— 成功：安装器替换成功 → result=done（且不带 reason）——
+  const okProfile = makeFakeProfile('state-result-done', '^0.2.0');
+  seedInstalledVersion(okProfile, '0.2.0');
+  const okState = join(selfUpdateRoot, 'update-state-result-done.json');
+  const okStage = join(selfUpdateRoot, 'stage-result-done');
+  const tarball2 = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 1 });
+  let okHost;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: okProfile,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarball2.base,
+      WORKTODO_UPDATE_STAGE_DIR: okStage,
+      WORKTODO_UPDATE_STATE_PATH: okState,
+      WORKTODO_APPLY_FAIL_STEP: undefined,
+    }, async () => {
+      okHost = await makeUpdateHost({ autoInstall: true });
+      const status = await waitForUpdateSettled(okHost.host, 10000);
+      eq(status?.state, 'done', `安装器成功就该 done（实际 ${status?.state}，error=${status?.error}）：`);
+      const wrote = await waitFor(() => {
+        try {
+          return JSON.parse(readFileSync(okState, 'utf8')).result === 'done';
+        } catch {
+          return false;
+        }
+      }, 3000);
+      eq(wrote, true, `成功也要写 done（而不是停在 started）：${existsSync(okState) ? readFileSync(okState, 'utf8') : '（文件不存在）'}`);
+      const persisted = JSON.parse(readFileSync(okState, 'utf8'));
+      eq(persisted.result, 'done', '成功 → result=done：');
+      eq(persisted.reason, undefined, `done 不该再有 reason：${JSON.stringify(persisted)}`);
+      eq(persisted.attempted, FAKE_NEXT_VERSION, 'A4 的节流字段 attempted 必须保留：');
+    });
+  } finally {
+    await tarball2.close();
+    if (okHost?.dir) rmSync(okHost.dir, { recursive: true, force: true });
+    rmSync(okStage, { recursive: true, force: true });
+  }
+});
+
+await test('重启：没配 restartCommand 就诚实说「请手动重启」；配了才真的跑那条命令', async () => {
+  // —— 不可用：绝不假装能重启 ——
+  const profile = makeFakeProfile('restart-unavailable', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const tarball = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 1 });
+  const stageDir = join(selfUpdateRoot, 'stage-restart-unavailable');
+  let host;
+  let dir;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base,
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-restart-unavailable.json'),
+      WORKTODO_RESTART_COMMAND: undefined,
+    }, async () => {
+      host = await makeUpdateHost({ autoUpdate: false });
+      dir = host.dir;
+      eq((await triggerUpdate(host.host, { action: 'plugin-update-download' })).json().ok, true);
+      eq((await triggerUpdate(host.host, { action: 'plugin-update-install' })).json().ok, true);
+      const settled = await waitForUpdateSettled(host.host, 8000);
+      eq(settled?.phase, 'installed', `装完必须停在 installed（实际 ${settled?.phase}）：`);
+      const afterInstall = await waitForUpdatePhase(host.host, (state) => state.restart !== null, 4000);
+      eq(afterInstall?.restart?.supported, false, '没配命令时必须 supported:false：');
+      eq(afterInstall?.restart?.reason, 'no-plugin-restart-ipc', `原因码要稳定（实际 ${afterInstall?.restart?.reason}）：`);
+      eq(String(afterInstall?.restart?.error).includes('手动'), true, `必须明确请用户手动重启：${afterInstall?.restart?.error}`);
+      // 单独点「重启」也必须是同一个诚实结论（不是抛错、不是假装成功）
+      const again = (await triggerUpdate(host.host, { action: 'plugin-update-restart' })).json();
+      eq(again.ok, false, '重启不可用时单独点重启也必须如实失败：');
+      eq(again.reason, 'restart-unavailable', `原因要是 restart-unavailable（实际 ${again.reason}）：`);
+      eq((await readUpdateState(host.host)).json().data.phase, 'installed', '失败的重启请求不能把「已安装」改成别的阶段：');
+    });
+  } finally {
+    await tarball.close();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    rmSync(stageDir, { recursive: true, force: true });
+  }
+
+  // —— 可用：用户显式配置重启命令后，「安装并重启」真的会执行那条命令 ——
+  const profile2 = makeFakeProfile('restart-available', '^0.2.0');
+  seedInstalledVersion(profile2, '0.2.0');
+  const tarball2 = await startTarballServer({ version: FAKE_NEXT_VERSION, chunks: 1 });
+  const stageDir2 = join(selfUpdateRoot, 'stage-restart-available');
+  const marker = join(selfUpdateRoot, 'restart-marker.txt');
+  const script = join(selfUpdateRoot, 'restart-cmd.mjs');
+  writeFileSync(script, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'restarted');\n`);
+  let host2;
+  let dir2;
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile2,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_TARBALL_BASE: tarball2.base,
+      WORKTODO_UPDATE_STAGE_DIR: stageDir2,
+      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-restart-available.json'),
+      WORKTODO_RESTART_COMMAND: undefined,
+    }, async () => {
+      host2 = await makeUpdateHost({ autoUpdate: false, restartCommand: `${process.execPath} ${script}` });
+      dir2 = host2.dir;
+      eq((await triggerUpdate(host2.host, { action: 'plugin-update-download' })).json().ok, true);
+      const before = (await readUpdateState(host2.host)).json().data;
+      eq(before.restartSupported, true, '配了 restartCommand 后 restartSupported 必须变成 true：');
+      eq((await triggerUpdate(host2.host, { action: 'plugin-update-install' })).json().ok, true);
+      // 重启命令真的跑了（marker 落盘）
+      const ran = await waitFor(() => existsSync(marker), 8000);
+      eq(ran, true, '配置了重启命令时，「安装并重启」必须真的执行它：');
+      eq(readFileSync(marker, 'utf8'), 'restarted', '跑的是我们配置的那条命令：');
+      const afterRestart = await waitForUpdatePhase(host2.host, (state) => state.restart !== null, 4000);
+      eq(afterRestart?.restart?.supported, true, '可用时记录里要写 supported:true：');
+      eq(afterRestart?.restart?.kind, 'command', '要记录实现方式（command）：');
+    });
+  } finally {
+    await tarball2.close();
+    if (dir2) rmSync(dir2, { recursive: true, force: true });
+    rmSync(stageDir2, { recursive: true, force: true });
   }
 });
 
@@ -4685,79 +4127,6 @@ await test('更新方式 auto + unsupported（link:）：不下载、不安装�
     });
   } finally {
     rmSync(settingsDir, { recursive: true, force: true });
-  }
-});
-
-await test('重启：没配 restartCommand 就诚实说「请手动重启」；配了才真的跑那条命令', async () => {
-  // —— 不可用：绝不假装能重启 ——
-  const profile = makeFakeProfile('restart-unavailable', '^0.2.0');
-  seedInstalledVersion(profile, '0.2.0');
-  const { capture, bin } = makeInstallingPnpm('restart-unavailable', profile);
-  const tarball = await startTarballServer({ chunks: 1, chunkSize: 1024 });
-  const stageDir = join(selfUpdateRoot, 'stage-restart-unavailable');
-  let host;
-  let dir;
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
-      WORKTODO_UPDATE_TARBALL_BASE: tarball.base, WORKTODO_UPDATE_STAGE_DIR: stageDir,
-    }, async () => {
-      ({ host, dir } = await makeUpdateHost({ autoUpdate: false }));
-      eq((await triggerUpdate(host, { action: 'plugin-update-download' })).json().ok, true);
-      eq((await triggerUpdate(host, { action: 'plugin-update-install' })).json().ok, true);
-      const settled = await waitForUpdateSettled(host, 6000);
-      eq(settled?.phase, 'installed', `装完必须停在 installed（实际 ${settled?.phase}）：`);
-      const afterInstall = await waitForUpdatePhase(host, (state) => state.restart !== null, 3000);
-      eq(afterInstall?.restart?.supported, false, '没配命令时必须 supported:false：');
-      eq(afterInstall?.restart?.reason, 'no-plugin-restart-ipc', `原因码要稳定（实际 ${afterInstall?.restart?.reason}）：`);
-      eq(String(afterInstall?.restart?.error).includes('手动'), true, `必须明确请用户手动重启：${afterInstall?.restart?.error}`);
-      // 单独点「重启」也必须是同一个诚实结论（不是抛错、不是假装成功）
-      const again = (await triggerUpdate(host, { action: 'plugin-update-restart' })).json();
-      eq(again.ok, false, '重启不可用时单独点重启也必须如实失败：');
-      eq(again.reason, 'restart-unavailable', `原因要是 restart-unavailable（实际 ${again.reason}）：`);
-      eq((await readUpdateState(host)).json().data.phase, 'installed', '失败的重启请求不能把「已安装」改成别的阶段：');
-    });
-  } finally {
-    await tarball.close();
-    rmSync(dir, { recursive: true, force: true });
-    rmSync(stageDir, { recursive: true, force: true });
-  }
-
-  // —— 可用：用户显式配置重启命令后，「安装并重启」真的会执行那条命令 ——
-  const profile2 = makeFakeProfile('restart-available', '^0.2.0');
-  seedInstalledVersion(profile2, '0.2.0');
-  const avail = makeInstallingPnpm('restart-available', profile2);
-  const tarball2 = await startTarballServer({ chunks: 1, chunkSize: 1024 });
-  const stageDir2 = join(selfUpdateRoot, 'stage-restart-available');
-  const marker = join(selfUpdateRoot, 'restart-marker.txt');
-  const script = join(selfUpdateRoot, 'restart-cmd.mjs');
-  writeFileSync(script, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'restarted');\n`);
-  let host2;
-  let dir2;
-  try {
-    await withEnv({
-      WORKTODO_PROFILE_DIR: profile2, PATH: `${avail.bin}:${process.env.PATH}`,
-      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
-      WORKTODO_UPDATE_TARBALL_BASE: tarball2.base, WORKTODO_UPDATE_STAGE_DIR: stageDir2, WORKTODO_RESTART_COMMAND: undefined,
-    }, async () => {
-      ({ host: host2, dir: dir2 } = await makeUpdateHost({ autoUpdate: false, restartCommand: `${process.execPath} ${script}` }));
-      eq((await triggerUpdate(host2, { action: 'plugin-update-download' })).json().ok, true);
-      const before = (await readUpdateState(host2)).json().data;
-      eq(before.restartSupported, true, '配了 restartCommand 后 restartSupported 必须变成 true：');
-      eq((await triggerUpdate(host2, { action: 'plugin-update-install' })).json().ok, true);
-      // 重启命令真的跑了（marker 落盘）
-      const ran = await waitFor(() => existsSync(marker), 6000);
-      eq(ran, true, '配置了重启命令时，「安装并重启」必须真的执行它：');
-      eq(readFileSync(marker, 'utf8'), 'restarted', '跑的是我们配置的那条命令：');
-      const afterRestart = await waitForUpdatePhase(host2, (state) => state.restart !== null, 3000);
-      eq(afterRestart?.restart?.supported, true, '可用时记录里要写 supported:true：');
-      eq(afterRestart?.restart?.kind, 'command', '要记录实现方式（command）：');
-    });
-  } finally {
-    await tarball2.close();
-    if (dir2) rmSync(dir2, { recursive: true, force: true });
-    rmSync(stageDir2, { recursive: true, force: true });
   }
 });
 
