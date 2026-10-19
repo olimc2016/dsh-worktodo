@@ -180,6 +180,9 @@ const zh = {
   'updateDownload': '下载',
   'updateDownloadHint': '下载新版本到本地（这一步不改动已安装的版本）',
   'updateChecking': '正在检查更新…',
+  // 检查失败是温和态，不是插件故障：不出现「失败」字样，也不展示原始网络错误。
+  'updateCheckFailed': '暂时无法检查更新，稍后自动重试',
+  'updateCheckFailedHint': '更新服务暂时连不上；待办列表与编辑不受影响，后台会自动重试。',
   'updateDownloading': '下载中 {percent}%',
   'updateDownloadingBytes': '下载中 · 已收到 {bytes}',
   'updateVerifying': '正在校验更新文件…',
@@ -307,6 +310,9 @@ const en = {
   'updateDownload': 'Download',
   'updateDownloadHint': 'Download the new version; the installed version is untouched',
   'updateChecking': 'Checking for updates…',
+  // 温和态：不出现 raw error / “timeout” / “aborted”，也不说插件坏了。
+  'updateCheckFailed': "Couldn't check for updates right now, will retry automatically",
+  'updateCheckFailedHint': 'The update service is temporarily unreachable. Your list is unaffected; it will retry automatically in the background.',
   'updateDownloading': 'Downloading {percent}%',
   'updateDownloadingBytes': 'Downloading · {bytes} received',
   'updateVerifying': 'Verifying update files…',
@@ -409,6 +415,8 @@ const UPDATE_TONE_STYLE = {
   ok: { color: C.ok, borderColor: tint(C.ok, 50), background: tint(C.ok, 12) },
   busy: { color: C.label2, borderColor: tint(C.label2, 40), background: tint(C.label2, 10) },
   warn: { color: C.warn, borderColor: tint(C.warn, 50), background: tint(C.warn, 12) },
+  // 检查更新失败专用：比 warn 更淡，明确「不是故障」，也不占用错误色。
+  muted: { color: C.label3, borderColor: tint(C.label3, 35), background: tint(C.label3, 8) },
   error: { color: C.error, borderColor: tint(C.error, 50), background: tint(C.error, 12) },
 };
 
@@ -2062,6 +2070,8 @@ export function storeLocationLabel(store, t) {
  *
  * 阶段与文案**照 DSH 桌面版更新器**（`DesktopUpdateIndicator.updateCopy`）的语义来：
  *   checking      → 正在检查更新…
+ *   check-failed  → 「暂时无法检查更新，稍后自动重试」**温和态**（不是故障：不亮红、不暴露
+ *                   原始错误串；下一次轮询会按宿主退避自动重试）
  *   available     → 「有新版本 vX · 下载」（可点：**下载**是第一步）
  *   downloading   → 「下载中 42%」（进度来自宿主，绝不在前端编造百分比）
  *   verifying     → 正在校验更新文件…
@@ -2080,7 +2090,7 @@ export function storeLocationLabel(store, t) {
  * @param {object|null} run 宿主 /worktodo/update 的状态（或 /list 载荷里的摘要）
  * @param {object|null} update /list 载荷里的 update 字段
  * @param {(key: string) => string} t 文案函数
- * @returns {{text: string, title: string, tone: 'ok'|'busy'|'warn'|'error', action: 'download'|'install'|'restart'|'retry'|'update'|null, disabled: boolean, phase: string|null}|null}
+ * @returns {{text: string, title: string, tone: 'ok'|'busy'|'warn'|'muted'|'error', action: 'download'|'install'|'restart'|'retry'|'update'|null, disabled: boolean, phase: string|null}|null}
  */
 export function updateBadgeState(run, update, t) {
   const state = run?.state ?? 'idle';
@@ -2095,6 +2105,11 @@ export function updateBadgeState(run, update, t) {
   /* ---- 1. 新的细粒度阶段（DSH 语义） ---- */
   if (phase === 'checking') {
     return view(t('updateChecking'), t('updateChecking'), 'busy', null, true);
+  }
+  if (phase === 'check-failed') {
+    // 检查更新失败 ≠ 插件坏了：用最淡的「muted」状态，不亮红、不给重试按钮
+    //（下一次自动轮询会自己重试，用户不需要做什么），也不展示 raw error。
+    return view(t('updateCheckFailed'), t('updateCheckFailedHint'), 'muted', null, true);
   }
   if (phase === 'downloading') {
     // 有 content-length 才报百分比；没有就只报「已收到多少字节」，不编造进度

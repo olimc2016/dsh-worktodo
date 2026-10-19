@@ -21,7 +21,7 @@ import { dirname, join, win32 } from 'node:path';
 // DSH 判定「工具返回值是否 lossless JSON」用的就是这一个函数（见 assertLossless 的说明）
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged, resolveUpdateLockPath, resolveStartupCheckDelayMs, acquireUpdateLock, releaseUpdateLock, classifyCliFailure, killProcessTree } from '../lib/index.js';
+import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged, resolveUpdateLockPath, resolveStartupCheckDelayMs, acquireUpdateLock, releaseUpdateLock, classifyCliFailure, killProcessTree, UPDATE_CHECK_TIMEOUT_MS, UPDATE_CHECK_RETRY_DELAY_MS, UPDATE_CHECK_TOTAL_BUDGET_MS, UPDATE_CHECK_BACKOFF_BASE_MS, UPDATE_CHECK_BACKOFF_MAX_MS, resolveCheckTimeoutMs, resolveCheckRetryDelayMs, resolveCheckBackoffMs } from '../lib/index.js';
 
 /**
  * 「模拟版本」的**唯一**来源：全部从 package.json 派生；本文件里不许再出现当前版本号的字面量。
@@ -3079,6 +3079,162 @@ await test('自升级：配置默认值——autoUpdate 默认 true / autoInstal
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('自升级：检查更新 20s / 重试 1 次 / 25s 预算 / 指数退避 30→60→120…上限 10 分钟', () => {
+  // 这一条是「超时太短」的反向闸门：把常量改回 8s（或删掉重试预算）这里必须变红。
+  eq(UPDATE_CHECK_TIMEOUT_MS, 20000, '单次检查超时必须是 20s（国内 npm registry 常见 10s+）：');
+  eq(UPDATE_CHECK_RETRY_DELAY_MS, 3000, '失败后等 3s 再试一次：');
+  eq(UPDATE_CHECK_TOTAL_BUDGET_MS, 25000, '整次检查预算约 25s（重试只用剩余预算）：');
+  eq(resolveCheckTimeoutMs({}), 20000, '没有 env 覆盖时用 20s：');
+  eq(resolveCheckTimeoutMs({ WORKTODO_CHECK_TIMEOUT_MS: '45000' }), 45000, 'WORKTODO_CHECK_TIMEOUT_MS 必须能覆盖（测试缝）：');
+  eq(resolveCheckTimeoutMs({ WORKTODO_CHECK_TIMEOUT_MS: 'nope' }), 20000, '非法 env 回落 20s：');
+  eq(resolveCheckRetryDelayMs({}), 3000);
+  eq(resolveCheckRetryDelayMs({ WORKTODO_CHECK_RETRY_DELAY_MS: '0' }), 0, '测试缝允许把重试间隔设成 0：');
+  eq(resolveCheckRetryDelayMs({ WORKTODO_CHECK_RETRY_DELAY_MS: 'nope' }), 3000);
+  eq(resolveCheckBackoffMs(1), 30000, '第一次失败后 30s：');
+  eq(resolveCheckBackoffMs(2), 60000, '第二次失败后 60s：');
+  eq(resolveCheckBackoffMs(3), 120000, '第三次失败后 120s：');
+  eq(resolveCheckBackoffMs(4), 240000);
+  eq(resolveCheckBackoffMs(5), 480000);
+  eq(resolveCheckBackoffMs(6), 600000, '上限 10 分钟：');
+  eq(resolveCheckBackoffMs(99), 600000, '再多次失败也不超过 10 分钟：');
+  eq(UPDATE_CHECK_BACKOFF_BASE_MS, 30000);
+  eq(UPDATE_CHECK_BACKOFF_MAX_MS, 600000);
+});
+
+await test('自升级：registry 慢响应超时 → check-failed 温和态（不是 failed），/list 首屏 <100ms、hasUpdate=false', async () => {
+  const requests = [];
+  const pendingTimers = new Set();
+  const slowRegistry = createServer((request, response) => {
+    requests.push(Date.now());
+    // 25s 后才回：模拟「国内访问 npm registry 10s+」的真实慢响应。
+    const timer = setTimeout(() => {
+      pendingTimers.delete(timer);
+      try {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ 'dist-tags': { latest: FAKE_NEXT_VERSION }, versions: {} }));
+      } catch { /* 测试已结束/连接已断 */ }
+    }, 25000);
+    timer.unref?.();
+    pendingTimers.add(timer);
+  });
+  await new Promise((resolve) => slowRegistry.listen(0, '127.0.0.1', resolve));
+  slowRegistry.unref();
+  try {
+    await withEnv({
+      WORKTODO_NO_UPDATE_CHECK: undefined,
+      WORKTODO_UPDATE_LATEST: undefined,
+      // 测试缝：把 20s/3s 压到 300ms/50ms，但走的仍是同一条「超时 → 新 AbortController 重试」路径。
+      WORKTODO_CHECK_TIMEOUT_MS: '300',
+      WORKTODO_CHECK_RETRY_DELAY_MS: '50',
+    }, async () => {
+      const { host, dir } = await makeUpdateHost({
+        autoUpdate: false,
+        updateRegistry: `http://127.0.0.1:${slowRegistry.address().port}/`,
+      });
+      try {
+        // 前置：检查必须真的在飞，否则下面的 /list 计时没有牙齿。
+        const during = (await readUpdateState(host)).json().data;
+        eq(during.phase, 'checking', `前置条件：启动检查应当正在飞（实际 ${during.phase}）：`);
+
+        const startedAt = Date.now();
+        const list = await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
+        const elapsed = Date.now() - startedAt;
+        eq(list.statusCode, 200);
+        eq(list.json().ok, true);
+        eq(elapsed < 100, true, `/list 首屏不能被检查超时拖慢（实际 ${elapsed}ms，要求 <100ms）：`);
+        console.log(`      [check] 慢 registry 检查在飞时 /list 首屏 ${elapsed}ms（要求 <100ms）`);
+        eq(list.json().data.update.hasUpdate, false, '还没查到时不能声称有更新：');
+
+        const status = await waitForUpdatePhase(host, (state) => state.phase === 'check-failed', 5000);
+        eq(status?.phase, 'check-failed', `超时后必须落在温和的 check-failed（实际 ${status?.phase}）：`);
+        eq(status?.state, 'idle', '兼容 state 必须是 idle，老面板不会亮红色 failed：');
+        eq(status?.checkError?.reason, 'timeout', `失败原因要稳定归类成 timeout（实际 ${status?.checkError?.reason}）：`);
+        eq(status?.checkError?.retriable, true, '要告诉面板这是可重试的：');
+        eq(status?.checkError?.attempt, 2, '超时后必须自动重试一次（attempt=2）：');
+        eq(status?.checkError?.retryInMs, 30000, '第一次失败后按 30s 退避：');
+        eq(status?.failedOperation, null, '检查失败不是下载/安装失败：');
+        eq(status?.failure, null, '检查失败不能塞进 failure（那是下载/安装的稳定失败种类）：');
+        eq(status?.error, null, '原始错误不能出现在面板读的 error 字段：');
+        eq(requests.length, 2, `失败后必须用新请求重试一次（假 registry 实际收到 ${requests.length} 次）：`);
+
+        // 列表摘要同样温和：phase/checkError 有，raw error 不在；hasUpdate 仍 false。
+        const listed = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json().data;
+        eq(listed.update.hasUpdate, false, '检查失败后 hasUpdate 必须是 false（没查到 = 不知道/无更新）：');
+        eq(listed.update.run.phase, 'check-failed');
+        eq(listed.update.run.checkError?.reason, 'timeout');
+        eq(listed.update.run.error, null, '列表摘要不能带原始网络错误：');
+
+        // 手动点检查失败：仍然温和（不是 failed 红态），且连续失败按 60s 退避。
+        const manual = (await triggerUpdate(host, { action: 'plugin-update-check' })).json();
+        eq(manual.ok, true, 'check 路由本身要走 200 data（不是请求失败）：');
+        eq(manual.data.phase, 'check-failed', '手动检查失败也必须是温和态：');
+        eq(manual.data.failedOperation, null);
+        eq(manual.data.checkError?.retryInMs, 60000, `连续第二次失败要退避到 60s（实际 ${manual.data.checkError?.retryInMs}）：`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    for (const timer of pendingTimers) clearTimeout(timer);
+    slowRegistry.closeAllConnections?.();
+    slowRegistry.close();
+  }
+});
+
+await test('自升级：第一次超时、第二次立即成功 → 退避后重试拿到版本，checkError 复位', async () => {
+  let hits = 0;
+  const pendingTimers = new Set();
+  const registry = createServer((request, response) => {
+    hits += 1;
+    if (hits === 1) {
+      // 第一次故意超过 200ms 超时；被 abort 后第二次请求立即成功。
+      const timer = setTimeout(() => {
+        pendingTimers.delete(timer);
+        try {
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ 'dist-tags': { latest: FAKE_NEXT_VERSION }, versions: {} }));
+        } catch { /* 已断开 */ }
+      }, 5000);
+      timer.unref?.();
+      pendingTimers.add(timer);
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ 'dist-tags': { latest: FAKE_NEXT_VERSION }, versions: {} }));
+  });
+  await new Promise((resolve) => registry.listen(0, '127.0.0.1', resolve));
+  registry.unref();
+  try {
+    await withEnv({
+      WORKTODO_NO_UPDATE_CHECK: undefined,
+      WORKTODO_UPDATE_LATEST: undefined,
+      WORKTODO_CHECK_TIMEOUT_MS: '200',
+      WORKTODO_CHECK_RETRY_DELAY_MS: '50',
+    }, async () => {
+      const { host, dir } = await makeUpdateHost({
+        autoUpdate: false,
+        updateRegistry: `http://127.0.0.1:${registry.address().port}/`,
+      });
+      try {
+        const available = await waitForUpdatePhase(host, (state) => state.phase === 'available', 5000);
+        eq(available?.phase, 'available', `第二次成功后必须落到 available（实际 ${available?.phase}，reason=${available?.checkError?.reason}）：`);
+        eq(available?.checkError, null, '成功后 checkError 必须复位：');
+        eq(available?.to, FAKE_NEXT_VERSION, '必须拿到第二次请求返回的新版本：');
+        eq(hits, 2, `必须真的重试了一次（实际请求 ${hits} 次）：`);
+        const listed = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json().data;
+        eq(listed.update.hasUpdate, true, '重试成功后列表要看到新版本：');
+        eq(listed.update.run.checkError, null, '成功后 /list 摘要里的 checkError 也要清掉：');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    for (const timer of pendingTimers) clearTimeout(timer);
+    registry.closeAllConnections?.();
+    registry.close();
   }
 });
 

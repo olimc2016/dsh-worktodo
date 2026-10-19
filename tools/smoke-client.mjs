@@ -1198,6 +1198,45 @@ test('updateBadgeState：有新版=可下载；装好待重启=只报重启、�
   eq(mod.updateBadgeState(null, null, t), null);
 });
 
+test('updateBadgeState：检查更新失败是温和态（muted），不亮红、不暴露 aborted/timeout 原始错误', () => {
+  const dictionaries = localeRegistrations[0]?.dictionaries ?? {};
+  const zhDict = (key) => dictionaries.zh?.[key] ?? key;
+  const enDict = (key) => dictionaries.en?.[key] ?? key;
+  for (const [lang, t] of [['zh', zhDict], ['en', enDict]]) {
+    const run = {
+      state: 'idle',
+      phase: 'check-failed',
+      checkError: { reason: 'timeout', at: 1, retriable: true, attempt: 2, nextRetryAt: 2, retryInMs: 30000 },
+      // 原始错误即便出现在宿主的 diagnostics 里，也绝不能被徽标文案带出来。
+      diagnostics: { checkError: 'the operation was aborted due to timeout' },
+    };
+    const badge = mod.updateBadgeState(run, { hasUpdate: false }, t);
+    eq(Boolean(badge), true, `${lang}: 温和态也要渲染（否则用户不知道后台在重试）：`);
+    eq(badge.phase, 'check-failed');
+    eq(badge.tone, 'muted', `${lang}: 不能用 error 红色（检查失败 ≠ 插件坏了）：`);
+    eq(badge.action, null, `${lang}: 不需要用户手动重试（后台会自动重试）：`);
+    eq(badge.disabled, true);
+    eq(badge.text, dictionaries[lang].updateCheckFailed, `${lang}: 必须用温和文案：`);
+    eq(/aborted|timeout|ECONN|ENOTFOUND|operation was aborted/i.test(`${badge.text} ${badge.title}`), false,
+      `${lang}: 徽标/提示里不能出现原始网络错误串：${badge.text} / ${badge.title}`);
+    eq(/失败/.test(badge.text), false, '中文文案不能出现「失败」：');
+    eq(/\bfailed\b/i.test(badge.text), false, '英文文案不能说 failed：');
+    eq(badge.detail, undefined, `${lang}: 技术细节只能留在 diagnostics，徽标不该带 detail：`);
+  }
+  // 已是最新（正常 idle）时仍然一个徽标都不出现 —— 不能因为「曾经失败过」而残留。
+  eq(mod.updateBadgeState({ state: 'idle', phase: 'idle' }, { hasUpdate: false, latest: '0.2.8' }, zhDict), null);
+  // 双语键都存在，且值里没有原始错误串。
+  for (const key of ['updateCheckFailed', 'updateCheckFailedHint']) {
+    for (const lang of ['zh', 'en']) {
+      eq(typeof dictionaries[lang]?.[key], 'string', `${lang}.${key} 必须存在：`);
+      eq(dictionaries[lang][key].length > 0, true, `${lang}.${key} 不能为空：`);
+      eq(/aborted|timeout|ECONN|ENOTFOUND/i.test(dictionaries[lang][key]), false,
+        `${lang}.${key} 不能暴露原始错误串：${dictionaries[lang][key]}`);
+    }
+  }
+  eq(mod.isUpdateBusy({ phase: 'check-failed' }), false, '检查失败不是「进行中」，不该常驻 2s 轮询：');
+});
+
 test('updateBadgeState：失败详情包含步骤/命令/退出码/版本/日志尾部（中英双语键，不 innerHTML）', () => {
   const zh = (key) => ({
     updateFailureDetail: '详情',
