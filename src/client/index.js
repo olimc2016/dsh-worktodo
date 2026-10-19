@@ -201,6 +201,9 @@ const zh = {
   'updateFailed': '更新失败',
   'updateDownloadFailed': '下载失败',
   'updateLinked': '这是本地链接安装（link:），请在仓库里用 git/pnpm 工作流更新',
+  // 预期内的不适用（不是失败）：淡色提示、不亮红、不出现「失败」、不给重试。
+  'updateUnsupportedLink': '当前是本地链接安装（开发模式），面板不能自更新；请用 git/pnpm 工作流更新',
+  'updateUnsupportedProfile': '无法确定当前 profile 位置，为安全起见未执行升级（未改动任何文件）',
   'updateRetry': '重试',
   'updateRetryHint': '点击重试',
   'updateFailureDetail': '详情',
@@ -331,6 +334,9 @@ const en = {
   'updateFailed': 'Update failed',
   'updateDownloadFailed': 'Download failed',
   'updateLinked': 'This is a local link: install — update it with the git/pnpm workflow',
+  // Expected non-applicability (not a failure): muted, no red, no "failed", no retry.
+  'updateUnsupportedLink': "Local link install (dev mode) — panel self-update doesn't apply; update via your git/pnpm workflow",
+  'updateUnsupportedProfile': "Couldn't determine the profile location; upgrade skipped for safety (no files changed)",
   'updateRetry': 'Retry',
   'updateRetryHint': 'Click to retry',
   'updateFailureDetail': 'Details',
@@ -2080,6 +2086,7 @@ export function storeLocationLabel(store, t) {
  *   installed     → 「已安装 vX，请手动重启 DSH」（**不可点**：DSH 没给插件重启入口，不假装能重启）
  *                  …除非宿主报 restartSupported（用户配了 restartCommand），那时给「重启 DSH」按钮
  *   restarting    → 重启中…
+ *   unsupported   → 预期内的不适用（本地链接安装 / 推不出 profile）：淡色提示、不亮红、不给重试
  *   failed        → 失败原因 + 重试（`linked` 换成「本地链接安装」的专门说明，那不是一个故障）
  *   旧载荷兼容    → 只有 state 没有 phase 时按老规则渲染（running→正在更新，done→已更新待重启）
  *
@@ -2110,6 +2117,13 @@ export function updateBadgeState(run, update, t) {
     // 检查更新失败 ≠ 插件坏了：用最淡的「muted」状态，不亮红、不给重试按钮
     //（下一次自动轮询会自己重试，用户不需要做什么），也不展示 raw error。
     return view(t('updateCheckFailed'), t('updateCheckFailedHint'), 'muted', null, true);
+  }
+  if (phase === 'unsupported') {
+    // 预期内的不适用（本地链接安装 / 推不出 profile）：不是失败。
+    // 淡色小字、不亮红、不出现「失败」、不给重试；技术细节只留在宿主 diagnostics，绝不上屏。
+    const unsupportedKind = run?.updateUnsupported ?? run?.reason ?? null;
+    const key = unsupportedKind === 'link-install' ? 'updateUnsupportedLink' : 'updateUnsupportedProfile';
+    return view(t(key), t(key), 'muted', null, true);
   }
   if (phase === 'downloading') {
     // 有 content-length 才报百分比；没有就只报「已收到多少字节」，不编造进度

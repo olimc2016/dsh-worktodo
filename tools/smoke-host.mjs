@@ -15,13 +15,13 @@ process.env.WORKTODO_NO_UPDATE_CHECK = '1';
 import { Readable } from 'node:stream';
 import { createServer } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, renameSync, rmSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
 // DSH 判定「工具返回值是否 lossless JSON」用的就是这一个函数（见 assertLossless 的说明）
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged, resolveUpdateLockPath, resolveStartupCheckDelayMs, acquireUpdateLock, releaseUpdateLock, classifyCliFailure, killProcessTree, UPDATE_CHECK_TIMEOUT_MS, UPDATE_CHECK_RETRY_DELAY_MS, UPDATE_CHECK_TOTAL_BUDGET_MS, UPDATE_CHECK_BACKOFF_BASE_MS, UPDATE_CHECK_BACKOFF_MAX_MS, resolveCheckTimeoutMs, resolveCheckRetryDelayMs, resolveCheckBackoffMs } from '../lib/index.js';
+import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, detectUnsupportedInstall, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged, resolveUpdateLockPath, resolveStartupCheckDelayMs, acquireUpdateLock, releaseUpdateLock, classifyCliFailure, killProcessTree, UPDATE_CHECK_TIMEOUT_MS, UPDATE_CHECK_RETRY_DELAY_MS, UPDATE_CHECK_TOTAL_BUDGET_MS, UPDATE_CHECK_BACKOFF_BASE_MS, UPDATE_CHECK_BACKOFF_MAX_MS, resolveCheckTimeoutMs, resolveCheckRetryDelayMs, resolveCheckBackoffMs } from '../lib/index.js';
 
 /**
  * 「模拟版本」的**唯一**来源：全部从 package.json 派生；本文件里不许再出现当前版本号的字面量。
@@ -1256,6 +1256,35 @@ function makeFakeProfile(name, spec) {
   return dir;
 }
 
+/**
+ * 目录快照：逐文件记录**原始字节**（base64）、权限与符号链接目标。
+ *
+ * 为什么不用 mtime：同一毫秒内的覆盖写可能骗过 mtime；「零写盘」必须逐字节证明。
+ * 只读、不跟随符号链接（链接本身也算一项，防止安装过程偷偷改链接）。
+ * @param {string} root
+ * @returns {Record<string, string>}
+ */
+function snapshotTree(root) {
+  const entries = {};
+  const walk = (dir, prefix = '') => {
+    for (const name of readdirSync(dir).sort()) {
+      const absolute = join(dir, name);
+      const relativeName = prefix ? `${prefix}/${name}` : name;
+      const stat = lstatSync(absolute);
+      if (stat.isSymbolicLink()) {
+        entries[relativeName] = `symlink:${readlinkSync(absolute)}`;
+      } else if (stat.isDirectory()) {
+        entries[relativeName] = 'dir';
+        walk(absolute, relativeName);
+      } else {
+        entries[relativeName] = `file:${readFileSync(absolute).toString('base64')}:${stat.mode & 0o777}`;
+      }
+    }
+  };
+  walk(root);
+  return entries;
+}
+
 /** 在假 profile 里放一份「已落盘」的安装版本（模拟升级后 node_modules 里的真版本）。 */
 function seedInstalledVersion(profileDir, version) {
   const dir = join(profileDir, 'node_modules', 'dsh-worktodo');
@@ -1602,27 +1631,138 @@ async function waitForUpdateSettled(host, timeoutMs = 5000) {
   return last;
 }
 
-await test('自升级：link: 安装被跳过，一个子进程都不起（reason=linked）', async () => {
+await test('自升级：link: 安装 → unsupported/link-install；别下载/别安装、零写盘、零子进程', async () => {
   const profile = makeFakeProfile('linked', 'link:/tmp/fake/dsh-worktodo');
+  const before = snapshotTree(profile);
   const capture = join(selfUpdateRoot, 'capture-linked.txt');
   const bin = join(selfUpdateRoot, 'bin-linked');
+  const stageDir = join(selfUpdateRoot, 'stage-linked');
   writeFakePnpm(bin, { capture });
-  const { host, dir } = await makeUpdateHost();
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
   try {
-    await withEnv({ WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`, WORKTODO_PNPM_PATH: undefined }, async () => {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile,
+      PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'state-linked.json'),
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+    }, async () => {
+      // 1) 面板「下载」：必须在**发起下载之前**就收口成 unsupported（连暂存区都不建）
+      const download = await triggerUpdate(host, { action: 'plugin-update-download', version: FAKE_NEXT_VERSION });
+      eq(download.statusCode, 200);
+      const downloaded = download.json();
+      eq(downloaded.ok, false, 'link: 不适用自更新，不是「装成功了」：');
+      eq(downloaded.reason, 'link-install', `POST 的稳定原因要是 link-install：${JSON.stringify(downloaded)}`);
+      // POST 的回包沿用旧契约（ok/reason/error），阶段读 GET /worktodo/update（面板也是这么做的）。
+      const downloadState = (await readUpdateState(host)).json().data;
+      eq(downloadState.phase, 'unsupported', `下载前就必须判成 unsupported（实际 ${downloadState.phase}）：`);
+      eq(downloadState.updateUnsupported, 'link-install', '要给出稳定的不适用种类：');
+      eq(downloadState.state, 'idle', '兼容层：老面板看到的仍是 idle（不亮红）：');
+      eq(downloadState.failure, null, 'unsupported 不是 failure：');
+      eq(downloadState.failedOperation, null, 'unsupported 没有「失败发生在哪一步」：');
+      eq(/失败/.test(String(downloadState.error)), false, `文案不能出现「失败」：${downloadState.error}`);
+      eq(String(downloadState.error).includes('git/pnpm'), true, `要说清该走哪条更新工作流：${downloadState.error}`);
+      eq(String(downloadState.diagnostics?.detail).includes('link:'), true,
+        `技术细节（link: 规格）只能进 diagnostics：${JSON.stringify(downloadState.diagnostics)}`);
+      eq(existsSync(stageDir), false, '判定发生在下载之前：暂存区都不该被创建：');
+      eq(invokeCount(capture), 0, `link: 场景一个子进程都不许起（实际 ${invokeCount(capture)}）：`);
+      eq(snapshotTree(profile), before, '零写盘：profile 目录逐字节不变：');
+
+      // 2) 旧接口「一次到位」：同样在 install 流程之前收口，不改盘、不起子进程
       const response = await triggerUpdate(host);
       eq(response.statusCode, 200);
       const body = response.json();
       eq(body.ok, false, 'link: 安装必须被拒绝，而不是照装：');
-      eq(body.reason, 'linked');
-      eq(String(body.error).includes('git/pnpm'), true, `要说清该走哪条更新工作流：${body.error}`);
-      // 子进程如果起了，capture 文件必然出现；给足时间再断言「它不存在」
+      eq(body.reason, 'link-install');
+      const installedState = (await readUpdateState(host)).json().data;
+      eq(installedState.phase, 'unsupported', `旧接口也要走 unsupported（实际 ${installedState.phase}）：`);
+      eq(installedState.updateUnsupported, 'link-install');
+      eq(installedState.state, 'idle');
       await new Promise((resolve) => setTimeout(resolve, 200));
-      eq(existsSync(capture), false, 'link: 场景绝不允许执行任何子进程（capture 文件不该出现）：');
+      eq(invokeCount(capture), 0, `link: 场景绝不允许执行任何子进程（实际 ${invokeCount(capture)}）：`);
+      eq(snapshotTree(profile), before, '零写盘：旧接口路径也必须逐字节不变：');
+
+      // 3) 兼容语义不变：hasUpdate 仍按「运行版本 vs latest」算（不是按不适用状态算）
+      const list = (await call(host.routes.get('/worktodo/list').handler, {
+        method: 'GET', url: '/worktodo/list',
+      })).json();
+      eq(list.data.update.hasUpdate, true, `hasUpdate 必须照旧按运行版本算：${JSON.stringify(list.data.update)}`);
+      eq(list.data.update.run.phase, 'unsupported', '/list 摘要也要带 unsupported 阶段：');
+      eq(list.data.update.run.updateUnsupported, 'link-install');
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+await test('自升级：node_modules/dsh-worktodo 指向仓库的 symlink → unsupported/link-install；零写盘、零子进程', async () => {
+  // pnpm 的 registry 安装本来就是链接到 profile 自己的 node_modules/.pnpm；这里刻意让链接
+  // 指向 profile **之外**的源码目录（等价 `link:`/`file:`/`workspace:`），必须在 install 前识别。
+  const profile = makeFakeProfile('symlinked', '^0.2.0');
+  const linkedRepo = join(selfUpdateRoot, 'symlink-repo');
+  mkdirSync(linkedRepo, { recursive: true });
+  writeFileSync(join(linkedRepo, 'package.json'), JSON.stringify({ name: 'dsh-worktodo', version: '0.2.0' }, null, 2));
+  mkdirSync(join(profile, 'node_modules'), { recursive: true });
+  symlinkSync(linkedRepo, join(profile, 'node_modules', 'dsh-worktodo'), 'dir');
+  const profileBefore = snapshotTree(profile);
+  const repoBefore = snapshotTree(linkedRepo);
+  const capture = join(selfUpdateRoot, 'capture-symlink.txt');
+  const bin = join(selfUpdateRoot, 'bin-symlink');
+  const stageDir = join(selfUpdateRoot, 'stage-symlink');
+  writeFakePnpm(bin, { capture });
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false });
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile,
+      PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined,
+      WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'state-symlink.json'),
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+    }, async () => {
+      const response = await triggerUpdate(host);
+      eq(response.statusCode, 200);
+      eq(response.json().reason, 'link-install');
+      const body = (await readUpdateState(host)).json().data;
+      eq(body.phase, 'unsupported', `symlink 安装也要在 install 前判成 unsupported（实际 ${body.phase}）：`);
+      eq(body.updateUnsupported, 'link-install', 'symlink 指向 profile 之外 = 本地链接安装：');
+      eq(body.state, 'idle', '兼容层保持 idle：');
+      eq(body.diagnostics?.evidence, 'node-modules-symlink', `诊断要说明命中的是 symlink：${JSON.stringify(body.diagnostics)}`);
+      eq(String(body.diagnostics?.detail).includes(linkedRepo), true, '诊断里要有链接目标（只进 diagnostics）：');
+      eq(existsSync(stageDir), false, '没有下载，暂存区不该出现：');
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      eq(invokeCount(capture), 0, `symlink 场景一个子进程都不许起（实际 ${invokeCount(capture)}）：`);
+      eq(snapshotTree(profile), profileBefore, '零写盘：profile（含链接本身）逐字节不变：');
+      eq(snapshotTree(linkedRepo), repoBefore, '零写盘：链接目标仓库也一个字节都不许动：');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test('预判：link:/file:/workspace: 都算本地链接安装；pnpm 的 .pnpm 内部 symlink 不算（不误伤正常安装）', () => {
+  for (const [label, spec] of [
+    ['link', 'link:../../default-workspace/dsh-worktodo'],
+    ['file', 'file:../dsh-worktodo'],
+    ['workspace', 'workspace:*'],
+  ]) {
+    const profile = makeFakeProfile(`preflight-${label}`, spec);
+    const detected = detectUnsupportedInstall({ profileDir: profile });
+    eq(detected?.kind, 'link-install', `${label}: 本地协议必须判成 link-install：${JSON.stringify(detected)}`);
+    eq(detected?.evidence, 'local-spec', `${label}: 证据要是 local-spec：`);
+    eq(String(detected?.detail).includes(spec), true, `${label}: diagnostics 要带原始规格：${detected?.detail}`);
+  }
+
+  // pnpm 的 registry 安装：node_modules/dsh-worktodo → node_modules/.pnpm/... 也是 symlink，
+  // 但目标在 profile 自己的 node_modules 内，不能误判成开发安装（否则正常用户永远升不了级）。
+  const pnpmProfile = makeFakeProfile('preflight-pnpm', '^0.2.0');
+  const storePkg = join(pnpmProfile, 'node_modules', '.pnpm', 'dsh-worktodo@0.2.0', 'node_modules', 'dsh-worktodo');
+  mkdirSync(storePkg, { recursive: true });
+  writeFileSync(join(storePkg, 'package.json'), JSON.stringify({ name: 'dsh-worktodo', version: '0.2.0' }, null, 2));
+  symlinkSync(storePkg, join(pnpmProfile, 'node_modules', 'dsh-worktodo'), 'dir');
+  eq(detectUnsupportedInstall({ profileDir: pnpmProfile }), null,
+    '正常 pnpm 安装（链接指向自己的 .pnpm 目录）必须返回 null，交给正常升级流程：');
 });
 
 await test('自升级：启动检查在飞时点升级不能被「已在运行」吞掉，且检查晚到不许冲掉结论', async () => {
@@ -1656,12 +1796,15 @@ await test('自升级：启动检查在飞时点升级不能被「已在运行�
           '前置条件：启动检查必须真的在飞（否则这条用例没有牙齿）：');
         const body = (await triggerUpdate(host)).json();
         eq(body.ok, false, '检查在飞不是「已在安装」：手动升级必须继续走守卫，link: 要拒绝：');
-        eq(body.reason, 'linked', `link: 的稳定原因不能被吞成 running（实际 ${body.reason}）：`);
+        eq(body.reason, 'link-install', `link: 的稳定原因不能被吞成 running（实际 ${body.reason}）：`);
+        const posted = (await readUpdateState(host)).json().data;
+        eq(posted.phase, 'unsupported', `link: 在 install 前就该判成 unsupported（实际 ${posted.phase}）：`);
         await checkArrived;
         await new Promise((resolve) => setTimeout(resolve, 500)); // 等检查真的返回并收口
         const status = (await readUpdateState(host)).json().data;
-        eq(status.phase, 'failed', `检查晚到不许把已定论的 link: 冲成 available/idle（实际 ${status.phase}）：`);
-        eq(status.reason, 'linked', `结论仍必须是 linked（实际 ${status.reason}）：`);
+        eq(status.phase, 'unsupported', `检查晚到不许把已定论的 link: 冲成 available/idle（实际 ${status.phase}）：`);
+        eq(status.reason, 'link-install', `结论仍必须是 link-install（实际 ${status.reason}）：`);
+        eq(status.updateUnsupported, 'link-install');
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -2011,9 +2154,12 @@ await test('A3：任一段位是 link:/file:/workspace: 就整体跳过 —— �
     }, async () => {
       const response = await triggerUpdate(host);
       eq(response.json().ok, false, '本地协议必须被拒绝：');
-      eq(response.json().reason, 'linked', `reason 要是 linked：${JSON.stringify(response.json())}`);
-      eq(String(response.json().error).includes('devDependencies'), true,
-        `要说清是哪个段位的本地协议（旧守卫只看 dependencies，拦不住这里）：${response.json().error}`);
+      const body = (await readUpdateState(host)).json().data;
+      eq(body.phase, 'unsupported', `本地协议是预期内的不适用（实际 ${body.phase}）：`);
+      eq(body.updateUnsupported, 'link-install', `种类要是 link-install：${JSON.stringify(body)}`);
+      eq(String(body.diagnostics?.detail).includes('devDependencies'), true,
+        `diagnostics 要说清是哪个段位命中的（旧守卫只看 dependencies）：${JSON.stringify(body.diagnostics)}`);
+      eq(/失败/.test(String(body.error)), false, `文案不能出现「失败」：${body.error}`);
       await new Promise((resolve) => setTimeout(resolve, 200));
       eq(invokeCount(capture), 0, `本地协议场景一个子进程都不许起（实际 ${invokeCount(capture)}）：`);
       eq(readFileSync(join(profile, 'package.json'), 'utf8') === bytes, true, '零写盘：清单逐字节不变：');
@@ -2448,6 +2594,9 @@ await test('B2（高）：dispose 取消在飞安装 —— 子进程被杀、�
       ({ host, dir } = await makeUpdateHost({ autoInstall: true, updateTimeoutMs: 5000 }));
       eq(await waitFor(() => existsSync(capture), 5000), true,
         '前置条件：autoInstall:true 必须真的起了一个安装子进程：');
+      // capture 与 pid 文件是假 pnpm 分两行写的：只等 capture 会偶发读到还没写出的 pid（CI 抖动）。
+      eq(await waitFor(() => existsSync(pidFile), 2000), true,
+        '前置条件：假 pnpm 必须已经写出自己的 pid：');
       const beforeDispose = (await readUpdateState(host)).json().data;
       eq(beforeDispose.phase, 'installing', `前置条件：dispose 时应当正在安装（实际 ${beforeDispose.phase}）：`);
       pid = Number(readFileSync(pidFile, 'utf8').trim());
@@ -2473,6 +2622,9 @@ await test('B2（高）：dispose 取消在飞安装 —— 子进程被杀、�
     if (pid && isPidAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* 已退出 */ } }
     if (dir) rmSync(dir, { recursive: true, force: true });
     rmSync(stageDir, { recursive: true, force: true });
+    // 若本用例中途失败，锁文件会留在共享的 selfUpdateRoot 里，让下一条 B3 被误判成 busy；
+    // 这里无条件回收，保证用例失败不会污染后续用例。
+    rmSync(join(dirname(statePath), 'update.lock'), { force: true });
   }
 });
 
@@ -3356,13 +3508,15 @@ await test('自动更新：link: 安装即使默认开启也一个子进程都�
       WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-auto-linked.json'),
     }, async () => {
       const host = makeCtx();
-      // autoUpdate 默认 true；显式 autoInstall:true 才会走到 startInstall 的 linked 守卫
+      // autoUpdate 默认 true；显式 autoInstall:true 才会走到 install 预判
       await apply(host.ctx, { storePath: join(dir, 'todos.json'), autoInstall: true });
       await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' });
       await new Promise((resolve) => setTimeout(resolve, 300));
       eq(invokeCount(capture), 0, `link: 场景自动更新也必须零子进程（实际 ${invokeCount(capture)}）：`);
       const status = (await readUpdateState(host)).json().data;
-      eq(status.reason, 'linked', `要明确回报 linked 原因：${JSON.stringify(status)}`);
+      eq(status.phase, 'unsupported', `自动更新也要提前判成 unsupported（实际 ${status.phase}）：`);
+      eq(status.updateUnsupported, 'link-install', `要明确回报 link-install：${JSON.stringify(status)}`);
+      eq(status.state, 'idle', '兼容层保持 idle：');
       eq(String(status.error).includes('git/pnpm'), true, `要说清该走哪条更新工作流：${status.error}`);
     });
   } finally {
@@ -3560,7 +3714,7 @@ await test('A1：writeFileAtomicSync 失败不动原文件 / 成功无残留 / �
   }
 });
 
-await test('A5：反推不出本实例 profile 时零写盘 —— 绝不改写 $DSH_HOME/profiles 里别的 profile', async () => {
+await test('A5：反推不出本实例 profile → unsupported/profile-undetermined，零写盘、绝不猜别的 profile', async () => {
   const home = mkdtempSync(join(tmpdir(), 'worktodo-a5-home-'));
   const aaa = join(home, 'profiles', 'aaa');
   const zzz = join(home, 'profiles', 'zzz');
@@ -3571,6 +3725,7 @@ await test('A5：反推不出本实例 profile 时零写盘 —— 绝不改写 
   writeFileSync(join(aaa, 'package.json'), aaaBytes);
   writeFileSync(join(zzz, 'package.json'), zzzBytes);
   const aaaMtime = statSync(join(aaa, 'package.json')).mtimeMs;
+  const homeBefore = snapshotTree(home);
   const capture = join(selfUpdateRoot, 'capture-a5.txt');
   const bin = join(selfUpdateRoot, 'bin-a5');
   // 假 pnpm 会在 aaa 里换版本 —— 如果插件去猜 profile，aaa 就会被改写（审查实跑的结果）
@@ -3583,13 +3738,23 @@ await test('A5：反推不出本实例 profile 时零写盘 —— 绝不改写 
       WORKTODO_UPDATE_LATEST: '9.9.9', WORKTODO_UPDATE_STATE_PATH: join(home, 'update-state.json'),
     }, async () => {
       const response = await triggerUpdate(host);
-      eq(response.json().ok, false, '反推不出 profile 时必须失败，而不是猜一个：');
-      eq(response.json().reason, 'profile-not-found', `reason 要是 profile-not-found：${JSON.stringify(response.json())}`);
+      eq(response.json().ok, false, '反推不出 profile 时必须拒绝，而不是猜一个：');
+      eq(response.json().reason, 'profile-undetermined');
+      const body = (await readUpdateState(host)).json().data;
+      eq(body.phase, 'unsupported', `推不出 profile 是预期内的不适用（实际 ${body.phase}）：`);
+      eq(body.updateUnsupported, 'profile-undetermined', `种类要是 profile-undetermined：${JSON.stringify(body)}`);
+      eq(body.state, 'idle', '兼容层保持 idle（不亮红）：');
+      eq(body.failure, null, '不是 failure：');
+      eq(/失败/.test(String(body.error)), false, `文案不能出现「失败」：${body.error}`);
+      eq(/反推不出/.test(String(body.error)), false, `技术串不许上面板：${body.error}`);
+      eq(String(body.diagnostics?.detail).includes('profiles'), true,
+        `技术细节只进 diagnostics：${JSON.stringify(body.diagnostics)}`);
       await new Promise((resolve) => setTimeout(resolve, 250));
       eq(invokeCount(capture), 0, `A5：一个子进程都不许起（实际 ${invokeCount(capture)}）：`);
       eq(readFileSync(join(aaa, 'package.json'), 'utf8') === aaaBytes, true, 'A5：字典序第一个 profile（aaa）一个字节都不许动：');
       eq(readFileSync(join(zzz, 'package.json'), 'utf8') === zzzBytes, true, 'A5：link: 的 zzz 也不许动：');
       eq(statSync(join(aaa, 'package.json')).mtimeMs, aaaMtime, 'A5：aaa 的 mtime 也不许变（零写盘）：');
+      eq(snapshotTree(home), homeBefore, 'A5：整个 $DSH_HOME 逐字节不变（没有新文件）：');
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });

@@ -1237,6 +1237,66 @@ test('updateBadgeState：检查更新失败是温和态（muted），不亮红�
   eq(mod.isUpdateBusy({ phase: 'check-failed' }), false, '检查失败不是「进行中」，不该常驻 2s 轮询：');
 });
 
+test('updateBadgeState：unsupported 是温和态（muted），两种文案中英齐全、不亮红、不给重试、不暴露技术串', () => {
+  const dictionaries = localeRegistrations[0]?.dictionaries ?? {};
+  for (const lang of ['zh', 'en']) {
+    const t = (key) => dictionaries[lang]?.[key] ?? key;
+    for (const [kind, key] of [
+      ['link-install', 'updateUnsupportedLink'],
+      ['profile-undetermined', 'updateUnsupportedProfile'],
+    ]) {
+      const run = {
+        state: 'idle',
+        phase: 'unsupported',
+        updateUnsupported: kind,
+        reason: kind,
+        // 宿主的 error 也只是温和话；即便 diagnostics 里放着技术串，也绝不能上屏。
+        error: dictionaries[lang][key],
+        diagnostics: {
+          step: 'preflight-unsupported',
+          detail: '反推不出本实例自己所在的 profile 目录（link: 装载或非标准布局）',
+        },
+      };
+      const badge = mod.updateBadgeState(run, { hasUpdate: true, latest: '9.9.9' }, t);
+      eq(Boolean(badge), true, `${lang}/${kind}: 不适用也要渲染（否则用户不知道为什么没有更新按钮）：`);
+      eq(badge.phase, 'unsupported');
+      eq(badge.text, dictionaries[lang][key], `${lang}/${kind}: 必须用约定的温和文案：`);
+      eq(badge.title, dictionaries[lang][key], `${lang}/${kind}: hover 也不能带技术串：`);
+      eq(badge.tone, 'muted', `${lang}/${kind}: 不能用 error 红色，也不能用 warn（这不是需要处理的事）：`);
+      eq(badge.action, null, `${lang}/${kind}: 不给重试/更新按钮：`);
+      eq(badge.disabled, true);
+      eq(badge.detail, undefined, `${lang}/${kind}: 技术细节只留在 diagnostics，徽标不带 detail：`);
+      eq(/失败/.test(badge.text), false, `${lang}/${kind}: 文案不能出现「失败」：`);
+      eq(/\bfailed\b/i.test(`${badge.text} ${badge.title}`), false, `${lang}/${kind}: 英文不能说 failed：`);
+      eq(/反推不出|profile-not-found|link: 装载|node_modules\/dsh-worktodo/i.test(`${badge.text} ${badge.title}`), false,
+        `${lang}/${kind}: 徽标/提示里不能出现原始异常串：${badge.text} / ${badge.title}`);
+    }
+  }
+
+  // 文案本身：中英都必须在、温和且可执行，绝不出现「失败 / failed / 反推不出 / 原始异常」。
+  for (const key of ['updateUnsupportedLink', 'updateUnsupportedProfile']) {
+    for (const lang of ['zh', 'en']) {
+      const text = dictionaries[lang]?.[key];
+      eq(typeof text, 'string', `${lang}.${key} 必须存在：`);
+      eq(text.length > 0, true, `${lang}.${key} 不能为空：`);
+      eq(/失败|\bfailed\b/i.test(text), false, `${lang}.${key} 不能出现「失败/failed」：${text}`);
+      eq(/反推不出|profile-not-found|link: 装载|node_modules\/dsh-worktodo/i.test(text), false,
+        `${lang}.${key} 不能暴露原始异常串：${text}`);
+    }
+  }
+  eq(dictionaries.zh.updateUnsupportedLink.includes('本地链接安装'), true, '中文 link 文案要说明是本地链接安装：');
+  eq(dictionaries.zh.updateUnsupportedLink.includes('git/pnpm'), true, '中文 link 文案要给出可执行的工作流：');
+  eq(dictionaries.en.updateUnsupportedLink.includes('git/pnpm workflow'), true, '英文 link 文案要给出可执行的工作流：');
+  eq(dictionaries.zh.updateUnsupportedProfile.includes('未改动任何文件'), true, '中文 profile 文案要说明没动文件：');
+  eq(dictionaries.en.updateUnsupportedProfile.includes('no files changed'), true, '英文 profile 文案要说明没动文件：');
+  eq(mod.isUpdateBusy({ phase: 'unsupported' }), false, '预期内的不适用不是「进行中」，不该轮询：');
+
+  // 老宿主（只有 failed + reason=linked）仍走既有兼容分支：至少不给重试。
+  const legacy = mod.updateBadgeState({ state: 'failed', reason: 'linked', error: 'link: 安装' }, null,
+    (key) => dictionaries.zh?.[key] ?? key);
+  eq(legacy.action, null, '老载荷的 linked 也不能给重试：');
+});
+
 test('updateBadgeState：失败详情包含步骤/命令/退出码/版本/日志尾部（中英双语键，不 innerHTML）', () => {
   const zh = (key) => ({
     updateFailureDetail: '详情',
