@@ -1471,6 +1471,102 @@ test('页脚：restartRequired 时只显示「已更新到 vX，重启 DSH 生�
   }
 });
 
+console.log('更新方式（客户端）：off 无提示 / 重启提醒条 / 设置浮层三档');
+
+test('更新方式：off 不渲染任何更新徽标；restartRequired 的顶部提示中英都含目标版本，且没有可点动作', () => {
+  const dictionaries = localeRegistrations[0]?.dictionaries ?? {};
+  const zh = (key) => dictionaries.zh?.[key] ?? key;
+  const en = (key) => dictionaries.en?.[key] ?? key;
+
+  // off：即使宿主错误地给了 hasUpdate，面板也必须不显示（宿主那侧同样会置 false，双保险）。
+  eq(mod.updateBadgeState({ phase: 'idle', state: 'idle' }, {
+    hasUpdate: true, latest: '9.9.9', updateMode: 'off',
+  }, zh), null, 'off：不许渲染「有新版本」徽标：');
+  eq(mod.updateBadgeState({ phase: 'check-failed', state: 'idle' }, {
+    hasUpdate: false, updateMode: 'off', checkError: { reason: 'timeout' },
+  }, zh), null, 'off：不许渲染「检查失败」徽标：');
+  eq(mod.updateBadgeState({ phase: 'unsupported', state: 'idle' }, {
+    hasUpdate: false, updateMode: 'off', updateUnsupported: 'link-install',
+  }, zh), null, 'off：不许渲染 unsupported 徽标：');
+
+  // 三档选项顺序/文案 key 固定（面板与测试共用一份）。
+  eq(mod.UPDATE_MODE_OPTIONS.map((option) => option.value), ['off', 'manual', 'auto']);
+
+  const zhNotice = mod.restartNotice({ restartRequired: true, installedVersion: '9.9.9' }, zh);
+  eq(zhNotice.text, '已更新到 v9.9.9，请重启 DSH 生效', `中文重启提醒要含目标版本：${zhNotice.text}`);
+  eq(zhNotice.text.includes('请重启'), true);
+  eq(zhNotice.version, '9.9.9');
+  eq(zhNotice.action, undefined, '重启提醒绝不能带可点动作（没有假重启按钮）：');
+  const enNotice = mod.restartNotice({ restartRequired: true, installedVersion: '9.9.9' }, en);
+  eq(enNotice.text, 'Updated to v9.9.9 — restart DSH to apply', `英文重启提醒要含目标版本：${enNotice.text}`);
+  eq(enNotice.text.includes('restart DSH to apply'), true);
+  eq(enNotice.action, undefined);
+  eq(mod.restartNotice({ restartRequired: true, installedVersion: '9.9.9', updateMode: 'off' }, zh), null,
+    'off：顶部也不显示重启提醒（只显示当前版本）：');
+  eq(mod.restartNotice({ restartRequired: false }, zh), null);
+  eq(mod.restartNotice(null, zh), null);
+
+  // 中英键都存在且都含版本占位符
+  for (const key of ['updateRestartBanner', 'updateRestartBannerHint', 'updateCheckNow', 'updateModeOff', 'updateModeManual', 'updateModeAuto']) {
+    for (const lang of ['zh', 'en']) {
+      eq(typeof dictionaries[lang]?.[key], 'string', `${lang}.${key} 必须存在：`);
+      eq(dictionaries[lang][key].length > 0, true, `${lang}.${key} 不能为空：`);
+    }
+  }
+  for (const lang of ['zh', 'en']) {
+    eq(dictionaries[lang].updateRestartBanner.includes('{version}'), true, `${lang}.updateRestartBanner 必须含 {version}：`);
+  }
+});
+
+await testAsync('更新设置：头部齿轮（title/aria）→ 浮层三档 radio（aria-checked）+ 当前版本 + 检查按钮；off 时检查禁用', async () => {
+  const t = (key) => key;
+  const previous = fakeListPayload.data.update;
+  fakeListPayload.data.update = {
+    current: '0.2.5', runningVersion: '0.2.5', hasUpdate: false,
+    updateMode: 'manual', run: { state: 'idle', phase: 'idle' },
+  };
+  try {
+    await withStableHooksAsync(async () => {
+      let nodes = flattenTree(renderPanel({ t }));
+      const gear = nodes.find((n) => String(n.props?.className ?? '').includes('wt-settings-btn'));
+      eq(Boolean(gear), true, '头部必须有更新设置入口（齿轮）：');
+      eq(gear.type, 'button', '齿轮必须是真按钮（键盘可达）：');
+      eq(gear.props.title, 'updateSettings', '齿轮要有 title（中英由 t 提供）：');
+      eq(gear.props['aria-label'], 'updateSettings', '齿轮要有 aria-label：');
+      eq(gear.props['aria-haspopup'], 'dialog');
+
+      gear.props.onClick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      nodes = flattenTree(renderPanel({ t }));
+      const dialog = nodes.find((n) => n.props?.role === 'dialog');
+      eq(Boolean(dialog), true, '点齿轮要打开设置浮层：');
+      eq(dialog.props['aria-label'], 'updateSettingsTitle');
+      const group = nodes.find((n) => n.props?.role === 'radiogroup');
+      eq(Boolean(group), true, '三档必须在 radiogroup 里：');
+      const radios = nodes.filter((n) => n.props?.role === 'radio');
+      eq(radios.length, 3, `必须恰好三档 radio（实际 ${radios.length}）：`);
+      eq(radios.map((node) => node.props['aria-checked']), [false, true, false], '当前 manual 必须被正确标记：');
+      eq(radios.every((node) => node.type === 'button'), true, 'radio 用原生 button，键盘可达：');
+      const check = nodes.find((node) => node.type === 'button' && textOf(node).includes('updateCheckNow'));
+      eq(Boolean(check), true, '浮层里必须有「检查更新」按钮：');
+      eq(check.props.disabled, false, 'manual 时检查按钮可用：');
+      eq(nodes.some((node) => node.props?.dangerouslySetInnerHTML), false, '浮层只用文本节点，没有 innerHTML：');
+
+      // 选 off：POST /settings 成功后检查按钮必须禁用，off 档被选中。
+      await radios[0].props.onClick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      nodes = flattenTree(renderPanel({ t }));
+      const afterOff = nodes.filter((node) => node.props?.role === 'radio');
+      eq(afterOff.map((node) => node.props['aria-checked']), [true, false, false], 'off 必须被标记为当前档：');
+      const checkOff = nodes.find((node) => node.type === 'button' && textOf(node).includes('updateCheckNow'));
+      eq(checkOff.props.disabled, true, 'off 时「检查更新」必须禁用：');
+      eq(String(checkOff.props.title).includes('updateCheckDisabledOff'), true, 'off 禁用的原因要写在 title 里：');
+    });
+  } finally {
+    fakeListPayload.data.update = previous;
+  }
+});
+
 console.log('自升级（客户端）：两阶段交互 —— 下载 → 进度 → 安装并重启 → 已安装待重启');
 
 /** 带占位符真身的 t，其余返回 key（便于断言「用的是哪个 key」而不是被文案细节缠住）。 */

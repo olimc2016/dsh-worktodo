@@ -21,7 +21,7 @@ import { dirname, join, win32 } from 'node:path';
 // DSH 判定「工具返回值是否 lossless JSON」用的就是这一个函数（见 assertLossless 的说明）
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, detectUnsupportedInstall, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged, resolveUpdateLockPath, resolveStartupCheckDelayMs, acquireUpdateLock, releaseUpdateLock, classifyCliFailure, killProcessTree, UPDATE_CHECK_TIMEOUT_MS, UPDATE_CHECK_RETRY_DELAY_MS, UPDATE_CHECK_TOTAL_BUDGET_MS, UPDATE_CHECK_BACKOFF_BASE_MS, UPDATE_CHECK_BACKOFF_MAX_MS, resolveCheckTimeoutMs, resolveCheckRetryDelayMs, resolveCheckBackoffMs } from '../lib/index.js';
+import { apply, shouldAutoUpdate, profileDirFromModuleUrl, resolveOwnProfileDir, detectUnsupportedInstall, normalizePanelConfig, normalizeUpdateConfig, buildUpdateSteps, resolveUpdateStatePath, resolveUpdateStageDir, buildTarballUrl, resolveRestartRequester, writeFileAtomicSync, readProfileSpecEntries, shouldSaveDev, resolveCliUpdater, resolvePnpmUpdater, bundledPnpmCandidates, installedVersionChanged, resolveUpdateLockPath, resolveStartupCheckDelayMs, acquireUpdateLock, releaseUpdateLock, classifyCliFailure, killProcessTree, UPDATE_CHECK_TIMEOUT_MS, UPDATE_CHECK_RETRY_DELAY_MS, UPDATE_CHECK_TOTAL_BUDGET_MS, UPDATE_CHECK_BACKOFF_BASE_MS, UPDATE_CHECK_BACKOFF_MAX_MS, resolveCheckTimeoutMs, resolveCheckRetryDelayMs, resolveCheckBackoffMs, UPDATE_MODES, DEFAULT_UPDATE_MODE, normalizeUpdateMode, defaultUpdateModeFromConfig, effectiveUpdatePolicy, resolveSettingsPath, parseUpdateSettings, readUpdateSettings, writeUpdateSettings } from '../lib/index.js';
 
 /**
  * 「模拟版本」的**唯一**来源：全部从 package.json 派生；本文件里不许再出现当前版本号的字面量。
@@ -308,7 +308,7 @@ await test('apply 完成且不抛（假 ctx 里没有 storage/tools 也不该崩
   eq(logs.some((line) => line.startsWith('info') && line.includes('待办数据')), true, '应有存储位置日志：');
 });
 
-await test('注册出 8 条路由', () => {
+await test('注册出 9 条路由', () => {
   eq([...routes.keys()].sort(), [
     '/worktodo/adopt',
     '/worktodo/create',
@@ -316,6 +316,7 @@ await test('注册出 8 条路由', () => {
     '/worktodo/list',
     '/worktodo/remove',
     '/worktodo/reorder',
+    '/worktodo/settings',
     '/worktodo/status',
     '/worktodo/update',
   ]);
@@ -1002,7 +1003,7 @@ console.log('S1-1：路由注册失败只能降级那一条（不泄漏、不毒
 await test('S1-1：第 N 条路由注册抛错 → apply 不 reject、其余路由照常且卸载时清干净、随后正常挂载不撞 duplicate', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'worktodo-host-routefail-'));
   try {
-    for (const failAt of [1, 3, 8]) {
+    for (const failAt of [1, 3, 8, 9]) {
       // 服务级路由表在 apply 之间共享（真实 DSH 就是这样：路由进了服务，不属于某个 ctx）
       const server = makeServerLevelWebServer({ failAt });
       const bad = makeCtx({ webServer: server });
@@ -1014,9 +1015,9 @@ await test('S1-1：第 N 条路由注册抛错 → apply 不 reject、其余路�
       }
       eq(applyError, null, `第 ${failAt} 条失败时 apply 绝不能 reject（改前工具与路由一起消失）：`);
       // 单条失败只丢那一条，其余照常（改前是「回调中途抛出 → 前 N-1 条泄漏 + 后面全没」）
-      eq(server.table.size, 7, `只有失败的那一条该缺失，实际路由表：${[...server.table.keys()]}`);
+      eq(server.table.size, 8, `只有失败的那一条该缺失，实际路由表：${[...server.table.keys()]}`);
       eq(server.table.has(server.calls.failed[0]), false, `失败的那条不该进路由表：${server.calls.failed[0]}`);
-      eq(server.calls.register, 8, `8 条都要被尝试注册（失败一条不影响其余）：实际尝试 ${server.calls.register} 次`);
+      eq(server.calls.register, 9, `9 条都要被尝试注册（失败一条不影响其余）：实际尝试 ${server.calls.register} 次`);
       await new Promise((resolve) => setTimeout(resolve, 50));
       eq(bad.tools.length, 7, `第 ${failAt} 条失败不能连累工具注册（改前 7 个工具全没）：`);
 
@@ -1033,7 +1034,7 @@ await test('S1-1：第 N 条路由注册抛错 → apply 不 reject、其余路�
         goodError = error;
       }
       eq(goodError, null, `第 ${failAt} 条失败后，下一次正常挂载不该撞 duplicate exact route（改前必须重启 DSH）：`);
-      eq(server.table.size, 8, '正常挂载应当 8 条路由都在：');
+      eq(server.table.size, 9, '正常挂载应当 9 条路由都在：');
       for (const effect of good.effects.filter((e) => e.label === 'worktodo: http routes')) await effect.dispose?.();
       eq(server.table.size, 0, '正常挂载卸载后同样不留残留：');
     }
@@ -1042,7 +1043,7 @@ await test('S1-1：第 N 条路由注册抛错 → apply 不 reject、其余路�
   }
 });
 
-await test('S1-2：storageDomain.open 永不 resolve → 超时后 apply 仍然返回并完整挂载（8 路由 / 7 工具）', async () => {
+await test('S1-2：storageDomain.open 永不 resolve → 超时后 apply 仍然返回并完整挂载（9 路由 / 7 工具）', async () => {
   const previousHome = process.env.DSH_HOME;
   const previousTimeout = process.env.WORKTODO_UPGRADE_TIMEOUT_MS;
   const dir = mkdtempSync(join(tmpdir(), 'worktodo-host-hang-'));
@@ -1062,7 +1063,7 @@ await test('S1-2：storageDomain.open 永不 resolve → 超时后 apply 仍然�
     eq(applyError, null, 'open 挂住时 apply 也不能抛（要降级，而不是半死）：');
     eq(ms < 2000, true, `apply 必须被超时兜住（改前永不返回；实际 ${ms.toFixed(0)}ms）：`);
     await new Promise((resolve) => setTimeout(resolve, 50));
-    eq(host.routes.size, 8, '超时后 8 条路由照常注册（面板可用）：');
+    eq(host.routes.size, 9, '超时后 9 条路由照常注册（面板可用）：');
     eq(host.tools.length, 7, '超时后 7 个工具照常注册：');
     eq(host.logs.some((line) => line.startsWith('warn') && line.includes('超时')), true,
       `超时必须告警（不静默）：${host.logs.filter((l) => l.includes('storage')).join(' | ')}`);
@@ -1222,7 +1223,7 @@ await test('S6-2：同名工具重复注册 → apply 不崩、面板照常，he
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     eq(applyError, null, '工具注册抛错不能冒到 apply（面板与路由必须照常挂上）：');
-    eq(host.routes.size, 8, `工具失败时 8 条路由照常在（实际 ${host.routes.size}）：`);
+    eq(host.routes.size, 9, `工具失败时 9 条路由照常在（实际 ${host.routes.size}）：`);
     const health = (await call(host.routes.get('/worktodo/health').handler, { method: 'GET', url: '/worktodo/health' })).json();
     eq(health.ok, true);
     eq(health.tools.status, 'failed', '工具注册失败必须显式报出来（不静默）：');
@@ -1966,13 +1967,13 @@ await test('A2：第 3 步 pnpm add 挂起到超时 → 规格逐字节回滚，
   const originalBytes = readFileSync(join(profile, 'package.json'), 'utf8');
   const capture = join(selfUpdateRoot, 'capture-timeout-rollback.txt');
   const bin = join(selfUpdateRoot, 'bin-timeout-rollback');
-  // add 先把规格写成精确版本，再挂起 5s（远长于 800ms 超时）→ 序列在 add 上超时被杀
+  // add 先把规格写成精确版本，再挂起 5s（远长于 3s 超时）→ 序列在 add 上超时被杀
   writeFakePnpm(bin, {
     capture, addSleepSec: 5,
     addSpecText: `${JSON.stringify({ name: 'dsh-profile-timeout-rollback', private: true, dependencies: { 'dsh-worktodo': FAKE_NEXT_VERSION } }, null, 2)}\n`,
     addSpecProfile: profile,
   });
-  const { host, dir } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 800 });
+  const { host, dir } = await makeUpdateHost({ autoUpdate: false, updateTimeoutMs: 3000 });
   try {
     await withEnv({
       WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
@@ -1980,11 +1981,11 @@ await test('A2：第 3 步 pnpm add 挂起到超时 → 规格逐字节回滚，
     }, async () => {
       const started = Date.now();
       await triggerUpdate(host);
-      const status = await waitForUpdateEnd(host, 5000);
+      const status = await waitForUpdateEnd(host, 10000);
       const elapsed = Date.now() - started;
       eq(status?.state, 'failed', `超时必须落 failed（实际 ${status?.state}）：`);
       eq(status?.reason, 'timeout', `失败原因是 timeout：${status?.reason}`);
-      eq(elapsed < 4000, true, `超时后必须尽快收口（实际 ${elapsed}ms，子进程本来要睡 5s）：`);
+      eq(elapsed < 8000, true, `超时后必须尽快收口（实际 ${elapsed}ms，子进程本来要睡 5s）：`);
       // ★ A2 核心：超时路径也必须回滚规格，且回到**原值**
       eq(readProfileSpec(profile), '^0.2.0', 'A2：超时后规格必须回到原值：');
       eq(readFileSync(join(profile, 'package.json'), 'utf8') === originalBytes, true,
@@ -3536,9 +3537,9 @@ await test('A1：启动检查默认延后 20–30s（绝不是 apply 后立刻�
     '负数必须回落默认：');
 });
 
-await test('A1/A2（高）：默认配置启动 —— 不自动安装、不写 profile（后台最多下载）', async () => {
-  // 审查实跑：默认 autoInstall:true + 无状态文件时，apply 返回约 50ms 后就 spawn CLI 并改 profile。
-  // 修复后默认 autoInstall:false：后台只允许把产物下载到插件自己的暂存区。
+await test('A1/A2（高）：默认更新方式 = manual —— 只检查，不下载、不安装、不写盘', async () => {
+  // 安全默认是 manual：后台**只检查**，绝不自动下载/安装（auto 必须由用户显式选）。
+  // 这里用默认配置 + 注入 latest，证明「看到新版本」也不会下、不会装、不会写任何东西。
   const profile = makeFakeProfile('startup-default', '^0.2.0');
   seedInstalledVersion(profile, '0.2.0');
   const manifest = join(profile, 'package.json');
@@ -3558,18 +3559,18 @@ await test('A1/A2（高）：默认配置启动 —— 不自动安装、不写 
       WORKTODO_UPDATE_STAGE_DIR: stageDir, WORKTODO_UPDATE_STATE_PATH: statePath,
     }, async () => {
       ({ host, dir } = await makeUpdateHost()); // 不传任何配置 = 默认值（必须在上面的 env 里 apply）
-      const status = await waitForUpdatePhase(host, (state) => state.phase === 'downloaded', 5000);
-      eq(status?.phase, 'downloaded', `默认配置后台只该下到 downloaded（实际 ${status?.phase}，error=${status?.error}）：`);
-      eq(status?.autoInstall, false, 'A1：默认 autoInstall 必须报 false：');
+      const status = await waitForUpdatePhase(host, (state) => state.phase === 'available', 5000);
+      eq(status?.phase, 'available', `默认 manual 只该检查到 available（实际 ${status?.phase}，error=${status?.error}）：`);
+      eq(status?.updateMode, 'manual', '默认更新方式必须是 manual（安全默认）：');
+      eq(status?.effective?.autoCheck, true, 'manual 仍然要检查（不是 off）：');
+      eq(status?.effective?.autoInstall, false, 'manual 绝不自动安装：');
       await new Promise((resolve) => setTimeout(resolve, 300));
       eq(invokeCount(capture), 0,
-        `A1：默认配置下启动绝不允许自动安装（实际起了 ${invokeCount(capture)} 个 pnpm 子进程）：`);
-      eq(readFileSync(manifest, 'utf8'), originalBytes, 'A1：默认配置启动后 profile 清单必须逐字节不变：');
+        `A1：manual 下绝不允许起任何下载/安装子进程（实际起了 ${invokeCount(capture)} 个 pnpm 子进程）：`);
+      eq(readFileSync(manifest, 'utf8'), originalBytes, 'A1：manual 下 profile 清单必须逐字节不变：');
       eq(statSync(manifest).mtimeMs, mtime, 'A1：连 mtime 都不许变（= 零写盘）：');
-      eq(existsSync(status?.download?.artifact), true, '后台允许下载到暂存区（不碰 profile）：');
-      eq(existsSync(statePath), true, 'A1：状态文件记录 downloaded（面板据此显示「已下载」）：');
-      const persisted = JSON.parse(readFileSync(statePath, 'utf8'));
-      eq(persisted.result, 'downloaded', `A1：状态文件结论必须是 downloaded：${JSON.stringify(persisted)}`);
+      eq(existsSync(stageDir), false, 'A1：manual 绝不自动下载（暂存区不该出现）：');
+      eq(existsSync(statePath), false, 'A1：manual 不产生任何自动更新节流状态（零写盘）：');
     });
   } finally {
     if (dir) rmSync(dir, { recursive: true, force: true });
@@ -4022,7 +4023,9 @@ async function makePanelConfigHost(config = {}) {
  */
 async function startTarballServer({ chunks = 1, chunkSize = 2048, delayMs = 0, status = 200 } = {}) {
   const body = Buffer.alloc(chunkSize * chunks, 0x61);
+  const stats = { hits: 0 };
   const server = createServer(async (_request, response) => {
+    stats.hits += 1;
     if (status !== 200) {
       response.writeHead(status, { 'content-length': '0' });
       response.end();
@@ -4039,6 +4042,8 @@ async function startTarballServer({ chunks = 1, chunkSize = 2048, delayMs = 0, s
   return {
     base: `http://127.0.0.1:${server.address().port}/`,
     body,
+    stats,
+    get hits() { return stats.hits; },
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
@@ -4307,8 +4312,8 @@ await test('自升级（两步）：下好了但没安装就「重启」→ 新�
   }
 });
 
-await test('自升级：config.autoInstall 两种取值——true=后台下完就装；false=后台只停在「已下载」', async () => {
-  // —— autoInstall:false（照 DSH 的做法：后台只下载，安装等用户点） ——
+await test('自升级：config 默认值映射——autoInstall:false=manual（只查，用户点才下/装）；true=auto（全自动）', async () => {
+  // —— autoInstall:false → manual：后台**只检查**，下载/安装都必须用户点 ——
   const profileOff = makeFakeProfile('autoinstall-off', '^0.2.0');
   seedInstalledVersion(profileOff, '0.2.0');
   const offPnpm = makeInstallingPnpm('autoinstall-off', profileOff);
@@ -4323,14 +4328,18 @@ await test('自升级：config.autoInstall 两种取值——true=后台下完�
       WORKTODO_UPDATE_STATE_PATH: join(selfUpdateRoot, 'update-state-autoinstall-off.json'),
     }, async () => {
       off = await makeUpdateHost({ autoInstall: false });
-      const status = await waitForUpdatePhase(off.host, (state) => state.phase === 'downloaded', 5000);
-      eq(status?.phase, 'downloaded', `autoInstall:false 时后台必须下完并停在 downloaded（实际 ${status?.phase}，error=${status?.error}）：`);
+      const status = await waitForUpdatePhase(off.host, (state) => state.phase === 'available', 5000);
+      eq(status?.phase, 'available', `autoInstall:false 映射成 manual，只该检查到 available（实际 ${status?.phase}，error=${status?.error}）：`);
+      eq(status.updateMode, 'manual', 'config.autoInstall:false 时默认档位是 manual：');
       eq(status.autoInstall, false, 'GET 状态要如实报出 autoInstall:false：');
-      eq(status.state, 'idle', '停在「已下载」时不该显示在运行（老字段 idle）：');
-      eq(existsSync(status.download?.artifact), true, '下载物要真的在暂存区：');
+      eq(status.state, 'idle', '只是「有新版本」不该显示在运行（老字段 idle）：');
+      eq(existsSync(stageOff), false, 'manual 绝不自动下载（暂存区不该出现）：');
       await new Promise((resolve) => setTimeout(resolve, 200));
-      eq(invokeCount(offPnpm.capture), 0, 'autoInstall:false 时后台绝不允许自动安装：');
-      // 用户点「安装并重启」之后才装
+      eq(invokeCount(offPnpm.capture), 0, 'manual 下后台绝不允许自动安装：');
+      // 用户点「下载」→「安装并重启」之后才动 profile
+      eq((await triggerUpdate(off.host, { action: 'plugin-update-download' })).json().ok, true);
+      const downloaded = await waitForUpdatePhase(off.host, (state) => state.phase === 'downloaded', 5000);
+      eq(downloaded?.phase, 'downloaded', `用户点了下载之后要能下好（实际 ${downloaded?.phase}）：`);
       eq((await triggerUpdate(off.host, { action: 'plugin-update-install' })).json().ok, true);
       const settled = await waitForUpdateSettled(off.host, 6000);
       eq(settled?.phase, 'installed', `用户点了之后要能装上（实际 ${settled?.phase}）：`);
@@ -4341,7 +4350,7 @@ await test('自升级：config.autoInstall 两种取值——true=后台下完�
     rmSync(stageOff, { recursive: true, force: true });
   }
 
-  // —— 显式 autoInstall:true：后台下完直接装（显式 opt-in 的旧行为） ——
+  // —— 显式 autoInstall:true → auto：后台检查到新版后下载 + 安装全自动 ——
   const profileOn = makeFakeProfile('autoinstall-default', '^0.2.0');
   seedInstalledVersion(profileOn, '0.2.0');
   const onPnpm = makeInstallingPnpm('autoinstall-default', profileOn);
@@ -4359,6 +4368,7 @@ await test('自升级：config.autoInstall 两种取值——true=后台下完�
       on = await makeUpdateHost({ autoInstall: true });
       const settled = await waitForUpdateSettled(on.host, 6000);
       eq(settled?.phase, 'installed', `显式 autoInstall:true 后台要一路装完（实际 ${settled?.phase}，error=${settled?.error}）：`);
+      eq(settled?.updateMode, 'auto', 'config.autoInstall:true 时默认档位是 auto：');
       eq(settled?.autoInstall, true, 'GET 状态要如实报出 autoInstall:true：');
       eq(invokeCount(onPnpm.capture) >= 1, true, '显式开启后要真的起安装子进程：');
       // 后台自动装完**不**会自动请求重启：重启永远是用户动作
@@ -4368,6 +4378,313 @@ await test('自升级：config.autoInstall 两种取值——true=后台下完�
     await tarballOn.close();
     if (on?.dir) rmSync(on.dir, { recursive: true, force: true });
     rmSync(stageOn, { recursive: true, force: true });
+  }
+});
+
+console.log('\n更新方式（off / manual / auto）：持久化 / 零网络 / 不自动装 / 全自动 + 重启提醒 / unsupported 零写盘');
+
+await test('更新方式：三档纯函数 + settings 持久化（POST/GET 一致、原子写无残留、非法值 400 不写盘、损坏回退 manual）', async () => {
+  eq([...UPDATE_MODES], ['off', 'manual', 'auto'], '三档顺序固定：');
+  eq(DEFAULT_UPDATE_MODE, 'manual', '安全默认必须是 manual：');
+  eq(normalizeUpdateMode('auto'), 'auto');
+  eq(normalizeUpdateMode('off'), 'off');
+  eq(normalizeUpdateMode('manual'), 'manual');
+  eq(normalizeUpdateMode('sometimes'), null, '非法档位必须被拒绝：');
+  eq(normalizeUpdateMode(undefined), null);
+  eq(defaultUpdateModeFromConfig({}), 'manual', '空配置 = manual：');
+  eq(defaultUpdateModeFromConfig({ autoUpdate: false }), 'manual', 'autoUpdate:false 是旧语义「不自动升级」，不是 off：');
+  eq(defaultUpdateModeFromConfig({ autoInstall: true }), 'auto', 'autoInstall:true 是显式 opt-in 的 auto：');
+  eq(effectiveUpdatePolicy('off'), { autoCheck: false, autoInstall: false });
+  eq(effectiveUpdatePolicy('manual'), { autoCheck: true, autoInstall: false });
+  eq(effectiveUpdatePolicy('auto'), { autoCheck: true, autoInstall: true });
+  eq(resolveSettingsPath({ env: {}, home: '/tmp/fake-home' }), '/tmp/fake-home/worktodo/settings.json');
+  eq(resolveSettingsPath({ env: { WORKTODO_SETTINGS_PATH: ' /tmp/x.json ' }, home: '/tmp/fake-home' }), '/tmp/x.json',
+    '测试缝要能覆盖到临时文件：');
+  eq(parseUpdateSettings('{"updateMode":"auto"}').updateMode, 'auto');
+  eq(parseUpdateSettings('{"updateMode":"nope"}'), null, '非法值 = 损坏：');
+  eq(parseUpdateSettings('{ 不是 JSON'), null);
+
+  const settingsDir = mkdtempSync(join(tmpdir(), 'worktodo-settings-'));
+  const settingsFile = join(settingsDir, 'settings.json');
+  const statePath = join(settingsDir, 'update-state.json');
+  const getSettings = (host) => call(host.routes.get('/worktodo/settings').handler, {
+    method: 'GET', url: '/worktodo/settings',
+  }).then((response) => response.json());
+  const postSettings = (host, body) => call(host.routes.get('/worktodo/settings').handler, {
+    method: 'POST', url: '/worktodo/settings', body,
+  });
+  try {
+    await withEnv({
+      WORKTODO_SETTINGS_PATH: settingsFile,
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+      WORKTODO_NO_UPDATE_CHECK: '1',
+    }, async () => {
+      const { host, dir } = await makeUpdateHost();
+      try {
+        const initial = await getSettings(host);
+        eq(initial.ok, true);
+        eq(initial.data.updateMode, 'manual', '没有 settings.json 时按 config 默认 → manual：');
+        eq(initial.data.effective, { autoCheck: true, autoInstall: false });
+
+        // 三档都 POST 一次，每次 GET 都要一致；文件只存 {updateMode, updatedAt}
+        for (const mode of ['off', 'auto', 'manual']) {
+          const posted = await postSettings(host, { updateMode: mode });
+          eq(posted.statusCode, 200, `POST ${mode} 必须成功：`);
+          eq(posted.json().data.updateMode, mode);
+          const readBack = await getSettings(host);
+          eq(readBack.data.updateMode, mode, `GET 必须回读 ${mode}：`);
+          const saved = JSON.parse(readFileSync(settingsFile, 'utf8'));
+          eq(Object.keys(saved).sort(), ['updateMode', 'updatedAt'], `settings.json 只允许这两个键：${JSON.stringify(saved)}`);
+          eq(saved.updateMode, mode);
+          eq(typeof saved.updatedAt, 'string', '必须记录 updatedAt：');
+        }
+        eq(readdirSync(settingsDir).sort(), ['settings.json'], '原子写不许留下 .tmp/.bak 残留：');
+
+        // /list 与 /update 都要带 updateMode
+        const list = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
+        eq(list.data.update.updateMode, 'manual', '/list 必须带 updateMode：');
+        eq(list.data.update.effective, { autoCheck: true, autoInstall: false });
+        const status = (await readUpdateState(host)).json().data;
+        eq(status.updateMode, 'manual', '/update 必须带 updateMode：');
+        eq(status.effective, { autoCheck: true, autoInstall: false });
+
+        // 非法值：400，且文件一个字节都不动
+        const beforeInvalid = readFileSync(settingsFile, 'utf8');
+        const invalid = await postSettings(host, { updateMode: 'sometimes' });
+        eq(invalid.statusCode, 400, '非法值必须回 400：');
+        eq(invalid.json().reason, 'invalid-update-mode');
+        eq(readFileSync(settingsFile, 'utf8'), beforeInvalid, '非法值绝不许写盘：');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // 损坏的 settings.json → manual + 告警，不崩
+    writeFileSync(settingsFile, '{ 这不是 JSON');
+    await withEnv({
+      WORKTODO_SETTINGS_PATH: settingsFile,
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+      WORKTODO_NO_UPDATE_CHECK: '1',
+    }, async () => {
+      const { host, dir } = await makeUpdateHost();
+      try {
+        const settings = await getSettings(host);
+        eq(settings.data.updateMode, 'manual', '损坏必须回退 manual：');
+        eq(host.logs.some((line) => line.startsWith('warn') && line.includes('settings.json')), true,
+          `损坏要留下可排查的告警：${JSON.stringify(host.logs)}`);
+        const list = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
+        eq(list.ok, true, '损坏设置不能影响 /list：');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    rmSync(settingsDir, { recursive: true, force: true });
+  }
+});
+
+await test('更新方式 off：零网络请求、面板无「新版本/检查失败」提示；切 off 会中止在飞检查且不再重试', async () => {
+  const requests = [];
+  const pending = new Set();
+  const registry = createServer((_request, response) => {
+    requests.push(Date.now());
+    const timer = setTimeout(() => {
+      pending.delete(timer);
+      try {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ 'dist-tags': { latest: FAKE_NEXT_VERSION }, versions: {} }));
+      } catch { /* 已被 abort */ }
+    }, 150);
+    timer.unref?.();
+    pending.add(timer);
+  });
+  await new Promise((resolve) => registry.listen(0, '127.0.0.1', resolve));
+  registry.unref();
+  const settingsDir = mkdtempSync(join(tmpdir(), 'worktodo-off-'));
+  const settingsFile = join(settingsDir, 'settings.json');
+  writeFileSync(settingsFile, `${JSON.stringify({ updateMode: 'off', updatedAt: new Date().toISOString() })}\n`);
+  try {
+    await withEnv({
+      WORKTODO_SETTINGS_PATH: settingsFile,
+      WORKTODO_UPDATE_STATE_PATH: join(settingsDir, 'update-state.json'),
+      WORKTODO_NO_UPDATE_CHECK: undefined,
+      WORKTODO_UPDATE_LATEST: undefined,
+      WORKTODO_STARTUP_CHECK_DELAY_MS: '0',
+    }, async () => {
+      const { host, dir } = await makeUpdateHost({ updateRegistry: `http://127.0.0.1:${registry.address().port}/` });
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        eq(requests.length, 0, `off：启动检查必须零请求（实际 ${requests.length}）：`);
+        // /list 的轮询也不许打网络
+        const list = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
+        eq(requests.length, 0, 'off：/list 轮询也必须零请求：');
+        eq(list.data.update.updateMode, 'off');
+        eq(list.data.update.hasUpdate, false, 'off：不许报「有新版本」：');
+        eq(list.data.update.latest, null, 'off：不显示新版本号：');
+        eq(list.data.update.checkError, null, 'off：不许报「检查失败」：');
+        eq(list.data.update.run.phase, 'idle', 'off：阶段保持 idle：');
+
+        // 切到 manual：会立刻补一次检查（请求在飞）
+        const toManual = await call(host.routes.get('/worktodo/settings').handler, {
+          method: 'POST', url: '/worktodo/settings', body: { updateMode: 'manual' },
+        });
+        eq(toManual.statusCode, 200);
+        eq(await waitFor(() => requests.length === 1, 2000), true, '切到 manual 后要补一次检查：');
+        // 立刻切回 off：在飞请求被 abort，且绝不再触发第二次
+        const toOff = await call(host.routes.get('/worktodo/settings').handler, {
+          method: 'POST', url: '/worktodo/settings', body: { updateMode: 'off' },
+        });
+        eq(toOff.statusCode, 200);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        eq(requests.length, 1, `切到 off 后不许再发起新的检查（实际 ${requests.length}）：`);
+        const status = (await readUpdateState(host)).json().data;
+        eq(status.updateMode, 'off');
+        eq(status.phase, 'idle', `在飞检查被中止后必须回到 idle（实际 ${status.phase}）：`);
+        eq(status.error, null, '不许把 abort 当成错误：');
+        eq(status.checkError, null);
+        const after = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
+        eq(after.data.update.hasUpdate, false, 'off：面板不能有新版本提示：');
+        eq(after.data.update.run.phase, 'idle');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    for (const timer of pending) clearTimeout(timer);
+    registry.closeAllConnections?.();
+    registry.close();
+    rmSync(settingsDir, { recursive: true, force: true });
+  }
+});
+
+await test('更新方式 manual：有新版本只提示，绝不自动下载/安装（假 pnpm 0 次、暂存区不存在）', async () => {
+  const profile = makeFakeProfile('mode-manual', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const capture = join(selfUpdateRoot, 'capture-mode-manual.txt');
+  const bin = join(selfUpdateRoot, 'bin-mode-manual');
+  writeFakePnpm(bin, { capture, installVersion: FAKE_NEXT_VERSION, installProfile: profile, installOn: 'any' });
+  const settingsDir = mkdtempSync(join(tmpdir(), 'worktodo-manual-'));
+  const settingsFile = join(settingsDir, 'settings.json');
+  writeFileSync(settingsFile, `${JSON.stringify({ updateMode: 'manual', updatedAt: new Date().toISOString() })}\n`);
+  const stageDir = join(settingsDir, 'updates');
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_SETTINGS_PATH: settingsFile,
+      WORKTODO_UPDATE_STATE_PATH: join(settingsDir, 'update-state.json'),
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+    }, async () => {
+      const { host, dir } = await makeUpdateHost();
+      try {
+        const status = await waitForUpdatePhase(host, (state) => state.phase === 'available', 5000);
+        eq(status?.phase, 'available', `manual 只该检查到 available（实际 ${status?.phase}）：`);
+        eq(status?.updateMode, 'manual');
+        eq(status?.to, FAKE_NEXT_VERSION, '面板要拿到新版本号：');
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        eq(invokeCount(capture), 0, `manual 绝不许自动安装（实际 ${invokeCount(capture)} 次）：`);
+        eq(existsSync(stageDir), false, 'manual 绝不许自动下载（暂存区不该出现）：');
+        const list = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
+        eq(list.data.update.hasUpdate, true, 'manual 仍要在面板提示有新版本：');
+        eq(list.data.update.latest, FAKE_NEXT_VERSION);
+        eq(list.data.update.updateMode, 'manual');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    rmSync(settingsDir, { recursive: true, force: true });
+  }
+});
+
+await test('更新方式 auto：自动下载 + 自动安装各一次；装好 restartRequired:true，且绝不自动重启', async () => {
+  const profile = makeFakeProfile('mode-auto', '^0.2.0');
+  seedInstalledVersion(profile, '0.2.0');
+  const capture = join(selfUpdateRoot, 'capture-mode-auto.txt');
+  const bin = join(selfUpdateRoot, 'bin-mode-auto');
+  writeFakePnpm(bin, { capture, installVersion: '9.9.9', installProfile: profile, installOn: 'any' });
+  const tarball = await startTarballServer({ chunks: 2, chunkSize: 512 });
+  const settingsDir = mkdtempSync(join(tmpdir(), 'worktodo-auto-'));
+  const settingsFile = join(settingsDir, 'settings.json');
+  writeFileSync(settingsFile, `${JSON.stringify({ updateMode: 'auto', updatedAt: new Date().toISOString() })}\n`);
+  const stageDir = join(settingsDir, 'updates');
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: '9.9.9',
+      WORKTODO_UPDATE_TARBALL_BASE: tarball.base,
+      WORKTODO_SETTINGS_PATH: settingsFile,
+      WORKTODO_UPDATE_STATE_PATH: join(settingsDir, 'update-state.json'),
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+    }, async () => {
+      const { host, dir } = await makeUpdateHost();
+      try {
+        const settled = await waitForUpdateSettled(host, 8000);
+        eq(settled?.phase, 'installed', `auto 要一路装完（实际 ${settled?.phase}，error=${settled?.error}）：`);
+        eq(settled?.state, 'done');
+        eq(settled?.updateMode, 'auto');
+        eq(settled?.effective, { autoCheck: true, autoInstall: true });
+        eq(settled?.restartRequired, true, '装好必须报 restartRequired:true：');
+        eq(settled?.restart, null, 'auto 也不许自动请求重启（没有插件重启入口）：');
+        eq(tarball.hits, 1, `自动下载必须恰好一次（实际 ${tarball.hits}）：`);
+        eq(invokeCount(capture) >= 1, true, `自动安装必须真的跑（实际 ${invokeCount(capture)}）：`);
+        eq(readInstalledVersionText(profile).includes('9.9.9'), true, '落盘版本必须真的变了：');
+        const list = (await call(host.routes.get('/worktodo/list').handler, { method: 'GET', url: '/worktodo/list' })).json();
+        eq(list.data.update.restartRequired, true, '/list 也要报 restartRequired:true：');
+        eq(list.data.update.installedVersion, '9.9.9');
+        eq(list.data.update.updateMode, 'auto');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    await tarball.close();
+    rmSync(settingsDir, { recursive: true, force: true });
+  }
+});
+
+await test('更新方式 auto + unsupported（link:）：不下载、不安装、零写盘，面板拿到温和原因', async () => {
+  const profile = makeFakeProfile('mode-auto-linked', 'link:/tmp/fake/dsh-worktodo');
+  const before = snapshotTree(profile);
+  const capture = join(selfUpdateRoot, 'capture-mode-auto-linked.txt');
+  const bin = join(selfUpdateRoot, 'bin-mode-auto-linked');
+  writeFakePnpm(bin, { capture, installVersion: '9.9.9', installProfile: profile, installOn: 'any' });
+  const settingsDir = mkdtempSync(join(tmpdir(), 'worktodo-auto-link-'));
+  const settingsFile = join(settingsDir, 'settings.json');
+  const settingsBytes = `${JSON.stringify({ updateMode: 'auto', updatedAt: new Date().toISOString() })}\n`;
+  writeFileSync(settingsFile, settingsBytes);
+  const stageDir = join(settingsDir, 'updates');
+  const statePath = join(settingsDir, 'update-state.json');
+  try {
+    await withEnv({
+      WORKTODO_PROFILE_DIR: profile, PATH: `${bin}:${process.env.PATH}`,
+      WORKTODO_PNPM_PATH: undefined, WORKTODO_UPDATE_LATEST: FAKE_NEXT_VERSION,
+      WORKTODO_SETTINGS_PATH: settingsFile,
+      WORKTODO_UPDATE_STATE_PATH: statePath,
+      WORKTODO_UPDATE_STAGE_DIR: stageDir,
+    }, async () => {
+      const { host, dir } = await makeUpdateHost();
+      try {
+        const status = await waitForUpdatePhase(host, (state) => state.phase === 'unsupported', 5000);
+        eq(status?.phase, 'unsupported', `link: 必须是 unsupported（实际 ${status?.phase}）：`);
+        eq(status?.updateUnsupported, 'link-install');
+        eq(status?.state, 'idle', '不是失败：兼容层 idle：');
+        eq(status?.failure, null);
+        eq(status?.failedOperation, null);
+        eq(status?.updateMode, 'auto', '档位不受影响：');
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        eq(invokeCount(capture), 0, `unsupported 绝不许起安装子进程（实际 ${invokeCount(capture)}）：`);
+        eq(existsSync(stageDir), false, 'unsupported 连暂存区都不建：');
+        eq(existsSync(statePath), false, 'unsupported 必须零写盘（连节流状态都不写）：');
+        eq(snapshotTree(profile), before, 'profile 必须逐字节不变：');
+        eq(readFileSync(settingsFile, 'utf8'), settingsBytes, 'settings.json 也不该被改写：');
+        eq(String(status?.error).includes('git/pnpm'), true, `面板/API 要给温和且可执行的说明：${status?.error}`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    rmSync(settingsDir, { recursive: true, force: true });
   }
 });
 

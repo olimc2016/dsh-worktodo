@@ -235,7 +235,7 @@ await test('能从客户端源码里抽出全部写请求', () => {
   // 去重：`/update` 现在有两个调用点（改待办 + 自升级 `{action:'plugin-update'}`），
   // 但它们是同一个路由；断言的是「路径集合」而不是「调用点个数」。
   const paths = [...new Set(clientPosts.map((p) => p.path))].sort();
-  eq(paths, ['/adopt', '/create', '/remove', '/reorder', '/status', '/update']);
+  eq(paths, ['/adopt', '/create', '/remove', '/reorder', '/settings', '/status', '/update']);
 });
 
 await test('能抽出列表 GET 路径与行内编辑字段', () => {
@@ -343,6 +343,8 @@ const ACCEPTED = {
   '/status': ['ref', 'id', 'status', 'toggle'],
   '/remove': ['ref', 'id'],
   '/adopt': ['todos'],
+  // 更新方式设置：只接受 {updateMode}，非法值 400
+  '/settings': ['updateMode'],
 };
 
 await test('每个请求体字段都在该路由接受范围内（防字段名打错导致的静默失效）', () => {
@@ -552,6 +554,12 @@ await test('客户端发的每个自升级 action，宿主都按「升级」而�
     eq(typeof body?.ok, 'boolean', `${action} 的响应不可识别：${JSON.stringify(body)}`);
     if (/ref|待办/u.test(String(body?.error ?? body?.reason ?? ''))) {
       throw new Error(`${action} 被当成「改待办」处理了：${JSON.stringify(body)}`);
+    }
+    if (action === 'plugin-update-check') {
+      // 「检查更新」没有失败时是成功收口（返回状态），不是「没有前提」的拒绝；
+      // 测试环境用 WORKTODO_NO_UPDATE_CHECK=1 关掉了网络，所以它安全地什么都不做。
+      eq(typeof body?.data?.phase, 'string', `plugin-update-check 必须返回稳定的阶段（实际 ${JSON.stringify(body)}）：`);
+      continue;
     }
     // 没注入 latest、也没下载物：这几条都必须安全地什么都不做
     eq(['no-target', 'not-downloaded', 'restart-unavailable'].includes(body.reason), true,

@@ -213,6 +213,26 @@ const zh = {
   'updateDetailSpawn': '启动错误',
   'updateDetailVersion': '版本',
   'updateDetailLog': '日志尾部',
+  // 更新方式（三档）+ 设置小浮层 + 重启提醒条
+  'updateSettings': '更新设置',
+  'updateSettingsTitle': '更新方式',
+  'updateSettingsHint': '选择插件如何检查与安装新版本；这个设置优先于插件配置。',
+  'updateSettingsCurrentVersion': '当前版本 {version}',
+  'updateModeOff': '禁用更新',
+  'updateModeOffHint': '完全不检查更新，也不发任何网络请求；面板只显示当前版本。',
+  'updateModeManual': '仅提示新版本',
+  'updateModeManualHint': '后台只检查；发现有新版本时由你决定是否下载、安装。',
+  'updateModeAuto': '自动更新',
+  'updateModeAutoHint': '后台自动下载并安装；装好后提示你重启 DSH，不会自动重启。',
+  'updateModeLabel': '更新方式',
+  'updateCheckNow': '检查更新',
+  'updateCheckNowHint': '立即在后台检查一次新版本',
+  'updateCheckDisabledOff': '已禁用更新，不会检查。',
+  'updateSettingsSaving': '保存中…',
+  'updateSettingsFailed': '设置保存失败',
+  'updateRestartBanner': '已更新到 {version}，请重启 DSH 生效',
+  'updateRestartBannerNoVersion': '更新已安装，请重启 DSH 生效',
+  'updateRestartBannerHint': '新版本已经装好但还没生效；DSH 没有向插件提供重启入口，所以不会自动重启。',
   'addOpen': '新增待办',
   'addCancel': '取消',
   'prioNone': '无',
@@ -346,6 +366,26 @@ const en = {
   'updateDetailSpawn': 'spawn error',
   'updateDetailVersion': 'version',
   'updateDetailLog': 'log tail',
+  // Update mode (three options) + settings popover + restart banner
+  'updateSettings': 'Update settings',
+  'updateSettingsTitle': 'Update mode',
+  'updateSettingsHint': 'Choose how the plugin checks for and installs updates. This setting wins over plugin config.',
+  'updateSettingsCurrentVersion': 'Current version {version}',
+  'updateModeOff': 'Updates off',
+  'updateModeOffHint': 'No update checks and no network requests at all; the panel only shows the current version.',
+  'updateModeManual': 'Only notify me',
+  'updateModeManualHint': 'Checks in the background; when a new version exists, you decide whether to download and install it.',
+  'updateModeAuto': 'Auto-update',
+  'updateModeAutoHint': 'Downloads and installs automatically in the background; when done it asks you to restart DSH (it never restarts on its own).',
+  'updateModeLabel': 'Update mode',
+  'updateCheckNow': 'Check for updates',
+  'updateCheckNowHint': 'Run an update check in the background now',
+  'updateCheckDisabledOff': 'Updates are off, so nothing will be checked.',
+  'updateSettingsSaving': 'Saving…',
+  'updateSettingsFailed': "Couldn't save settings",
+  'updateRestartBanner': 'Updated to {version} — restart DSH to apply',
+  'updateRestartBannerNoVersion': 'Update installed — restart DSH to apply',
+  'updateRestartBannerHint': 'The new version is installed but not active yet. DSH exposes no restart entry point to plugins, so it will not restart automatically.',
   'addOpen': 'New todo',
   'addCancel': 'Cancel',
   'prioNone': 'None',
@@ -658,6 +698,48 @@ export const STYLE_TEXT = `
 /* 纯状态（正在更新 / 已装好待重启 / linked）：不是按钮，别给可点的暗示 */
 .wt-update.is-state { cursor: default; }
 .wt-update.is-state:hover { text-decoration: none; }
+/* 更新设置入口 + 小浮层：只用主题变量，不写颜色字面量 */
+.wt-settings-wrap { position: relative; display: inline-flex; align-items: center; }
+.wt-settings-btn { width: 24px; height: 24px; padding: 0; }
+.wt-settings-pop {
+  position: absolute; top: 28px; right: 0; z-index: 20; width: 268px;
+  padding: 10px 11px; border-radius: 10px; text-align: left;
+  border: 1px solid ${C.border}; background: ${C.layer1}; color: ${C.label};
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+  font-size: 11.5px; line-height: 1.55;
+}
+.wt-settings-pop-title { font-weight: 650; font-size: 12px; margin-bottom: 2px; }
+.wt-settings-pop-hint { color: ${C.label3}; margin-bottom: 8px; }
+.wt-settings-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.wt-settings-option {
+  appearance: none; text-align: left; font: inherit; cursor: pointer;
+  display: flex; flex-direction: column; gap: 1px; width: 100%;
+  padding: 6px 8px; border-radius: 8px; color: ${C.label2};
+  border: 1px solid ${C.border1}; background: transparent;
+}
+.wt-settings-option:hover { background: ${C.hover}; color: ${C.label}; }
+.wt-settings-option:focus-visible { outline: 2px solid ${C.brand}; outline-offset: 1px; }
+.wt-settings-option.is-on { border-color: ${tint(C.brand, 55)}; background: ${tint(C.brand, 10)}; color: ${C.label}; }
+.wt-settings-option-label { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.wt-settings-radio {
+  width: 10px; height: 10px; border-radius: 50%; flex: none;
+  border: 1px solid ${C.border}; background: transparent;
+}
+.wt-settings-option.is-on .wt-settings-radio { border-color: ${C.brand}; background: ${C.brand}; }
+.wt-settings-option-hint { color: ${C.label3}; font-size: 10.5px; }
+.wt-settings-foot {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  border-top: 1px solid ${C.border1}; padding-top: 8px; color: ${C.label3};
+}
+.wt-settings-error { color: ${C.error}; margin-top: 6px; }
+/* 重启提醒条：醒目但不打扰（不是错误红），没有假重启按钮 */
+.wt-restart-banner {
+  display: flex; align-items: flex-start; gap: 7px; margin-bottom: 10px;
+  padding: 7px 10px; border-radius: 9px; font-size: 12px; line-height: 1.55;
+  color: ${C.label}; border: 1px solid ${tint(C.ok, 45)}; background: ${tint(C.ok, 10)};
+}
+.wt-restart-banner-mark { flex: none; color: ${C.ok}; font-weight: 700; }
+.wt-restart-banner-text { flex: 1; min-width: 0; word-break: break-word; }
 .wt-title { cursor: pointer; word-break: break-word; }
 .wt-title:hover { text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
 .wt-spin {
@@ -855,6 +937,21 @@ function IconRefresh({ size = 12 }) {
     React.createElement('path', { key: 'b', d: 'M13.4 8a5.4 5.4 0 0 1-9.1 3.9' }),
     React.createElement('path', { key: 'c', d: 'M12.3 1.9v2.6H9.7' }),
     React.createElement('path', { key: 'd', d: 'M3.7 14.1v-2.6h2.6' }),
+  ]);
+}
+
+/** 小齿轮：更新设置入口。纯装饰，可读名由按钮的 aria-label/title 提供。 */
+function IconSettings({ size = 13 }) {
+  return React.createElement('svg', {
+    width: size, height: size, viewBox: '0 0 16 16', fill: 'none',
+    stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round', strokeLinejoin: 'round',
+    'aria-hidden': 'true',
+  }, [
+    React.createElement('circle', { key: 'c', cx: 8, cy: 8, r: 2.1 }),
+    React.createElement('path', {
+      key: 'p',
+      d: 'M8 1.7v1.6M8 12.7v1.6M1.7 8h1.6M12.7 8h1.6M3.55 3.55l1.13 1.13M11.32 11.32l1.13 1.13M12.45 3.55l-1.13 1.13M4.68 11.32l-1.13 1.13',
+    }),
   ]);
 }
 
@@ -2099,6 +2196,37 @@ export function storeLocationLabel(store, t) {
  * @param {(key: string) => string} t 文案函数
  * @returns {{text: string, title: string, tone: 'ok'|'busy'|'warn'|'muted'|'error', action: 'download'|'install'|'restart'|'retry'|'update'|null, disabled: boolean, phase: string|null}|null}
  */
+/**
+ * 三档更新方式的单选项（顺序固定：off → manual → auto）。
+ * 面板与测试共用这一份，避免文案 key 在 JSX 里散落。
+ */
+export const UPDATE_MODE_OPTIONS = Object.freeze([
+  { value: 'off', labelKey: 'updateModeOff', hintKey: 'updateModeOffHint' },
+  { value: 'manual', labelKey: 'updateModeManual', hintKey: 'updateModeManualHint' },
+  { value: 'auto', labelKey: 'updateModeAuto', hintKey: 'updateModeAutoHint' },
+]);
+
+/**
+ * 装好待重启的**顶部提示条**内容（纯函数，导出供单测）。
+ *
+ * 只认 `restartRequired`；`off` 时返回 null（面板在 off 下只显示当前版本）。
+ * 版本号只取「已落盘/已安装」字段，绝不拿 latest 顶替；没有版本号时用无版本的兜底文案。
+ * 不返回任何 action —— 面板**没有**「假重启按钮」（DSH 未给插件重启入口）。
+ * @param {object|null} update /list 载荷里的 update
+ * @param {(key: string) => string} t 文案函数
+ * @returns {{text: string, title: string, version: string|null}|null}
+ */
+export function restartNotice(update, t) {
+  if (!update?.restartRequired) return null;
+  if (update?.updateMode === 'off') return null;
+  const raw = update?.installedVersion ?? update?.installed ?? null;
+  const version = raw ? String(raw) : null;
+  const text = version
+    ? t('updateRestartBanner').replace('{version}', `v${version}`)
+    : t('updateRestartBannerNoVersion');
+  return { text, title: t('updateRestartBannerHint'), version };
+}
+
 export function updateBadgeState(run, update, t) {
   const state = run?.state ?? 'idle';
   const phase = typeof run?.phase === 'string' ? run.phase : null;
@@ -2108,6 +2236,10 @@ export function updateBadgeState(run, update, t) {
   const restartSupported = update?.restartSupported === true || run?.restartSupported === true || run?.restart?.supported === true;
   /** @type {(text: string, title: string, tone: string, action: string|null, disabled: boolean, phase: string|null) => object} */
   const view = (text, title, tone, action, disabled, at) => ({ text, title, tone, action, disabled, phase: at ?? phase });
+
+  // off：面板「只显示当前版本」—— 不显示任何新版本 / 检查失败 / 不适用徽标。
+  // 唯一例外是用户已经点过、正在跑的下载/安装：进度不该被藏掉（那不是「提示」）。
+  if ((update?.updateMode ?? run?.updateMode) === 'off' && !isUpdateBusy(run)) return null;
 
   /* ---- 1. 新的细粒度阶段（DSH 语义） ---- */
   if (phase === 'checking') {
@@ -2375,6 +2507,50 @@ function WorkTodoPanel(props) {
   // 页脚那一格要显示什么、可点做什么：纯函数决定（见 updateBadgeState），
   // 必须在这里算 —— 下面的点击处理要用它的 action 分派，晚于 handleUpdate 会撞 TDZ。
   const updateBadge = updateBadgeState(run, update, t);
+  // 顶部重启提醒条（restartRequired 时才有；off 下不显示，也没有「假重启按钮」）。
+  const restart = restartNotice(update, t);
+
+  /**
+   * 更新方式设置（三档小浮层）。
+   *
+   * `modeOverride` 是本地的乐观值：POST 成功先回显，随后 `refresh()` 用 /list 的
+   * `update.updateMode` 校准；页面刷新后仍然以宿主为准（settings.json 已落盘）。
+   */
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const [modeOverride, setModeOverride] = React.useState(null);
+  const [settingsPending, setSettingsPending] = React.useState(false);
+  const [settingsError, setSettingsError] = React.useState(null);
+  const updateMode = modeOverride ?? update?.updateMode ?? 'manual';
+  const openSettings = React.useCallback(() => {
+    const next = !settingsOpen;
+    setSettingsOpen(next);
+    setSettingsError(null);
+    if (!next) return;
+    // 打开时向宿主确认一次（多标签页/别处改过设置时以宿主为准）。
+    fetch(`${ROUTE_BASE}/settings`, { cache: 'no-store', credentials: 'same-origin' })
+      .then((response) => response.json())
+      .then((parsed) => {
+        const mode = parsed?.ok ? parsed?.data?.updateMode : null;
+        if (mode) setModeOverride(mode);
+      })
+      .catch(() => { /* 读不到就先用 /list 里的值，不打断面板 */ });
+  }, [settingsOpen]);
+  const chooseMode = React.useCallback((next) => {
+    if (next === updateMode || settingsPending) return Promise.resolve(false);
+    setSettingsPending(true);
+    setSettingsError(null);
+    return postJson('/settings', { updateMode: next })
+      .then((data) => {
+        setModeOverride(data?.updateMode ?? next);
+        refresh();
+        return true;
+      })
+      .catch((error) => {
+        setSettingsError(String(error?.message ?? error));
+        return false;
+      })
+      .finally(() => setSettingsPending(false));
+  }, [updateMode, settingsPending, refresh]);
 
   /**
    * 升级进度轮询：**只在「进行中」时存在**（checking/downloading/verifying/installing/restarting，
@@ -2676,8 +2852,104 @@ function WorkTodoPanel(props) {
     { key: 'done', label: t('statDoneToday'), value: num(stats.completedToday) },
   ];
 
+  /**
+   * 头部「更新设置」入口 + 小浮层。
+   *
+   * 无障碍：齿轮是真按钮（title + aria-label 中英随语言）、浮层是 role=dialog、
+   * 三档是 role=radio + aria-checked；全部键盘可达（原生 button），Escape 收起。
+   * 只用文本节点（没有 innerHTML）；没有新增动效（prefers-reduced-motion 无需额外分支）。
+   */
+  const settingsNode = React.createElement('span', {
+    key: 'settings',
+    className: 'wt-settings-wrap',
+  }, [
+    React.createElement('button', {
+      key: 'gear',
+      type: 'button',
+      className: 'wt-icon-btn wt-settings-btn',
+      title: t('updateSettings'),
+      'aria-label': t('updateSettings'),
+      'aria-haspopup': 'dialog',
+      'aria-expanded': settingsOpen,
+      disabled: settingsPending,
+      onClick: openSettings,
+    }, React.createElement(IconSettings, { key: 'i' })),
+    settingsOpen
+      ? React.createElement('div', {
+        key: 'pop',
+        className: 'wt-settings-pop',
+        role: 'dialog',
+        'aria-label': t('updateSettingsTitle'),
+        onKeyDown: (event) => {
+          if (event?.key === 'Escape') {
+            event.preventDefault?.();
+            setSettingsOpen(false);
+          }
+        },
+      }, [
+        React.createElement('div', { key: 't', className: 'wt-settings-pop-title' }, t('updateSettingsTitle')),
+        React.createElement('div', { key: 'h', className: 'wt-settings-pop-hint' }, t('updateSettingsHint')),
+        React.createElement('div', {
+          key: 'g',
+          className: 'wt-settings-group',
+          role: 'radiogroup',
+          'aria-label': t('updateModeLabel'),
+        }, UPDATE_MODE_OPTIONS.map((option) => React.createElement('button', {
+          key: option.value,
+          type: 'button',
+          role: 'radio',
+          'aria-checked': updateMode === option.value,
+          className: `wt-settings-option${updateMode === option.value ? ' is-on' : ''}`,
+          title: t(option.hintKey),
+          disabled: settingsPending,
+          onClick: () => chooseMode(option.value),
+        }, [
+          React.createElement('span', { key: 'l', className: 'wt-settings-option-label' }, [
+            React.createElement('span', { key: 'r', className: 'wt-settings-radio', 'aria-hidden': 'true' }),
+            t(option.labelKey),
+          ]),
+          React.createElement('span', { key: 'h', className: 'wt-settings-option-hint' }, t(option.hintKey)),
+        ]))),
+        React.createElement('div', { key: 'f', className: 'wt-settings-foot' }, [
+          React.createElement('span', { key: 'v', title: t('versionHint') }, t('updateSettingsCurrentVersion')
+            .replace('{version}', version ? `v${version}` : '—')),
+          React.createElement('span', { key: 'sp', style: { flex: 1 } }),
+          React.createElement('button', {
+            key: 'check',
+            type: 'button',
+            className: 'wt-btn',
+            disabled: updateMode === 'off' || busy || updatePending || settingsPending,
+            title: updateMode === 'off' ? t('updateCheckDisabledOff') : t('updateCheckNowHint'),
+            onClick: () => postUpdateAction('plugin-update-check'),
+          }, settingsPending ? t('updateSettingsSaving') : t('updateCheckNow')),
+        ]),
+        updateMode === 'off'
+          ? React.createElement('div', { key: 'off', className: 'wt-settings-pop-hint' }, t('updateCheckDisabledOff'))
+          : null,
+        settingsError
+          ? React.createElement('div', { key: 'err', className: 'wt-settings-error', role: 'alert' },
+            `${t('updateSettingsFailed')}：${settingsError}`)
+          : null,
+      ])
+      : null,
+  ]);
+
   return React.createElement('div', { className: 'wt-root', style: rootStyle }, [
     React.createElement('style', { key: 'css' }, STYLE_TEXT),
+
+    /* 顶部重启提醒：装好待重启时醒目但不打扰；没有假重启按钮 */
+    restart
+      ? React.createElement('div', {
+        key: 'restart',
+        className: 'wt-restart-banner',
+        role: 'status',
+        'aria-live': 'polite',
+        title: restart.title,
+      }, [
+        React.createElement('span', { key: 'm', className: 'wt-restart-banner-mark', 'aria-hidden': 'true' }, '↑'),
+        React.createElement('span', { key: 't', className: 'wt-restart-banner-text' }, restart.text),
+      ])
+      : null,
 
     /* 顶部：标题 + 统计 + 刷新 */
     React.createElement('div', {
@@ -2721,6 +2993,7 @@ function WorkTodoPanel(props) {
         }, t('viewProject')),
       ]),
       React.createElement('span', { key: 'sp', style: { flex: 1 } }),
+      settingsNode,
       React.createElement('button', {
         key: 'rf',
         type: 'button',
