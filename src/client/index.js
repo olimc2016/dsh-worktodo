@@ -698,11 +698,16 @@ export const STYLE_TEXT = `
 /* 纯状态（正在更新 / 已装好待重启 / linked）：不是按钮，别给可点的暗示 */
 .wt-update.is-state { cursor: default; }
 .wt-update.is-state:hover { text-decoration: none; }
-/* 更新设置入口 + 小浮层：只用主题变量，不写颜色字面量 */
-.wt-settings-wrap { position: relative; display: inline-flex; align-items: center; }
-.wt-settings-btn { width: 24px; height: 24px; padding: 0; }
+/* 更新设置入口 + 小浮层：只用主题变量，不写颜色字面量。
+   入口在页脚版本号旁边，所以浮层**向上**弹（bottom 贴入口上沿、left 对齐页脚行），
+   贴底时不会越出面板；刻意不用 top，浮层永远朝面板内部展开。 */
+.wt-settings-wrap { display: inline-flex; align-items: center; }
+.wt-settings-btn { width: 20px; height: 20px; padding: 0; }
+/* 页脚「版本号 + 齿轮」这一行是浮层的定位基准（见 .wt-settings-pop 的 left/bottom） */
+.wt-ver-row { position: relative; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 2px; }
 .wt-settings-pop {
-  position: absolute; top: 28px; right: 0; z-index: 20; width: 268px;
+  position: absolute; bottom: calc(100% + 6px); left: 0; right: auto; z-index: 20;
+  width: 268px; max-width: 100%;
   padding: 10px 11px; border-radius: 10px; text-align: left;
   border: 1px solid ${C.border}; background: ${C.layer1}; color: ${C.label};
   box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
@@ -940,18 +945,33 @@ function IconRefresh({ size = 12 }) {
   ]);
 }
 
-/** 小齿轮：更新设置入口。纯装饰，可读名由按钮的 aria-label/title 提供。 */
-function IconSettings({ size = 13 }) {
+/**
+ * 齿轮轮廓：8 个均匀的梯形齿（齿顶外弧 R6.05、齿根内弧 R4.65），
+ * 每个齿 = 两条直边 + 一段外弧，齿间用一段内弧连起来。逐齿写开，
+ * 保证「均匀」是肉眼与测试都能数出来的（8 × 'A' 外弧 + 8 × 'A' 内弧）。
+ * 用 <path> 描边而不是文字符号（☀/⚙）—— 字形在不同平台/字体下大小与形状不一致。
+ */
+const GEAR_PATH = [
+  'M6.1 2.44 L6.1 1.02 A6.05 6.05 0 0 1 7.9 1.02 L7.9 2.44 A4.65 4.65 0 0 1 9.59 3.14',
+  'L10.59 2.13 A6.05 6.05 0 0 1 11.87 3.41 L10.86 4.41 A4.65 4.65 0 0 1 11.56 6.1',
+  'L12.98 6.1 A6.05 6.05 0 0 1 12.98 7.9 L11.56 7.9 A4.65 4.65 0 0 1 10.86 9.59',
+  'L11.87 10.59 A6.05 6.05 0 0 1 10.59 11.87 L9.59 10.86 A4.65 4.65 0 0 1 7.9 11.56',
+  'L7.9 12.98 A6.05 6.05 0 0 1 6.1 12.98 L6.1 11.56 A4.65 4.65 0 0 1 4.41 10.86',
+  'L3.41 11.87 A6.05 6.05 0 0 1 2.13 10.59 L3.14 9.59 A4.65 4.65 0 0 1 2.44 7.9',
+  'L1.02 7.9 A6.05 6.05 0 0 1 1.02 6.1 L2.44 6.1 A4.65 4.65 0 0 1 3.14 4.41',
+  'L2.13 3.41 A6.05 6.05 0 0 1 3.41 2.13 L4.41 3.14 A4.65 4.65 0 0 1 6.1 2.44 Z',
+].join(' ');
+
+/** 小齿轮（14×14）：齿圈轮廓 + 中心圆孔，纯描边 currentColor。
+ * 纯装饰，可读名由按钮的 aria-label/title 提供。 */
+function IconSettings({ size = 14 }) {
   return React.createElement('svg', {
-    width: size, height: size, viewBox: '0 0 16 16', fill: 'none',
-    stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round', strokeLinejoin: 'round',
-    'aria-hidden': 'true',
+    width: size, height: size, viewBox: '0 0 14 14', fill: 'none',
+    stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round',
+    'aria-hidden': 'true', focusable: 'false',
   }, [
-    React.createElement('circle', { key: 'c', cx: 8, cy: 8, r: 2.1 }),
-    React.createElement('path', {
-      key: 'p',
-      d: 'M8 1.7v1.6M8 12.7v1.6M1.7 8h1.6M12.7 8h1.6M3.55 3.55l1.13 1.13M11.32 11.32l1.13 1.13M12.45 3.55l-1.13 1.13M4.68 11.32l-1.13 1.13',
-    }),
+    React.createElement('path', { key: 'gear', d: GEAR_PATH }),
+    React.createElement('circle', { key: 'hole', cx: 7, cy: 7, r: 1.7 }),
   ]);
 }
 
@@ -2520,6 +2540,7 @@ function WorkTodoPanel(props) {
   const [modeOverride, setModeOverride] = React.useState(null);
   const [settingsPending, setSettingsPending] = React.useState(false);
   const [settingsError, setSettingsError] = React.useState(null);
+  const settingsWrapRef = React.useRef(null);
   const updateMode = modeOverride ?? update?.updateMode ?? 'manual';
   const openSettings = React.useCallback(() => {
     const next = !settingsOpen;
@@ -2551,6 +2572,22 @@ function WorkTodoPanel(props) {
       })
       .finally(() => setSettingsPending(false));
   }, [updateMode, settingsPending, refresh]);
+
+  /**
+   * 点击浮层外部收起浮层（入口在页脚，浮层向上弹，点面板别处/面板外都要关）。
+   * 监听只在这档打开时存在，关掉立刻移除 —— 不在面板常驻 document 监听。
+   * Escape 走浮层容器（.wt-settings-wrap）的 onKeyDown：焦点还在齿轮上时也收得到。
+   */
+  React.useEffect(() => {
+    if (!settingsOpen) return undefined;
+    const onPointerDown = (event) => {
+      const wrap = settingsWrapRef.current;
+      if (wrap && typeof wrap.contains === 'function' && event?.target && wrap.contains(event.target)) return;
+      setSettingsOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [settingsOpen]);
 
   /**
    * 升级进度轮询：**只在「进行中」时存在**（checking/downloading/verifying/installing/restarting，
@@ -2853,15 +2890,25 @@ function WorkTodoPanel(props) {
   ];
 
   /**
-   * 头部「更新设置」入口 + 小浮层。
+   * 页脚「更新设置」入口（版本号右侧的齿轮）+ 向上弹的小浮层。
    *
+   * 位置：页脚「版本 vX」那一行的版本号右侧，同一行、间距 6px、垂直居中；
+   * 行为与版本信息放在一起（设置本来就属于「这一版怎么更新」，不占头部主区）。
    * 无障碍：齿轮是真按钮（title + aria-label 中英随语言）、浮层是 role=dialog、
-   * 三档是 role=radio + aria-checked；全部键盘可达（原生 button），Escape 收起。
+   * 三档是 role=radio + aria-checked；全部键盘可达（原生 button），Escape 收起
+   *（keydown 挂在整个入口容器上，所以焦点还在齿轮时也能关）。
    * 只用文本节点（没有 innerHTML）；没有新增动效（prefers-reduced-motion 无需额外分支）。
    */
   const settingsNode = React.createElement('span', {
     key: 'settings',
     className: 'wt-settings-wrap',
+    ref: settingsWrapRef,
+    onKeyDown: (event) => {
+      if (event?.key === 'Escape' && settingsOpen) {
+        event.preventDefault?.();
+        setSettingsOpen(false);
+      }
+    },
   }, [
     React.createElement('button', {
       key: 'gear',
@@ -2880,12 +2927,6 @@ function WorkTodoPanel(props) {
         className: 'wt-settings-pop',
         role: 'dialog',
         'aria-label': t('updateSettingsTitle'),
-        onKeyDown: (event) => {
-          if (event?.key === 'Escape') {
-            event.preventDefault?.();
-            setSettingsOpen(false);
-          }
-        },
       }, [
         React.createElement('div', { key: 't', className: 'wt-settings-pop-title' }, t('updateSettingsTitle')),
         React.createElement('div', { key: 'h', className: 'wt-settings-pop-hint' }, t('updateSettingsHint')),
@@ -2951,9 +2992,10 @@ function WorkTodoPanel(props) {
       ])
       : null,
 
-    /* 顶部：标题 + 统计 + 刷新 */
+    /* 顶部：标题 + 统计 + 刷新（更新设置入口已移到页脚版本号旁边） */
     React.createElement('div', {
       key: 'head',
+      className: 'wt-head',
       style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 10 },
     }, [
       React.createElement('div', { key: 'ti', style: { fontWeight: 700, fontSize: 15 } }, t('title')),
@@ -2993,7 +3035,6 @@ function WorkTodoPanel(props) {
         }, t('viewProject')),
       ]),
       React.createElement('span', { key: 'sp', style: { flex: 1 } }),
-      settingsNode,
       React.createElement('button', {
         key: 'rf',
         type: 'button',
@@ -3101,18 +3142,21 @@ function WorkTodoPanel(props) {
     /* 底部：数据到底存在哪（排查「我的待办不见了」时第一眼要看的东西） */
     React.createElement('div', {
       key: 'foot',
+      className: 'wt-foot',
       style: { marginTop: 14, paddingTop: 8, borderTop: `1px solid ${C.border1}`, fontSize: 10.5, color: C.label3, lineHeight: 1.7 },
     }, [
-      /* 角落信息：装了哪一版 + 有没有新版（一眼可见，不占主区） */
+      /* 角落信息：装了哪一版 + 更新设置齿轮 + 有没有新版（一眼可见，不占主区）。
+         齿轮紧挨版本号右侧（同一行、gap 6px、垂直居中）：设置是「这一版怎么更新」的一部分。 */
       React.createElement('div', {
         key: 'ver',
-        style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 2 },
+        className: 'wt-ver-row',
       }, [
         React.createElement('span', {
           key: 'v',
           title: t('versionHint'),
           style: { color: C.label3 },
         }, `${t('versionLabel')} ${version ? `v${version}` : '—'}`),
+        settingsNode,
         updateBadge
           ? (updateBadge.action
             /* 只有真的能做点什么时才渲染 <button>；纯状态（下载中/安装中/已装好待重启/失败但不可重试）

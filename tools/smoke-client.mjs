@@ -90,6 +90,26 @@ function textOf(node) {
   return node === null || node === undefined ? '' : String(node);
 }
 
+/**
+ * 取一个替身节点的**直接子元素**。
+ *
+ * stub 的 createElement 把 `createElement(type, props, [children])` 的数组参数原样存进
+ * `children`，所以渲染后的 children 常是 `[[...]]` 两层；这里只摊平数组，不跨进子节点，
+ * 这样「版本号 + 齿轮是不是同一行的相邻兄弟」才量得准。
+ */
+function directChildren(node) {
+  const out = [];
+  const walk = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item);
+      return;
+    }
+    if (value && typeof value === 'object') out.push(value);
+  };
+  walk(node?.children);
+  return out;
+}
+
 /* ------------------------------------------------------------------ *
  * 模拟外壳：window.__ModuleLoader__ + 基座模块表
  * ------------------------------------------------------------------ */
@@ -1518,7 +1538,86 @@ test('更新方式：off 不渲染任何更新徽标；restartRequired 的顶部
   }
 });
 
-await testAsync('更新设置：头部齿轮（title/aria）→ 浮层三档 radio（aria-checked）+ 当前版本 + 检查按钮；off 时检查禁用', async () => {
+await testAsync('更新设置入口在页脚版本号右侧（同一行、紧邻），顶部不再有设置入口', async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const t = (key) => key;
+  const tree = renderPanel({ t });
+  const nodes = flattenTree(tree);
+  const head = nodes.find((n) => String(n.props?.className ?? '') === 'wt-head');
+  const foot = nodes.find((n) => String(n.props?.className ?? '') === 'wt-foot');
+  eq(Boolean(head), true, '面板必须有顶部容器（用来反向断言设置不在顶部）：');
+  eq(Boolean(foot), true, '面板必须有页脚容器：');
+
+  // 1) 顶部绝不能有设置入口（挪回去这条必须红）
+  const headHasGear = flattenTree(head).some((n) => String(n.props?.className ?? '').includes('wt-settings-btn'));
+  eq(headHasGear, false, '顶部不能再放更新设置入口：');
+
+  // 2) 页脚是面板最后一个区域（视觉上就在底部）
+  // 2) 页脚是面板最后一个区域（视觉上就在底部）。错误边界外面可能包一层 Fragment，
+  //    所以定位真正的 .wt-root 再看它的直接子区域。
+  const root = nodes.find((n) => String(n.props?.className ?? '').includes('wt-root'));
+  eq(Boolean(root), true, '必须能找到面板根节点：');
+  const siblings = directChildren(root);
+  eq(siblings.includes(foot), true, '页脚必须是面板的直接子区域：');
+  const afterFoot = siblings.slice(siblings.indexOf(foot) + 1);
+  eq(afterFoot.map((n) => n.props?.className ?? n.type), [], '页脚必须是面板最后一个区域（设置入口随页脚贴底）：');
+
+  // 3) 版本号与齿轮在同一行、紧邻（齿轮在版本号右侧）
+  const row = flattenTree(foot).find((n) => String(n.props?.className ?? '').includes('wt-ver-row'));
+  eq(Boolean(row), true, '页脚必须有「版本号 + 齿轮」这一行：');
+  const rowChildren = directChildren(row);
+  const versionIndex = rowChildren.findIndex((child) => textOf(child).includes('versionLabel'));
+  const gearIndex = rowChildren.findIndex((child) => flattenTree(child)
+    .some((n) => String(n.props?.className ?? '').includes('wt-settings-btn')));
+  eq(versionIndex >= 0, true, `版本号必须在页脚这一行里：${rowChildren.map(textOf).join('|')}`);
+  eq(gearIndex, versionIndex + 1, '齿轮必须紧挨版本号右侧（同一容器、相邻）：');
+
+  // 4) 间距 6–8px、垂直居中、muted→hover 变亮（样式表原文断言，不靠肉眼）
+  const rowRule = /\.wt-ver-row\s*\{([^}]*)\}/.exec(code)?.[1] ?? '';
+  const gap = Number(/gap:\s*([0-9.]+)px/.exec(rowRule)?.[1]);
+  eq(Number.isFinite(gap) && gap >= 6 && gap <= 8, true, `版本号与齿轮间距必须 6–8px：${rowRule}`);
+  eq(/align-items:\s*center/.test(rowRule), true, '齿轮与版本号必须垂直居中对齐：');
+  const gear = nodes.find((n) => String(n.props?.className ?? '').includes('wt-settings-btn'));
+  eq(String(gear.props.className).includes('wt-icon-btn'), true, '齿轮沿用 muted 图标按钮样式（hover 变亮）：');
+});
+
+await testAsync('更新设置图标是 SVG 齿轮（齿圈 + 中心圆孔），不是 ☀/⚙ 文字符号', async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const nodes = flattenTree(renderPanel({ t: (key) => key }));
+  const gear = nodes.find((n) => String(n.props?.className ?? '').includes('wt-settings-btn'));
+  eq(Boolean(gear), true, '必须能找到设置入口：');
+
+  const inside = flattenTree(gear);
+  const svg = inside.find((n) => n.type === 'svg');
+  eq(Boolean(svg), true, '图标必须是 <svg>（改用文字符号这条必须红）：');
+  eq(svg.props.width, 14, '图标 14×14：');
+  eq(svg.props.height, 14, '图标 14×14：');
+  eq(svg.props.viewBox, '0 0 14 14', 'viewBox 14×14：');
+  eq(svg.props.fill, 'none', '纯描边：');
+  eq(svg.props.stroke, 'currentColor', '跟文字颜色：');
+  eq(Number(svg.props.strokeWidth) >= 1.4 && Number(svg.props.strokeWidth) <= 1.6, true,
+    `stroke-width 约 1.5：${svg.props.strokeWidth}`);
+  eq(svg.props['aria-hidden'], 'true', '装饰性图标 aria-hidden：');
+
+  const path = inside.find((n) => n.type === 'path');
+  eq(Boolean(path), true, '齿轮轮廓要用 <path>：');
+  const circle = inside.find((n) => n.type === 'circle');
+  eq(Boolean(circle), true, '中心圆孔要用 <circle>：');
+  eq(Number(circle.props.r) > 0, true, '中心孔半径必须 > 0：');
+
+  // 8 个均匀梯形齿 = 8 段齿顶外弧（R6.05）+ 8 段齿间内弧（R4.65）
+  const outerArcs = (String(path.props.d).match(/A6\.05 6\.05/g) ?? []).length;
+  const rootArcs = (String(path.props.d).match(/A4\.65 4\.65/g) ?? []).length;
+  eq(outerArcs >= 6 && outerArcs <= 8, true, `必须有 6–8 个齿（实际外弧 ${outerArcs} 段）：`);
+  eq(rootArcs, outerArcs, '每个齿之间要有内弧连接（齿数一致）：');
+
+  // 3) 绝不能是字体字形：按钮内没有任何文字节点，也不出现 ☀/☼/⚙ 等符号
+  const looseText = inside.filter((n) => typeof n === 'string');
+  eq(looseText, [], `图标里不能有文字节点：${JSON.stringify(looseText)}`);
+  eq(/[☀☼⚙]/.test(textOf(gear)), false, '图标里不能出现 ☀/⚙ 文字符号：');
+});
+
+await testAsync('更新设置：点页脚齿轮开三档浮层，Escape/点外部可关，aria-checked 正确；off 时检查禁用', async () => {
   const t = (key) => key;
   const previous = fakeListPayload.data.update;
   fakeListPayload.data.update = {
@@ -1529,11 +1628,12 @@ await testAsync('更新设置：头部齿轮（title/aria）→ 浮层三档 rad
     await withStableHooksAsync(async () => {
       let nodes = flattenTree(renderPanel({ t }));
       const gear = nodes.find((n) => String(n.props?.className ?? '').includes('wt-settings-btn'));
-      eq(Boolean(gear), true, '头部必须有更新设置入口（齿轮）：');
+      eq(Boolean(gear), true, '页脚必须有更新设置入口（齿轮）：');
       eq(gear.type, 'button', '齿轮必须是真按钮（键盘可达）：');
       eq(gear.props.title, 'updateSettings', '齿轮要有 title（中英由 t 提供）：');
       eq(gear.props['aria-label'], 'updateSettings', '齿轮要有 aria-label：');
       eq(gear.props['aria-haspopup'], 'dialog');
+      eq(gear.props['aria-expanded'], false, '关着时 aria-expanded=false：');
 
       gear.props.onClick();
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1541,6 +1641,9 @@ await testAsync('更新设置：头部齿轮（title/aria）→ 浮层三档 rad
       const dialog = nodes.find((n) => n.props?.role === 'dialog');
       eq(Boolean(dialog), true, '点齿轮要打开设置浮层：');
       eq(dialog.props['aria-label'], 'updateSettingsTitle');
+      // 浮层挂在齿轮同一个容器里（向上弹），不是挂到页面别处
+      const wrap = nodes.find((n) => String(n.props?.className ?? '').includes('wt-settings-wrap'));
+      eq(flattenTree(wrap).includes(dialog), true, '浮层必须挂在齿轮容器内（向上弹的定位基准）：');
       const group = nodes.find((n) => n.props?.role === 'radiogroup');
       eq(Boolean(group), true, '三档必须在 radiogroup 里：');
       const radios = nodes.filter((n) => n.props?.role === 'radio');
@@ -1551,9 +1654,32 @@ await testAsync('更新设置：头部齿轮（title/aria）→ 浮层三档 rad
       eq(Boolean(check), true, '浮层里必须有「检查更新」按钮：');
       eq(check.props.disabled, false, 'manual 时检查按钮可用：');
       eq(nodes.some((node) => node.props?.dangerouslySetInnerHTML), false, '浮层只用文本节点，没有 innerHTML：');
+      eq(/\.wt-settings-pop\s*\{[^}]*bottom:/.test(code), true, '浮层必须向上弹（用 bottom 定位）：');
+      eq(/\.wt-settings-pop\s*\{[^}]*\btop:/.test(code), false, '浮层不能再用 top 向下弹：');
+
+      // Escape：焦点还在齿轮上（keydown 落在入口容器）也必须能关
+      const wrapOpen = nodes.find((n) => String(n.props?.className ?? '').includes('wt-settings-wrap'));
+      wrapOpen.props.onKeyDown({ key: 'Escape', preventDefault() {} });
+      nodes = flattenTree(renderPanel({ t }));
+      eq(nodes.some((n) => n.props?.role === 'dialog'), false, 'Escape 必须关掉浮层：');
+
+      // 再打开：点外部也要关
+      nodes.find((n) => String(n.props?.className ?? '').includes('wt-settings-btn')).props.onClick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      eq(flattenTree(renderPanel({ t })).some((n) => n.props?.role === 'dialog'), true, '再次点击齿轮要能重新打开：');
+      const outside = [...(documentListeners.get('mousedown') ?? [])].pop();
+      eq(typeof outside, 'function', '打开时必须注册「点击外部关闭」监听：');
+      outside({ target: {} });
+      nodes = flattenTree(renderPanel({ t }));
+      eq(nodes.some((n) => n.props?.role === 'dialog'), false, '点击浮层外部必须关掉浮层：');
 
       // 选 off：POST /settings 成功后检查按钮必须禁用，off 档被选中。
-      await radios[0].props.onClick();
+      nodes.find((n) => String(n.props?.className ?? '').includes('wt-settings-btn')).props.onClick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      nodes = flattenTree(renderPanel({ t }));
+      const radiosOpen = nodes.filter((node) => node.props?.role === 'radio');
+      eq(radiosOpen.map((node) => node.props['aria-checked']), [false, true, false], '重新打开后仍是 manual：');
+      await radiosOpen[0].props.onClick();
       await new Promise((resolve) => setTimeout(resolve, 0));
       nodes = flattenTree(renderPanel({ t }));
       const afterOff = nodes.filter((node) => node.props?.role === 'radio');
