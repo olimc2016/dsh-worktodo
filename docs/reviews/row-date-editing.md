@@ -11,7 +11,7 @@ Node：`~/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node`；�
 ### 1.1 有日期的行
 
 - 行内「日期」从纯文本 `<span>` 换成原生 `<button type="button">`，视觉仍是原来的 11px 小字
-  （逾期仍用 warn 色，且前缀仍是「逾期」）。
+  （已过期仍用 warn 色，且前缀仍是「已过期」）。
 - 日期旁边**显示该行的 `dueTime`**（旧实现只显示日期）；日期与时间一起点。
 - hover 反馈：淡品牌色底 + 下划线；`cursor: pointer`；键盘 focus 有 2px focus ring。
 - 无障碍：`aria-label="修改日期"` / `"Edit date"`（随语言），`aria-haspopup="dialog"`、

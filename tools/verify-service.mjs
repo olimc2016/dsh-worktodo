@@ -178,7 +178,7 @@ console.log('列表与统计');
 
 await test('统计基于全部记录，不随筛选变化', async () => {
   const s = makeService();
-  await s.create({ title: '逾期', due: '2026-10-10' });
+  await s.create({ title: '已过期', due: '2026-10-10' });
   await s.create({ title: '今天', due: 'today' });
   await s.create({ title: '以后', due: '2026-11-01' });
   const done = await s.create({ title: '做完的' });
@@ -211,11 +211,11 @@ await test('按项目与关键词过滤，并给出项目清单', async () => {
 
 await test('分组结果与筛选结果同时可用（面板一次请求拿全）', async () => {
   const s = makeService();
-  await s.create({ title: '逾期', due: '2026-10-10' });
+  await s.create({ title: '已过期', due: '2026-10-10' });
   await s.create({ title: '今天', due: 'today' });
   await s.create({ title: '无期' });
   const view = await s.list({ filter: 'open' });
-  eq(view.groups.overdue.map((t) => t.title), ['逾期']);
+  eq(view.groups.overdue.map((t) => t.title), ['已过期']);
   eq(view.groups.today.map((t) => t.title), ['今天']);
   eq(view.groups.later.map((t) => t.title), ['无期']);
   eq(view.today, '2026-10-14');

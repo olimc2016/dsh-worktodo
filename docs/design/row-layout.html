@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="zh" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh-worktodo · 待办行排版四方案（静态 mockup）</title>
+<style>
+  /* ------------------------------------------------------------------ *
+   * 视觉语言与面板一致：13px 正文字号、11px 小字、10.5px 胶囊、
+   * 8/10/14px 圆角、品牌蓝 + 语义色，深浅两套变量。
+   * ------------------------------------------------------------------ */
+  :root{
+    color-scheme: light;
+    --bg:#ffffff; --page:#f6f7f9;
+    --label:#1b1c1f; --label2:#55575d; --label3:#8a8d94;
+    --border:#d5d7dc; --border1:#e6e7ea;
+    --hover:rgba(20,24,32,.055);
+    --brand:#2f6fed; --warn:#d98a00; --error:#d93b3b; --ok:#1a9e63;
+    --shadow:0 1px 2px rgba(0,0,0,.05);
+    --f:-apple-system,"SF Pro Text","PingFang SC","Helvetica Neue",system-ui,sans-serif;
+  }
+  html[data-theme="dark"]{
+    color-scheme: dark;
+    --bg:#1b1c1f; --page:#131417;
+    --label:#e7e8eb; --label2:#a9acb3; --label3:#7e828b;
+    --border:#3a3d43; --border1:#2c2f34;
+    --hover:rgba(255,255,255,.065);
+    --brand:#6f9dff; --warn:#e0a33a; --error:#f07373; --ok:#3ecf8e;
+    --shadow:0 1px 2px rgba(0,0,0,.3);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--page);color:var(--label);font-family:var(--f);font-size:13px;line-height:1.6;-webkit-font-smoothing:antialiased}
+  button{font-family:inherit}
+
+  /* 顶栏 ---------------------------------------------------------------- */
+  .top{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+       padding:9px 26px;background:color-mix(in srgb,var(--page) 88%,transparent);
+       backdrop-filter:blur(10px);border-bottom:1px solid var(--border1)}
+  .top h1{margin:0;font-size:14.5px;font-weight:650;letter-spacing:.01em}
+  .top .crumb{color:var(--label3);font-size:11.5px}
+  .spacer{flex:1}
+  .theme{display:inline-flex;align-items:center;gap:2px;padding:2px;border:1px solid var(--border1);border-radius:9px;background:var(--bg)}
+  .theme button{appearance:none;border:0;background:transparent;color:var(--label2);font-size:11.5px;padding:4px 10px;border-radius:7px;cursor:pointer}
+  .theme button.is-on{background:var(--hover);color:var(--label);font-weight:600}
+  .theme button:focus-visible{outline:2px solid var(--brand);outline-offset:1px}
+
+  .wrap{max-width:1480px;margin:0 auto;padding:22px 26px 90px}
+  .intro{max-width:1000px}
+  .intro h2{font-size:18px;margin:0 0 6px;letter-spacing:.01em}
+  .intro p{margin:0 0 7px;color:var(--label2);font-size:12.5px}
+  .intro .en{color:var(--label3);font-size:11.8px}
+  .intro code{font-size:11.5px;padding:1px 5px;border-radius:5px;background:var(--hover);color:var(--label2)}
+
+  .reco{display:flex;gap:10px;align-items:flex-start;margin:14px 0 4px;padding:10px 12px;max-width:1000px;
+        border-radius:10px;font-size:12.5px;color:var(--label);
+        background:color-mix(in srgb,var(--brand) 8%,transparent);
+        border:1px solid color-mix(in srgb,var(--brand) 28%,transparent)}
+  .reco .k{flex:none;font-size:11px;font-weight:650;color:var(--brand);border:1px solid color-mix(in srgb,var(--brand) 40%,transparent);
+           border-radius:6px;padding:1px 7px;margin-top:1px;white-space:nowrap}
+  .reco .en{display:block;color:var(--label3);font-size:11.5px;margin-top:2px}
+
+  .legend{display:flex;flex-wrap:wrap;gap:5px 14px;margin:14px 0 2px;font-size:11.5px;color:var(--label3);max-width:1100px}
+  .legend b{color:var(--label2);font-weight:600}
+
+  /* 方案 ---------------------------------------------------------------- */
+  .scheme{margin-top:32px;padding-top:20px;border-top:1px solid var(--border1)}
+  .scheme-head{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .scheme-badge{flex:none;display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;margin-top:1px;
+                border-radius:8px;font-weight:700;font-size:13px;
+                background:color-mix(in srgb,var(--brand) 12%,transparent);color:var(--brand)}
+  .scheme-head h2{font-size:15px;margin:0;font-weight:650}
+  .scheme-sub{color:var(--label3);font-size:11.8px}
+  .scheme-tag{margin-left:auto;margin-top:2px;font-size:11px;padding:2px 9px;border-radius:999px;
+              border:1px solid var(--border1);color:var(--label2);white-space:nowrap}
+  .scheme-tag.rec{border-color:color-mix(in srgb,var(--ok) 45%,transparent);color:var(--ok);
+                  background:color-mix(in srgb,var(--ok) 10%,transparent)}
+
+  .frames{display:flex;gap:16px;align-items:flex-start;overflow-x:auto;padding:2px 2px 8px;scrollbar-width:thin}
+  .frame{flex:none}
+  .frame-tag{font-size:11px;color:var(--label3);margin:0 0 5px 3px;letter-spacing:.02em}
+
+  .panel{background:var(--bg);border:1px solid var(--border1);border-radius:14px;padding:10px;box-shadow:var(--shadow)}
+  .panel-head{display:flex;align-items:center;gap:8px;padding:2px 6px 5px}
+  .panel-title{font-weight:650;font-size:13.5px}
+  .panel-count{font-size:11px;color:var(--label3)}
+  .group-head{display:flex;align-items:center;gap:7px;padding:3px 8px;border-radius:8px;
+              color:var(--label2);font-size:12px;font-weight:600;margin-bottom:1px}
+  .gcount{font-weight:400;font-size:11px;color:var(--label3)}
+
+  .row-label{font-size:9.5px;line-height:1.4;letter-spacing:.03em;color:var(--label3);opacity:.85;
+             padding:6px 8px 1px;user-select:none}
+
+  /* 行的公共部分 -------------------------------------------------------- */
+  .row{position:relative;border-radius:10px;transition:background .12s ease}
+  .row:hover,.row.is-hover{background:var(--hover)}
+  .row.p-high{border-left:2px solid var(--error)}
+
+  .title{appearance:none;border:0;margin:0;padding:0;background:transparent;color:var(--label);
+         font:inherit;font-size:13px;line-height:1.6;text-align:left;cursor:text;word-break:break-word}
+  .title:hover{text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px}
+  .row.is-hover .title{text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px}
+  .row.is-done .title{color:var(--label3);text-decoration:line-through;text-decoration-thickness:1px}
+  .row.is-done .title:hover,.row.is-done.is-hover .title{text-decoration:line-through;text-decoration-style:solid}
+  .row.is-done .meta,.row.is-done .end{opacity:.85}
+
+  .check{position:relative;flex:none;display:inline-flex;align-items:center;justify-content:center;
+         width:26px;height:26px;padding:0;border-radius:8px;border:1px solid var(--border);
+         background:transparent;color:transparent;cursor:pointer;
+         transition:border-color .12s,background .12s,color .12s}
+  /* 可点区域 40×40：伪元素向外扩 7px，不占布局（与面板里的 .wt-check 同款） */
+  .check::before{content:'';position:absolute;inset:-7px;border-radius:12px}
+  .check:hover{border-color:var(--brand)}
+  .check:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+  .check .tick{opacity:0;transition:opacity .12s}
+  .check.done{border-color:color-mix(in srgb,var(--ok) 55%,transparent);
+              background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+  .check.done .tick{opacity:1}
+
+  .flag{appearance:none;flex:none;display:inline-flex;align-items:center;justify-content:center;
+        width:22px;height:22px;padding:0;border:1px solid transparent;border-radius:6px;
+        background:transparent;cursor:pointer;transition:opacity .12s,background .12s}
+  .flag:hover{background:var(--hover)}
+  .flag.ghost{opacity:0;pointer-events:none}
+  .row:hover .flag.ghost,.row.is-hover .flag.ghost{opacity:1;pointer-events:auto}
+  .flag:focus-visible{outline:2px solid var(--brand);outline-offset:1px}
+
+  .date-btn{appearance:none;display:inline-flex;align-items:baseline;gap:4px;font:inherit;font-size:11px;
+            line-height:1.7;padding:0 4px;margin:0;border:1px solid transparent;border-radius:6px;
+            background:transparent;color:var(--label3);white-space:nowrap;cursor:pointer;
+            transition:background .12s,color .12s}
+  .date-btn.warn{color:var(--warn)}
+  .row:hover .date-btn,.row.is-hover .date-btn{color:var(--label2)}
+  .date-btn:hover,.date-btn.emph{background:color-mix(in srgb,var(--brand) 10%,transparent);
+                                 text-decoration:underline;text-underline-offset:2px;color:var(--label2)}
+  .date-btn.warn:hover,.date-btn.warn.emph{color:var(--warn)}
+
+  .proj{appearance:none;display:inline-flex;align-items:center;font:inherit;font-size:10.5px;line-height:1.6;
+        padding:0 6px;border-radius:999px;border:1px solid var(--border1);background:transparent;
+        color:var(--label3);white-space:nowrap;cursor:pointer;transition:background .12s,color .12s,border-color .12s}
+  .row:hover .proj,.row.is-hover .proj{color:var(--label2);border-color:var(--border)}
+  .proj:hover,.proj.emph{background:color-mix(in srgb,var(--brand) 10%,transparent);color:var(--label)}
+
+  /* 无日期 / 无项目：常驻占位但透明，hover 行时淡出「＋ 日期」「＋ 项目」 */
+  .add-slot{display:inline-flex;align-items:center;font-size:10.5px;line-height:1.6;padding:0 6px;
+            border-radius:999px;border:1px dashed var(--border1);color:var(--label3);white-space:nowrap;
+            opacity:0;pointer-events:none;transition:opacity .12s}
+  .add-slot.date-add{padding:0 5px;border-radius:6px}
+  .row:hover .add-slot,.row.is-hover .add-slot{opacity:.75}
+
+  .ico{appearance:none;flex:none;display:inline-flex;align-items:center;justify-content:center;
+       width:22px;height:22px;padding:0;border:0;border-radius:6px;background:transparent;
+       color:var(--label3);cursor:pointer;transition:background .12s,color .12s}
+  .ico:hover{background:var(--hover);color:var(--label)}
+  .ico.danger:hover{color:var(--error);background:color-mix(in srgb,var(--error) 10%,transparent)}
+
+  /* A：现状 —— 两行，勾选框顶对齐，小字缩进在标题下方 ------------------ */
+  .a-row{display:flex;align-items:flex-start;gap:8px;padding:5px 8px;min-height:44px}
+  .a-row .check{margin-top:-3px}
+  .a-row .main{flex:1;min-width:0}
+  .a-row .title{display:block;width:100%}
+  .a-row .meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:2px}
+
+  /* B：单行 —— 固定 44px，勾选框垂直居中，小字钉在行末 ------------------ */
+  .b-row{display:flex;align-items:center;gap:8px;height:44px;padding:0 8px}
+  .b-row .title{flex:1 1 auto;min-width:0;display:block;overflow:hidden;
+                white-space:nowrap;text-overflow:ellipsis}
+  .b-row .end{display:flex;align-items:center;gap:6px;flex:none}
+
+  /* C：单行 + 窄屏自适应 —— 换行时小字落到第二行、与标题左对齐 -------- */
+  .c-row{display:grid;grid-template-columns:26px minmax(0,1fr) auto auto;
+         grid-template-areas:"ch ti fl end";align-items:center;column-gap:6px;
+         min-height:44px;padding:5px 8px}
+  .c-row .check{grid-area:ch}
+  .c-row .title{grid-area:ti;display:block;min-width:0;overflow:hidden;
+                white-space:nowrap;text-overflow:ellipsis}
+  .c-row .flagcell{grid-area:fl;display:inline-flex;align-items:center}
+  .c-row .end{grid-area:end;display:flex;align-items:center;gap:6px;justify-content:flex-end}
+  .c-row.is-wrapped{grid-template-columns:26px minmax(0,1fr) auto;
+                    grid-template-areas:"ch ti fl" ". end end";row-gap:3px;padding-top:6px;padding-bottom:6px}
+  .c-row.is-wrapped .title{overflow:visible;white-space:normal;text-overflow:clip}
+  .c-row.is-wrapped .end{justify-content:flex-start}
+
+  /* D：两行保守版 —— 仍是两行，勾选框相对整行居中，小字与标题左对齐 ---- */
+  .d-row{display:flex;align-items:center;gap:8px;padding:5px 8px;min-height:44px}
+  .d-row .main{flex:1;min-width:0}
+  .d-row .title{display:block;width:100%}
+  .d-row .meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:1px;
+               /* 抵掉日期按钮的 4px 内边距 + 1px 边框，让小字字形与标题字形左对齐 */
+               margin-left:-5px}
+
+  /* 优缺点 -------------------------------------------------------------- */
+  .verdict{display:flex;gap:10px;align-items:flex-start;max-width:1000px;margin:13px 0 0;
+           padding:10px 12px;border:1px solid var(--border1);border-radius:10px;background:var(--bg)}
+  .verdict .k{flex:none;font-size:10.5px;font-weight:650;color:var(--label2);
+              border:1px solid var(--border1);border-radius:6px;padding:1px 7px;margin-top:2px;white-space:nowrap}
+  .verdict p{margin:0;font-size:12px;color:var(--label2)}
+  .verdict p b{color:var(--label);font-weight:600}
+  .verdict .en{display:block;color:var(--label3);font-size:11.5px;margin-top:3px}
+
+  .foot{max-width:1000px;margin:38px 0 0;padding-top:14px;border-top:1px solid var(--border1);
+        color:var(--label3);font-size:11.5px}
+  .foot code{font-size:11px;padding:1px 5px;border-radius:5px;background:var(--hover);color:var(--label2)}
+
+  @media (prefers-reduced-motion: reduce){
+    *{transition:none !important}
+  }
+</style>
+<script>
+  /* 打开时先跟上系统深浅色，之后由右上角按钮切换（不写死） */
+  try{
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+      document.documentElement.dataset.theme = 'dark';
+    }
+  }catch(_){}
+</script>
+</head>
+<body>
+
+<div class="top">
+  <h1>待办行排版 · 四个方案</h1>
+  <span class="crumb">dsh-worktodo · 静态 mockup（不改应用代码）</span>
+  <span class="spacer"></span>
+  <div class="theme" role="group" aria-label="深浅色">
+    <button type="button" id="themeLight">浅色</button>
+    <button type="button" id="themeDark">深色</button>
+  </div>
+</div>
+
+<main class="wrap">
+  <section class="intro">
+    <h2>同一组待办，四种行的排法 · Four row layouts, one dataset</h2>
+    <p>这页只是 <b>mockup</b>：不改应用代码，也不读写任何数据。四个方案用<b>同一组示例数据</b>，
+       分别在<b>窄 320 / 中 420 / 宽 600</b> 的面板宽度下各渲染一遍；每格都含普通行、空白行（hover 才显出「＋日期」「＋项目」）、
+       长标题、hover 态、已完成态，以及高/中/低三档旗子。行尾的铅笔/删除与真实面板一致。</p>
+    <p class="en">A static mockup comparing four layouts for a task row in the dsh-worktodo panel — no app code is touched.
+       Every scheme renders the same sample rows at 320 / 420 / 600 px panel widths, covering normal, empty, long-title,
+       hover, done and all three priority flags. Hover any row for the real interaction; rows marked “hover” show it forced.</p>
+    <div class="reco">
+      <span class="k">推荐</span>
+      <span>B 的骨架 + C 的窄屏自适应：宽面板永远单行、小字钉在行末；窄到标题被挤时，小字自己落到第二行并与标题左对齐。同一份结构，两种宽度表现。
+        <span class="en">Recommended: B's single-line skeleton, with C's narrow-width fallback.</span>
+      </span>
+    </div>
+    <div class="legend">
+      <span><b>①</b> 日期 + 时间 + 项目</span>
+      <span><b>②</b> 无日期 / 无项目 / 无优先级 · 模拟 hover</span>
+      <span><b>③</b> 超长标题（省略号）</span>
+      <span><b>④</b> hover 态（小字变清晰、日期/项目可点）</span>
+      <span><b>⑤</b> 已完成（勾选、划线、变灰）</span>
+      <span><b>⑥⑦⑧</b> 高 / 中 / 低优先级旗子</span>
+    </div>
+  </section>
+
+  <div id="schemes"></div>
+
+  <p class="foot">
+    参考实现：<code>src/client/index.js</code> 里的 <code>.wt-row</code> / <code>.wt-check</code> / <code>.wt-title</code> / <code>.wt-date-btn</code> / <code>.wt-tag</code>；
+    同款预览：<code>docs/design/panel-preview.html</code>。本页只是排版对照，未改动任何应用代码，也未提交。
+  </p>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ---------------------------------------------------------------- *
+   * 示例数据：四个方案、三个宽度都用这一份
+   * ---------------------------------------------------------------- */
+  var ROWS = [
+    { label: '① 普通', title: '把周报发给团队', due: '明天 09:00', project: '产品', prio: 'normal' },
+    { label: '② 空白 · 模拟 hover', title: '整理评审意见', prio: 'none', forceHover: true },
+    { label: '③ 长标题', title: '重构行内编辑的保存流程：Enter 提交、Esc 取消、失焦自动保存，并把错误提示接回面板顶部的错误条',
+      due: '10-24', project: '重构', prio: 'normal' },
+    { label: '④ hover 态', title: '和设计师对一下窄屏下的换行策略', due: '今天 18:30', project: '设计',
+      prio: 'normal', forceHover: true, emph: true },
+    { label: '⑤ 已完成', title: '回复合作方关于排期的邮件', due: '10-18', project: '合作', prio: 'low', done: true },
+    { label: '⑥ 高优先级', title: '上线前跑一遍全量自检', due: '今天', project: '发布', prio: 'high' },
+    { label: '⑦ 中优先级', title: '补一版深色模式的对比截图', due: '周四 15:00', project: '设计', prio: 'normal' },
+    { label: '⑧ 低优先级', title: '看看社区提的两个小建议', project: '社区', prio: 'low' }
+  ];
+
+  var WIDTHS = [
+    { w: 320, label: '窄 · 320px' },
+    { w: 420, label: '中 · 420px' },
+    { w: 600, label: '宽 · 600px' }
+  ];
+
+  var SCHEMES = [
+    {
+      id: 'A', cls: 'a-row', name: 'A · 现状（基准）', tag: '基准',
+      sub: '两行 · 勾选框顶对齐 · 小字缩进在标题下方',
+      pros: '两行结构最宽容，长标题、日期、项目、操作都放得下。',
+      cons: '勾选框只咬住第一行，第二行小字又比标题缩进约 5px，一行读起来像两截——反馈里的「没对齐」就出在这。',
+      en: 'Robust, but the checkbox only lines up with line one and the meta line is indented, so the row reads as two pieces.'
+    },
+    {
+      id: 'B', cls: 'b-row', name: 'B · 单行（推荐）', tag: '推荐', rec: true,
+      sub: '固定 44px · 勾选框垂直居中 · 小字永远钉在行末',
+      pros: '一眼一行、勾选框与整行垂直居中，小字不再参与标题排版，扫读最快。',
+      cons: '窄面板（320px）下元信息把标题挤到只剩一小截，长标题只能靠省略号。',
+      en: 'Fastest to scan and visually calm; the cost is a short title at 320px, where the meta takes almost half the width.'
+    },
+    {
+      id: 'C', cls: 'c-row', name: 'C · 单行 + 窄屏自适应', tag: '推荐组合', rec: true,
+      sub: '同 B；标题被挤时小字自动落到第二行、与标题左对齐',
+      pros: '宽时与 B 完全一致；窄时先保标题，小字换行后与标题左对齐，勾选框仍居中于标题行。',
+      cons: '同一列表里会同时出现 44px 和更高的行，纵向节奏不如纯单行整齐。',
+      en: 'B when there is room, two lines when there is not — at the cost of two row heights inside one list.'
+    },
+    {
+      id: 'D', cls: 'd-row', name: 'D · 两行保守版', tag: '最小改动',
+      sub: '仍是两行 · 勾选框相对整行垂直居中 · 小字与标题左对齐',
+      pros: '只动两个变量（勾选框居中、小字去掉缩进），改动面最小、回归风险最低。',
+      cons: '还是两行，信息密度与扫读速度都没有改善。',
+      en: 'The smallest possible change: centered checkbox, flush meta — still two lines.'
+    }
+  ];
+
+  /* ---------------------------------------------------------------- *
+   * 小图标（内联 SVG，与面板同一套线条）
+   * ---------------------------------------------------------------- */
+  function flagIcon(filled, dashed) {
+    var dash = dashed ? ' stroke-dasharray="1.5 1.5"' : '';
+    return '<svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true">'
+      + '<path d="M3.6 1.6v13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"' + dash + '/>'
+      + '<path d="M5.2 2.4h7.4L11 5.2l1.6 2.8H5.2z" fill="' + (filled ? 'currentColor' : 'none')
+      + '" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"' + dash + '/>'
+      + '</svg>';
+  }
+  var TICK = '<svg class="tick" width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor"'
+    + ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6.3 4.6 8.9 10 3.1"/></svg>';
+  var PENCIL = '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"'
+    + ' stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">'
+    + '<path d="M2.8 13.2l.5-2.4 7.1-7.1 1.9 1.9-7.1 7.1-2.4.5z"/><path d="M9.4 2.6l1.9 1.9"/></svg>';
+  var TRASH = '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor"'
+    + ' stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">'
+    + '<path d="M2.8 4.4h10.4"/><path d="M6.4 4.4V2.9h3.2v1.5"/>'
+    + '<path d="M4.5 4.4l.7 8.4h5.6l.7-8.4"/><path d="M6.9 6.8v3.9M9.1 6.8v3.9"/></svg>';
+  var CHEVRON = '<svg width="10" height="10" viewBox="0 0 14 14" fill="none" stroke="currentColor"'
+    + ' stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3.4 5.2 3.6 3.6 3.6-3.6"/></svg>';
+
+  var PRIO_LABEL = { none: '无', high: '高', normal: '中', low: '低' };
+  var PRIO_COLOR = { none: 'var(--label3)', high: 'var(--error)', normal: 'var(--warn)', low: 'var(--label3)' };
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 行的零件
+   * ---------------------------------------------------------------- */
+  function flagHTML(r) {
+    var ghost = r.prio === 'none';
+    return '<button type="button" class="flag' + (ghost ? ' ghost' : '') + '"'
+      + ' style="color:' + PRIO_COLOR[r.prio] + '"'
+      + ' title="优先级：' + PRIO_LABEL[r.prio] + '" aria-label="优先级：' + PRIO_LABEL[r.prio] + '">'
+      + flagIcon(r.prio === 'high', ghost) + '</button>';
+  }
+
+  function checkHTML(r) {
+    var label = r.done ? '取消完成' : '标记完成';
+    return '<button type="button" class="check' + (r.done ? ' done' : '') + '"'
+      + ' title="' + label + '" aria-label="' + label + '">' + TICK + '</button>';
+  }
+
+  function dateHTML(r, emph) {
+    if (r.due) {
+      return '<button type="button" class="date-btn' + (emph ? ' emph' : '') + '" title="改日期">'
+        + esc(r.due) + '</button>';
+    }
+    return '<span class="add-slot date-add" title="加日期">＋日期</span>';
+  }
+
+  function projHTML(r, emph) {
+    if (r.project) {
+      return '<button type="button" class="proj' + (emph ? ' emph' : '') + '" title="改项目">#'
+        + esc(r.project) + '</button>';
+    }
+    return '<span class="add-slot proj-add" title="加项目">＋项目</span>';
+  }
+
+  function actionsHTML() {
+    return '<button type="button" class="ico" title="编辑详情">' + PENCIL + '</button>'
+      + '<button type="button" class="ico danger" title="删除">' + TRASH + '</button>';
+  }
+
+  function rowAttrs(scheme, r) {
+    var cls = 'row ' + scheme + '-row';
+    if (r.forceHover) cls += ' is-hover';
+    if (r.done) cls += ' is-done';
+    if (r.prio === 'high') cls += ' p-high';
+    return 'class="' + cls + '"';
+  }
+
+  function titleHTML(r) {
+    return '<button type="button" class="title" title="点按编辑标题">' + esc(r.title) + '</button>';
+  }
+
+  /* A：flag / check / main(title + meta) / actions */
+  function rowA(r) {
+    var emph = r.forceHover && r.emph;
+    return '<div ' + rowAttrs('a', r) + '>'
+      + flagHTML(r)
+      + checkHTML(r)
+      + '<div class="main">' + titleHTML(r)
+      + '<div class="meta">' + dateHTML(r, emph) + projHTML(r, emph) + '</div>'
+      + '</div>'
+      + actionsHTML()
+      + '</div>';
+  }
+
+  /* B：check / title / end(flag + date + project + actions) */
+  function rowB(r) {
+    var emph = r.forceHover && r.emph;
+    return '<div ' + rowAttrs('b', r) + '>'
+      + checkHTML(r)
+      + titleHTML(r)
+      + '<div class="end">' + flagHTML(r) + dateHTML(r, emph) + projHTML(r, emph) + actionsHTML() + '</div>'
+      + '</div>';
+  }
+
+  /* C：grid —— check / title / flag / end；换行时 end 落到第二行（列与标题同起点） */
+  function rowC(r) {
+    var emph = r.forceHover && r.emph;
+    return '<div ' + rowAttrs('c', r) + '>'
+      + checkHTML(r)
+      + titleHTML(r)
+      + '<span class="flagcell">' + flagHTML(r) + '</span>'
+      + '<div class="end">' + dateHTML(r, emph) + projHTML(r, emph) + actionsHTML() + '</div>'
+      + '</div>';
+  }
+
+  /* D：flag / check / main(title + meta) / actions，但整行垂直居中、meta 不缩进 */
+  function rowD(r) {
+    var emph = r.forceHover && r.emph;
+    return '<div ' + rowAttrs('d', r) + '>'
+      + flagHTML(r)
+      + checkHTML(r)
+      + '<div class="main">' + titleHTML(r)
+      + '<div class="meta">' + dateHTML(r, emph) + projHTML(r, emph) + '</div>'
+      + '</div>'
+      + actionsHTML()
+      + '</div>';
+  }
+
+  function rowHTML(scheme, r) {
+    if (scheme === 'A') return rowA(r);
+    if (scheme === 'B') return rowB(r);
+    if (scheme === 'C') return rowC(r);
+    return rowD(r);
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 面板与方案
+   * ---------------------------------------------------------------- */
+  function frameHTML(scheme, width, label) {
+    var rows = ROWS.map(function (r) {
+      return '<div class="row-label">' + r.label + '</div>' + rowHTML(scheme, r);
+    }).join('');
+    return '<div class="frame">'
+      + '<div class="frame-tag">' + label + '</div>'
+      + '<div class="panel" style="width:' + width + 'px">'
+      + '<div class="panel-head"><span class="panel-title">工作待办</span><span class="panel-count">8 项</span></div>'
+      + '<div class="group-head">' + CHEVRON + '今天<span class="gcount">3</span></div>'
+      + rows
+      + '</div></div>';
+  }
+
+  function schemeHTML(s) {
+    var frames = WIDTHS.map(function (w) { return frameHTML(s.id, w.w, w.label); }).join('');
+    return '<section class="scheme" id="scheme-' + s.id + '">'
+      + '<div class="scheme-head">'
+      + '<span class="scheme-badge">' + s.id + '</span>'
+      + '<div><h2>' + s.name + '</h2><div class="scheme-sub">' + s.sub + '</div></div>'
+      + '<span class="scheme-tag' + (s.rec ? ' rec' : '') + '">' + s.tag + '</span>'
+      + '</div>'
+      + '<div class="frames">' + frames + '</div>'
+      + '<div class="verdict"><span class="k">优缺点</span><p>'
+      + '<b>优点</b>：' + s.pros + '　<b>缺点</b>：' + s.cons
+      + '<span class="en">' + s.en + '</span>'
+      + '</p></div>'
+      + '</section>';
+  }
+
+  document.getElementById('schemes').innerHTML = SCHEMES.map(schemeHTML).join('');
+
+  /* ---------------------------------------------------------------- *
+   * C 的换行判定：先在单行态量一次「标题是否被省略号截断」，
+   * 截断就加 .is-wrapped，让小字整组落到第二行（与标题同一列起点）。
+   * 只在这一处做测量；容器宽度是固定的，不需要每帧监听。
+   * ---------------------------------------------------------------- */
+  function measureC() {
+    var rows = Array.prototype.slice.call(document.querySelectorAll('.c-row'));
+    rows.forEach(function (row) { row.classList.remove('is-wrapped'); });
+    // 先让浏览器按单行态完成一次布局，再逐行读取 scrollWidth
+    void document.body.offsetHeight;
+    rows.forEach(function (row) {
+      var title = row.querySelector('.title');
+      if (title && title.scrollWidth > title.clientWidth + 1) row.classList.add('is-wrapped');
+    });
+  }
+
+  measureC();
+
+  /* 字体/缩放变化后重新量一次（只在窗口尺寸或字体就绪时） */
+  var resizeTimer = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(measureC, 120);
+  });
+  if (document.fonts && document.fonts.ready && typeof document.fonts.ready.then === 'function') {
+    document.fonts.ready.then(measureC);
+  }
+
+  /* ---------------------------------------------------------------- *
+   * 深浅色切换
+   * ---------------------------------------------------------------- */
+  var root = document.documentElement;
+  var btnLight = document.getElementById('themeLight');
+  var btnDark = document.getElementById('themeDark');
+
+  function applyTheme(theme) {
+    root.dataset.theme = theme;
+    btnLight.classList.toggle('is-on', theme === 'light');
+    btnDark.classList.toggle('is-on', theme === 'dark');
+    btnLight.setAttribute('aria-pressed', theme === 'light' ? 'true' : 'false');
+    btnDark.setAttribute('aria-pressed', theme === 'dark' ? 'true' : 'false');
+  }
+
+  btnLight.addEventListener('click', function () { applyTheme('light'); });
+  btnDark.addEventListener('click', function () { applyTheme('dark'); });
+  applyTheme(root.dataset.theme === 'dark' ? 'dark' : 'light');
+})();
+</script>
+</body>
+</html>

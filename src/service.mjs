@@ -152,7 +152,7 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
    *
    * 口径要分清（这里踩过一次坑）：
    *   - `todos` 与 `groups` 都基于**筛选后**的子集；
-   *   - `stats` 基于**全量**记录——面板顶部的「逾期 3 条」不该因为切到「已完成」标签就变 0。
+   *   - `stats` 基于**全量**记录——面板顶部的「已过期 3 条」不该因为切到「已完成」标签就变 0。
    * 因此想要完整五个分组的面板请求 `filter: 'all'`，而不是 `open`
    * （否则 `groups.completed` 恒为空，「已完成」那一栏永远出不来）。
    * @param {object} [options]
@@ -219,7 +219,7 @@ export function createWorkTodoService({ store, clock = () => Date.now(), logger 
       ok: true,
       // 回显实际给出的形状，调用方/测试能一眼看出这次拿了几份
       shapes: LIST_SHAPES.filter((shape) => shapeSet.has(shape)),
-      // 统计基于**全部**记录，而不是当前筛选结果：面板顶部的「逾期 3 条」不该因为
+      // 统计基于**全部**记录，而不是当前筛选结果：面板顶部的「已过期 3 条」不该因为
       // 用户切到「已完成」标签就变成 0
       sort: mode,
       stats: statsOf(records, now),

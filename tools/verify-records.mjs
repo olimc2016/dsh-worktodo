@@ -193,7 +193,7 @@ test('歧义与找不到都给出明确原因', () => {
 console.log('分组与统计');
 
 const records = [
-  mk({ title: '逾期事', due: '2026-10-10', priority: 'high' }, 'a'),
+  mk({ title: '已过期事', due: '2026-10-10', priority: 'high' }, 'a'),
   mk({ title: '今天事', due: TODAY }, 'b'),
   mk({ title: '本周事', due: '2026-10-18' }, 'c'),
   mk({ title: '下周事', due: '2026-10-19' }, 'd'),
@@ -210,12 +210,12 @@ test('分组边界：本周日算本周、下周一算以后、已完成单独�
   eq(g.completed.map((r) => r.id), ['f']);
 });
 
-test('已完成的逾期事不再算逾期', () => {
+test('已完成的已过期事不再算已过期', () => {
   const g = groupRecords(records, NOW);
   eq(g.overdue.some((r) => r.id === 'f'), false);
 });
 
-test('统计口径：逾期/今天/未完成/今日完成', () => {
+test('统计口径：已过期/今天/未完成/今日完成', () => {
   const s = statsOf(records, NOW);
   eq(s.total, 6);
   eq(s.open, 5);
@@ -380,11 +380,11 @@ test('提升时按标题去重、忽略空条目', () => {
 
 console.log('文本渲染');
 
-test('行文本包含状态框、id、截止与逾期标记', () => {
-  const line = formatLine(mk({ title: '逾期事', due: '2026-10-10' }, 'a'), NOW);
+test('行文本包含状态框、id、截止与已过期标记', () => {
+  const line = formatLine(mk({ title: '已过期事', due: '2026-10-10' }, 'a'), NOW);
   eq(line.includes('[ ]'), true);
   eq(line.includes('a'), true);
-  eq(line.includes('已逾期 2026-10-10'), true);
+  eq(line.includes('已已过期 2026-10-10'), true);
 });
 
 // ---- 按项目分组（面板的「按项目」视图）----
@@ -418,7 +418,7 @@ test('groupByProject：未完成多的项目排前面', () => {
 test('groupByProject：桶内统计 total/open/overdue，且已完成不计入 open', () => {
   const now = Date.parse('2026-10-11T09:00:00+08:00');
   const records = [
-    createRecord({ title: 'x', project: 'alpha', due: '2026-10-01' }, { now, id: 'x' }),      // 逾期
+    createRecord({ title: 'x', project: 'alpha', due: '2026-10-01' }, { now, id: 'x' }),      // 已过期
     createRecord({ title: 'y', project: 'alpha' }, { now, id: 'y' }),
     createRecord({ title: 'z', project: 'alpha', status: 'completed' }, { now, id: 'z' }),
   ];

@@ -590,7 +590,7 @@ export function formatLine(record, now = Date.now()) {
   else if (record.priority === 'low') bits.push('低');
   if (record.due) {
     const overdue = record.status !== 'completed' && record.due < today;
-    bits.push(`${overdue ? '已逾期 ' : '截止 '}${record.due}${record.dueTime ? ` ${record.dueTime}` : ''}`);
+    bits.push(`${overdue ? '已已过期 ' : '截止 '}${record.due}${record.dueTime ? ` ${record.dueTime}` : ''}`);
   }
   if (record.project) bits.push(`#${record.project}`);
   const suffix = bits.length ? `  (${bits.join(', ')})` : '';

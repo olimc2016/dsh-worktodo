@@ -121,7 +121,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
       render: (_args, value) => [{
         type: 'text',
         text: `已记入工作待办：${value.title}（${value.id}${value.due ? `，截止 ${value.due}${value.dueTime ? ` ${value.dueTime}` : ''}` : ''}）`
-          + (value.stats ? `｜当前未完成 ${value.stats.open} 条，逾期 ${value.stats.overdue} 条` : ''),
+          + (value.stats ? `｜当前未完成 ${value.stats.open} 条，已过期 ${value.stats.overdue} 条` : ''),
       }],
     },
     execute(args) {
@@ -210,7 +210,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
         type: 'text',
         text: `已记入工作待办 ${value.count} 条`
           + (value.skipped.length ? `，跳过 ${value.skipped.length} 条（${value.skipped.map((entry) => `#${entry.index} ${entry.reason}`).join('；')}）` : '')
-          + (value.stats ? `｜当前未完成 ${value.stats.open} 条，逾期 ${value.stats.overdue} 条` : ''),
+          + (value.stats ? `｜当前未完成 ${value.stats.open} 条，已过期 ${value.stats.overdue} 条` : ''),
       }],
     },
     async execute(args) {
@@ -251,7 +251,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
   disposers.push(ctx.tools.register(defineTool({
     name: 'worktodo_list',
     description:
-      '查看用户的「工作待办」列表，含优先级、截止日期、项目与逾期情况。'
+      '查看用户的「工作待办」列表，含优先级、截止日期、项目与已过期情况。'
       + '在开始一轮工作前、或用户问「我今天要做什么 / 有什么没做完」时先调它，避免重复登记同一件事。'
       + '默认只看未完成；completed 才看已完成的。',
     parameters: {
@@ -277,7 +277,7 @@ export async function registerWorkTodoTools({ ctx, service, logger }) {
         lines: result.todos.length
           ? result.todos.map((t) => {
             const box = t.status === 'completed' ? '[x]' : t.status === 'in_progress' ? '[~]' : '[ ]';
-            const bits = [t.priority === 'high' ? '高' : t.priority === 'low' ? '低' : null, t.due ? `${t.due}${t.dueTime ? ` ${t.dueTime}` : ''}${t.due < result.today && t.status !== 'completed' ? '(逾期)' : ''}` : null, t.project ? `#${t.project}` : null].filter(Boolean);
+            const bits = [t.priority === 'high' ? '高' : t.priority === 'low' ? '低' : null, t.due ? `${t.due}${t.dueTime ? ` ${t.dueTime}` : ''}${t.due < result.today && t.status !== 'completed' ? '(已过期)' : ''}` : null, t.project ? `#${t.project}` : null].filter(Boolean);
             return `${box} ${t.id}  ${t.title}${bits.length ? `  (${bits.join(', ')})` : ''}`;
           }).join('\n')
           : '（没有符合条件的待办）',

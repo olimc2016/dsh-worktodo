@@ -88,7 +88,7 @@ git push -u origin add-dsh-worktodo
   "category": "ui",
   "description": {
     "en": "A sidebar work todo panel with priorities, due dates, projects, overdue and this-week views. Todos persist across sessions in the Harness storage layer, and worktodo_* tools let the agent read and write the same list as the user.",
-    "zh": "侧栏工作待办面板：优先级、截止日期、项目、逾期与本周视图。待办跨会话持久保存在 Harness 存储层，并提供 worktodo_* 工具，让 agent 与用户读写同一份列表。"
+    "zh": "侧栏工作待办面板：优先级、截止日期、项目、已过期与本周视图。待办跨会话持久保存在 Harness 存储层，并提供 worktodo_* 工具，让 agent 与用户读写同一份列表。"
   },
   "added": "2026-10-11"
 }
@@ -130,7 +130,7 @@ Adds one catalog entry: catalog/plugins/olimc2016--dsh-worktodo.json
 本插件那一行的写法（照他们既有条目的格式：`- [名字](仓库) — 说明`）：
 
 ```markdown
-- [dsh-worktodo](https://github.com/olimc2016/dsh-worktodo) — 归你所有、跨会话持久的工作待办：优先级、截止日期、项目、逾期与本周视图，agent 通过 worktodo_* 工具读写同一份列表。
+- [dsh-worktodo](https://github.com/olimc2016/dsh-worktodo) — 归你所有、跨会话持久的工作待办：优先级、截止日期、项目、已过期与本周视图，agent 通过 worktodo_* 工具读写同一份列表。
 ```
 
 按 star 数从高到低做（值不值得花时间一目了然）：

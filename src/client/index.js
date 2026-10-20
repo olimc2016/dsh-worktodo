@@ -128,7 +128,7 @@ const zh = {
   'panelCrashTitle': '工作待办面板出错了',
   'panelCrashHint': '渲染这块面板时抛了异常，已在这里兜住，待办数据本身没丢。点「重试」可以重新挂载，无需重启 DSH；若反复出现，请把控制台里的完整报错发出来。',
   'statOpen': '未完成',
-  'statOverdue': '逾期',
+  'statOverdue': '已过期',
   'statToday': '今天',
   'statDoing': '进行中',
   'statDoneToday': '今日完成',
@@ -159,7 +159,7 @@ const zh = {
   'prioHigh': '高',
   'prioNormal': '普通',
   'prioLow': '低',
-  'groupOverdue': '逾期',
+  'groupOverdue': '已过期',
   'groupToday': '今天',
   'groupWeek': '本周',
   'groupLater': '以后',
@@ -253,7 +253,7 @@ const zh = {
   'collapse': '收起',
   'empty': '还没有待办',
   'emptyHint': '在上面输入框加第一件事',
-  'overdueTag': '逾期',
+  'overdueTag': '已过期',
   'sourceAgent': 'AI',
   'sourceSession': '会话',
   'markDone': '标为完成',
@@ -465,7 +465,7 @@ const en = {
  * 不写任何颜色字面量兜底——兜底值等于写死某一种主题下的颜色，另一套主题就花了。
  * 需要「淡淡的底色」时用 color-mix 把语义色混进 transparent，仍然是变量驱动。
  * ------------------------------------------------------------------ */
-/** 本地时区的 YYYY-MM-DD（面板里判断"今天 / 逾期"用；与宿主 records.mjs 的 dayKey 同语义）。 */
+/** 本地时区的 YYYY-MM-DD（面板里判断"今天 / 已过期"用；与宿主 records.mjs 的 dayKey 同语义）。 */
 function dayKey(stamp) {
   const d = new Date(stamp);
   const pad = (n) => String(n).padStart(2, '0');
@@ -2199,7 +2199,7 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       'aria-haspopup': 'dialog',
       'aria-expanded': dateOpen,
       title: shownDue ? t('editDate') : t('addDateLabel'),
-      // 视觉与旧文案一致（11px 小字）；逾期仍用 warn 色
+      // 视觉与旧文案一致（11px 小字）；已过期仍用 warn 色
       style: { color: overdue ? C.warn : C.label3 },
       onClick: openDate,
       onKeyDown: (event) => { if (event?.key === 'Escape') closeDate(); },
@@ -3478,7 +3478,7 @@ function WorkTodoPanel(props) {
   const store = data?.store ?? null;
   const num = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
   const overdueCount = num(stats.overdue);
-  // 视图分桶：按截止（原有 GROUPS）或按项目（宿主给的 projectGroups，附 未完成/总数/逾期）
+  // 视图分桶：按截止（原有 GROUPS）或按项目（宿主给的 projectGroups，附 未完成/总数/已过期）
   const projectGroups = asArray(data?.projectGroups);
   const viewGroups = view === 'project'
     ? projectGroups.map((bucket) => ({

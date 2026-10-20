@@ -4,7 +4,7 @@
 > 规则细节看 `docs/process/development-standard.md`。本文件保持 ≤100 行。
 
 ## 这个项目是什么
-DSH（DeepSeek Harness）的**工作待办**插件：归用户所有、跨会话持久的工作清单（优先级 / 截止 / 项目 / 逾期与本周视图），并与 agent 工具联动。
+DSH（DeepSeek Harness）的**工作待办**插件：归用户所有、跨会话持久的工作清单（优先级 / 截止 / 项目 / 已过期与本周视图），并与 agent 工具联动。
 npm 包名：`dsh-worktodo`（维护者 `olimc2026`，可正常发版）。
 
 ## 文件地图（改之前先看这里，别整读大文件）
