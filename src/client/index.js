@@ -543,17 +543,17 @@ const CHECK_HIT_INSET_PX = (CHECK_HIT_PX - CHECK_SIZE_PX) / 2;
  * 行高下限（B1）。**必须 ≥ 命中盒高度**，否则相邻两行的命中盒会纵向重叠，
  * 而 DOM 里后绘制的下一行在上层 —— 点偏几像素就变成「静默改错条目」。
  *
- * 几何（相对本行上沿，含 padding 5px 与勾选框 margin-top −3px）：
- *   视觉盒 y = [2, 28]；命中盒 y = [−5, 35]（40×40）；
- *   下一行命中盒上沿 = 44 − 5 = 39 ⇒ **重叠 0px、留 4px 间隙**。
- * 为什么不取刚好 40：40 时下一行命中盒上沿 = 35，与本行命中盒下沿正好贴边，
+ * 几何（相对本行上沿，单行布局 44px、padding 5px、勾选框在行内垂直居中）：
+ *   内容区 34px，视觉盒 y = [9, 35]；命中盒 y = [2, 42]（40×40）；
+ *   下一行命中盒上沿 = 44 + 2 = 46 ⇒ **重叠 0px、留 4px 间隙**。
+ * 为什么不取刚好 40：40 时下一行命中盒上沿 = 42，与本行命中盒下沿正好贴边，
  * 边界那 1px 仍会被后绘制的下一行吃掉；44 同时对齐常见的 44px 触控目标。
  */
 export const ROW_MIN_HEIGHT_PX = 44;
 /** 行的纵向 padding（几何算式与样式表共用，测试会解析样式表核对）。 */
 const ROW_PADDING_Y_PX = 5;
-/** 勾选框的 margin-top（让它与首行文字视觉居中对齐）。 */
-const CHECK_MARGIN_TOP_PX = -3;
+/** 勾选框不再用负 margin 做顶对齐：单行布局靠 align-items:center 垂直居中。 */
+const CHECK_MARGIN_TOP_PX = 0;
 
 /**
  * 勾选框命中盒的几何（B1 的护栏，导出供单测）。
@@ -563,7 +563,8 @@ const CHECK_MARGIN_TOP_PX = -3;
  * @returns {{rowHeight: number, hitWidth: number, hitHeight: number, hitTop: number, hitBottom: number, nextHitTop: number, gap: number, overlap: number}}
  */
 export function checkHitGeometry() {
-  const visualTop = ROW_PADDING_Y_PX + CHECK_MARGIN_TOP_PX;
+  const contentHeight = ROW_MIN_HEIGHT_PX - ROW_PADDING_Y_PX * 2;
+  const visualTop = ROW_PADDING_Y_PX + Math.max(0, (contentHeight - CHECK_SIZE_PX) / 2);
   const visualBottom = visualTop + CHECK_SIZE_PX;
   const hitTop = visualTop - CHECK_HIT_INSET_PX;
   const hitBottom = visualBottom + CHECK_HIT_INSET_PX;
@@ -578,6 +579,43 @@ export function checkHitGeometry() {
     gap: nextHitTop - hitBottom,
     overlap: Math.max(0, hitBottom - nextHitTop),
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * 行布局：默认单行（B），标题会被省略号截断时整行换成两行（C）
+ *
+ * 判定的是「标题会不会被截断」，而不是「面板窄不窄」：同样的面板宽度，
+ * 短标题永远单行、长标题才换行。换行后小字组（旗子/日期/项目）落到第二行，
+ * 与标题左对齐；勾选框仍居中在标题那一行。
+ * ------------------------------------------------------------------ */
+/** 单行布局的列间距（px）：与样式表 .wt-row 的 gap 取同一个值。 */
+export const ROW_GAP_PX = 8;
+/** 量标题时允许的亚像素误差：多出 1px 才算出界，避免 0.5px 抖动反复换行。 */
+export const ROW_WRAP_SLACK_PX = 1;
+/** 解除换行所需的额外余量（px）：一旦换行，要等单行真的放得下且多出这么多才收回。 */
+export const ROW_WRAP_HYSTERESIS_PX = 8;
+/** scrollWidth 测量防抖窗口（ms）：面板拖动/窗口缩放时别每一帧都读布局。 */
+export const ROW_WRAP_DEBOUNCE_MS = 120;
+
+/**
+ * 单行/换行判定（纯函数，导出供单测）。
+ *
+ * **滞回**是这里的关键：换行后标题列变宽了，直接用「现在没被截断」去解除会立刻
+ * 「换行→不省略→又换回」地抖。所以换行态不看到当前是否截断，而是先算
+ * 「如果小字组回到第一行，标题还剩多少宽」（availableWidth − metaWidth − gap），
+ * 只有这个预测宽度 ≥ 标题固有宽度 + ROW_WRAP_HYSTERESIS_PX 才解除。
+ *
+ * @param {{wrapped?: boolean, intrinsicWidth?: number, availableWidth?: number, metaWidth?: number}} box
+ *   intrinsicWidth = title.scrollWidth（标题的固有宽度）；
+ *   availableWidth = title.clientWidth（当前标题列宽）；
+ *   metaWidth = 小字组的固有宽度（只在换行态需要）。
+ * @returns {boolean} true = 需要换行
+ */
+export function decideRowWrap({ wrapped = false, intrinsicWidth = 0, availableWidth = 0, metaWidth = 0 } = {}) {
+  if (!(availableWidth > 0) || !(intrinsicWidth > 0)) return Boolean(wrapped);
+  if (!wrapped) return intrinsicWidth > availableWidth + ROW_WRAP_SLACK_PX;
+  const predictedSingle = availableWidth - (metaWidth > 0 ? metaWidth + ROW_GAP_PX : 0);
+  return predictedSingle < intrinsicWidth + ROW_WRAP_HYSTERESIS_PX;
 }
 /**
  * 对勾描边动画的虚线段长。取值略大于路径实际长度（≈11.6），
@@ -670,6 +708,7 @@ export const STYLE_TEXT = `
   background: transparent; color: ${C.label3}; cursor: pointer;
 }
 .wt-icon-btn:hover { background: ${C.hover}; color: ${C.label}; }
+.wt-icon-btn:focus-visible { outline: 2px solid ${C.brand}; outline-offset: 1px; }
 .wt-icon-btn-danger:hover { background: var(--dsw-alias-interactive-bg-hover-danger); color: ${C.error}; }
 .wt-check {
   position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
@@ -696,13 +735,44 @@ export const STYLE_TEXT = `
 .wt-row.is-celebrating .wt-title {
   animation: wt-title-settle ${TITLE_SETTLE_MS}ms ease-out ${ROW_CELEBRATE_DELAY_MS}ms both;
 }
-/* B1：min-height 必须 ≥ 命中盒高度（见 checkHitGeometry / ROW_MIN_HEIGHT_PX） */
-.wt-row { display: flex; align-items: flex-start; gap: 8px; padding: ${ROW_PADDING_Y_PX}px 8px; min-height: ${ROW_MIN_HEIGHT_PX}px; border-radius: 10px; }
+/* B1：min-height 必须 ≥ 命中盒高度（见 checkHitGeometry / ROW_MIN_HEIGHT_PX）。
+   B（默认单行）：[勾选框][标题 flex:1 可省略][小字组 flex-shrink:0][行尾操作]，
+   勾选框靠 align-items:center 垂直居中（不再用负 margin 顶对齐）。 */
+.wt-row { display: flex; align-items: center; gap: ${ROW_GAP_PX}px; padding: ${ROW_PADDING_Y_PX}px 8px; min-height: ${ROW_MIN_HEIGHT_PX}px; border-radius: 10px; }
 .wt-row:hover { background: ${C.hover}; }
+/* 标题列：唯一可伸缩的格子；min-width:0 是省略号能生效的前提。 */
+.wt-row-main { flex: 1 1 auto; min-width: 0; }
+/* 小字组：旗子 / 日期 / 项目 / 来源。flex:none —— 它不参与压缩，标题让位。 */
+.wt-meta { display: flex; align-items: center; gap: 6px; flex: none; min-width: 0; }
+/* 行尾操作（整单编辑 / 删除）：平时完全让出视线（opacity:0 + pointer-events:none），
+   行 hover 或行内任一元素获得焦点（含键盘 Tab）才显形；仍在 DOM 里，所以 Tab 照样到得了。
+   注意不能用 visibility/display 隐藏，否则键盘就摸不到这两个按钮了。 */
+.wt-actions { display: flex; align-items: center; gap: 2px; flex: none; opacity: 0; pointer-events: none; transition: opacity .12s ease; }
+.wt-row:hover .wt-actions,
+.wt-row:focus-within .wt-actions { opacity: 1; pointer-events: auto; }
+/* 删除的二次确认态必须一直可点：鼠标移到别处时不能把「确认删除？」藏掉。 */
+.wt-actions.is-armed { opacity: 1; pointer-events: auto; }
 .wt-row-edit {
   flex-direction: column; align-items: stretch; gap: 6px;
   border: 1px solid ${C.border1}; background: ${C.layer1};
 }
+/* C（自适应换行）：同样的 DOM，标题会被截断时整行切成两行网格。
+   第一行 [勾选框][标题][行尾操作]；第二行小字组落在标题那一列（不是勾选框下面），
+   所以小字与标题左对齐；勾选框仍只居中于第一行（标题行）。 */
+.wt-row--wrap {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "check main actions" ". meta .";
+  align-items: center;
+  column-gap: ${ROW_GAP_PX}px;
+  row-gap: 3px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.wt-row--wrap .wt-check { grid-area: check; }
+.wt-row--wrap .wt-row-main { grid-area: main; min-width: 0; }
+.wt-row--wrap .wt-meta { grid-area: meta; justify-self: start; max-width: 100%; flex-wrap: wrap; }
+.wt-row--wrap .wt-actions { grid-area: actions; }
 .wt-seg {
   display: inline-flex; align-items: center; border-radius: 8px; overflow: hidden;
   border: 1px solid ${C.border}; background: ${C.bg2};
@@ -851,8 +921,12 @@ export const STYLE_TEXT = `
 .wt-restart-banner-mark { flex: none; color: ${C.ok}; font-weight: 700; }
 .wt-restart-banner-text { flex: 1; min-width: 0; word-break: break-word; }
 /* 行内标题：视觉上就是原来那行字（同字号/行高/颜色），但它是真按钮。
-   cursor:text 是「点进去改文字」的暗示；hover 只加一条虚线下划线，不改任何布局。 */
-.wt-title { word-break: break-word; }
+   永远只占一行：超出就省略号 —— 换行态也一样，绝不让标题把行撑成两三行高。 */
+.wt-title {
+  display: block; width: 100%; min-width: 0;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  word-break: normal;
+}
 .wt-title-btn {
   appearance: none; display: block; width: 100%; margin: 0; padding: 0;
   border: 0; background: transparent; font: inherit; line-height: inherit;
@@ -1817,6 +1891,115 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
   const projectOverrideActive = projectOverride !== undefined && projectOverrideFor === todo;
   const shownProject = projectOverrideActive ? projectOverride : baseProject;
 
+  /* ---------------- 行布局：默认单行（B） / 标题被截断时换行（C） ---------------- */
+
+  /**
+   * 布局状态：
+   *   - `rowWrap`：true = 标题会被省略号截断 → 小字组落到第二行（C）；
+   *   - `titleElRef` / `metaElRef`：量 scrollWidth / 读小字组宽度的两个元素；
+   *   - `requiredTitleWidthRef`：换行那一刻记下标题的固有宽度。换行后标题列变宽、可能
+   *     不再截断，不能再用 scrollWidth 当「需要多宽」；记住它才能判断何时真的放得下。
+   *   - `measureTimerRef`：scrollWidth 测量的防抖句柄；
+   *   - `resizeObserverRef`：面板/行宽变化的触发源（只读布局，绝不写布局）。
+   * 全部用 ref 而不是 state：回调只建一次，读到的永远是最新值。
+   */
+  const [rowWrap, setRowWrap] = React.useState(false);
+  const rowWrapRef = React.useRef(false);
+  const titleElRef = React.useRef(null);
+  const metaElRef = React.useRef(null);
+  const requiredTitleWidthRef = React.useRef(0);
+  const measureTimerRef = React.useRef(null);
+  const resizeObserverRef = React.useRef(null);
+
+  const clearMeasureTimer = React.useCallback(() => {
+    if (measureTimerRef.current === null) return;
+    clearTimeout(measureTimerRef.current);
+    measureTimerRef.current = null;
+  }, []);
+
+  /**
+   * 量一次（只读 scrollWidth/clientWidth，不触发额外布局写入）：
+   *   - 单行态：标题被截断就换行；
+   *   - 换行态：算「小字组若回到第一行，标题还剩多宽」，要 ≥ 固有宽度 + 滞回量才收回。
+   * 换行态下标题仍是 nowrap + ellipsis，所以 scrollWidth 仍能反映内容变长（编辑标题时）。
+   */
+  const measureRow = React.useCallback((titleEl) => {
+    const el = titleEl ?? titleElRef.current;
+    if (!el || typeof el.scrollWidth !== 'number' || typeof el.clientWidth !== 'number') return;
+    if (!(el.clientWidth > 0)) return;
+    const intrinsic = el.scrollWidth;
+    const available = el.clientWidth;
+    if (rowWrapRef.current && intrinsic > available + ROW_WRAP_SLACK_PX) {
+      requiredTitleWidthRef.current = Math.max(requiredTitleWidthRef.current, intrinsic);
+    }
+    const intrinsicForDecision = rowWrapRef.current
+      ? Math.max(requiredTitleWidthRef.current, intrinsic)
+      : intrinsic;
+    const metaEl = metaElRef.current;
+    const metaWidth = metaEl && typeof metaEl.scrollWidth === 'number' ? metaEl.scrollWidth : 0;
+    const next = decideRowWrap({
+      wrapped: rowWrapRef.current,
+      intrinsicWidth: intrinsicForDecision,
+      availableWidth: available,
+      metaWidth,
+    });
+    if (next === rowWrapRef.current) return;
+    if (!next) requiredTitleWidthRef.current = 0;
+    else requiredTitleWidthRef.current = intrinsicForDecision;
+    rowWrapRef.current = next;
+    setRowWrap(next);
+  }, []);
+
+  /** 防抖：拖动面板/缩放窗口会连续触发 ResizeObserver，停手后再读一次布局。 */
+  const scheduleMeasure = React.useCallback((titleEl) => {
+    clearMeasureTimer();
+    measureTimerRef.current = setTimeout(() => {
+      measureTimerRef.current = null;
+      measureRow(titleEl ?? titleElRef.current);
+    }, ROW_WRAP_DEBOUNCE_MS);
+  }, [clearMeasureTimer, measureRow]);
+
+  /** 行元素 ref：ResizeObserver 盯行宽（≈ 面板内容宽）。子元素 ref 先挂，标题此时已在。 */
+  const attachRowEl = React.useCallback((el) => {
+    const observer = resizeObserverRef.current;
+    if (observer) {
+      try { observer.disconnect(); } catch { /* 测试替身 / 旧内核没有 disconnect */ }
+      resizeObserverRef.current = null;
+    }
+    if (!el) { clearMeasureTimer(); return; }
+    if (typeof ResizeObserver === 'function') {
+      const next = new ResizeObserver(() => scheduleMeasure(titleElRef.current));
+      try {
+        next.observe(el);
+        if (titleElRef.current) next.observe(titleElRef.current);
+      } catch { /* 观察失败就退化成只在挂载 / 标题变化时量 */ }
+      resizeObserverRef.current = next;
+    }
+    measureRow(titleElRef.current);
+  }, [clearMeasureTimer, measureRow, scheduleMeasure]);
+
+  /** 标题元素 ref：button ↔ input 换元素时重挂观察，并立即量一次（不等防抖，避免闪一下）。 */
+  const attachTitleEl = React.useCallback((el) => {
+    const previous = titleElRef.current;
+    const observer = resizeObserverRef.current;
+    if (previous && previous !== el && observer) {
+      try { observer.unobserve(previous); } catch { /* 同 attachRowEl */ }
+    }
+    titleElRef.current = el;
+    if (!el) { clearMeasureTimer(); return; }
+    if (observer) {
+      try { observer.observe(el); } catch { /* 同 attachRowEl */ }
+    }
+    measureRow(el);
+  }, [clearMeasureTimer, measureRow]);
+
+  // 标题文字变了（编辑提交 / 服务端刷新）而元素本身没换时，也要重量一次：
+  // 变短要能收回第二行，变长要及时换行。真实布局完成后才读，所以放 layout effect。
+  React.useLayoutEffect(() => {
+    if (!titleElRef.current) return;
+    scheduleMeasure(titleElRef.current);
+  }, [shownTitle, scheduleMeasure]);
+
   /**
    * 打开/关闭日期浮层。
    *
@@ -1907,6 +2090,11 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     setTitleOverride(next);
     setTitleOverrideFor(todo);
     setTitleError(null);
+    // 新标题可能明显变短/变长：先按单行重来，等 input → button 的 ref 挂上时立即重量
+    // （不等防抖，避免先单行后换行地闪一下）。量出来仍截断会马上再加回 .wt-row--wrap。
+    rowWrapRef.current = false;
+    requiredTitleWidthRef.current = 0;
+    setRowWrap(false);
     const fail = () => {
       setTitleOverride(null);
       setTitleOverrideFor(null);
@@ -2165,16 +2353,42 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     ]);
   }
 
-  const meta = [];
-  if (row.priority === 'high') {
-    meta.push(React.createElement('span', {
-      key: 'p',
-      className: 'wt-tag',
-      style: { color: C.warn, borderColor: tint(C.warn, 50), background: tint(C.warn, 12), fontWeight: 600 },
-    }, t('prioHigh')));
-  } else if (row.priority === 'low') {
-    meta.push(React.createElement('span', { key: 'p', className: 'wt-tag' }, t('prioLow')));
-  }
+  /* 优先级旗子放在小字组的最前面（B/C 的目标顺序：🚩 明天 09:00 #项目）。
+     无优先级的行也**始终渲染**这个按钮（ghost：opacity 0），占住列宽、各行左侧稳定，
+     也保证纯键盘 Tab 依然能聚焦到它；旗子的可见性仍由 flagPeek / flagOpen 组件状态驱动。 */
+  const priorityNode = React.createElement('span', {
+    key: 'prio-flag',
+    style: { position: 'relative', display: 'inline-flex', flex: '0 0 auto' },
+  }, [
+    React.createElement('button', {
+      key: 'btn',
+      type: 'button',
+      className: `wt-flag-btn${flagVisible ? '' : ' is-ghost'}`,
+      'data-wt-priority-btn': 'true',
+      'data-wt-ghost': flagVisible ? undefined : 'true',
+      'aria-label': `${t('priorityLabel')}：${flagLabel}`,
+      'aria-expanded': flagOpen,
+      'aria-haspopup': 'true',
+      title: `${t('priorityLabel')}：${flagLabel}`,
+      style: { color: priorityColor(flagValue), opacity: flagOpacity },
+      onClick: () => setFlagOpen((open) => !open),
+      onKeyDown: (event) => { if (event?.key === 'Escape') setFlagOpen(false); },
+    }, React.createElement(IconFlag, { filled: flagValue === 'high', dashed: flagValue === 'none' })),
+    flagOpen ? React.createElement(PriorityFlagsPopover, {
+      key: 'pop',
+      t,
+      value: flagValue,
+      // 选中即收弹层 + 走面板统一的写路径（POST /worktodo/update {ref, priority}）。
+      // 失败由面板顶部的错误条原样显示；成功后按现有 refresh() 机制重取列表，不整页刷新。
+      onPick: (value) => {
+        setFlagOpen(false);
+        Promise.resolve(onPriority?.(row.id, value)).catch(() => { /* 已在错误条上显示 */ });
+      },
+      onClose: () => setFlagOpen(false),
+    }) : null,
+  ]);
+
+  const meta = [priorityNode];
 
   /**
    * 行内日期控件：已设日期＝一直显示的按钮（点一下改日期）；
@@ -2348,10 +2562,13 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     ...(flagValue === 'high' ? { borderLeft: `2px solid ${C.error}`, paddingLeft: 8 } : {}),
   };
   return React.createElement('div', {
-    className: `wt-row${celebrating ? ' is-celebrating' : ''}`,
+    ref: attachRowEl,
+    // B/C 的两种形态共用同一份 DOM：默认单行；标题会被截断时加 --wrap（小字组去第二行）
+    className: `wt-row ${rowWrap ? 'wt-row--wrap' : 'wt-row--single'}${celebrating ? ' is-celebrating' : ''}`,
     // 状态可见性给测试与读屏：动效开着时 data-wt-celebrating="true"
     'data-wt-celebrating': celebrating ? 'true' : undefined,
     'data-wt-row': row.id ?? '',
+    'data-wt-row-wrap': rowWrap ? 'true' : undefined,
     'data-wt-row-priority': flagValue,
     // hover / focus 都让「无优先级」行的旗子、「无日期」行的＋日期、「无项目」行的＋项目淡出来。
     // focus 冒泡自子元素，纯键盘同样到达；日期/项目入口在「焦点仍在本行内」时不收起，
@@ -2378,41 +2595,6 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     ...dragAttrs,
     style: rowStyle,
   }, [
-    /* 优先级呈现（设计稿 v5）：高＝红色左缘 + 实心红旗；中＝琥珀；低＝灰；
-       无＝默认不显（悬停/聚焦该行时淡出一个空心旗，可点）。旗子是按钮：点开四旗选择器。
-       即「无」优先级的行也**始终渲染**这个按钮（占住那一列，各行左侧对齐稳定），
-       只是 opacity:0 —— 因此 Tab 键依然能聚焦到它。 */
-    React.createElement('span', {
-      key: 'prio-flag',
-      style: { position: 'relative', display: 'inline-flex', flex: '0 0 auto' },
-    }, [
-      React.createElement('button', {
-        key: 'btn',
-        type: 'button',
-        className: `wt-flag-btn${flagVisible ? '' : ' is-ghost'}`,
-        'data-wt-priority-btn': 'true',
-        'data-wt-ghost': flagVisible ? undefined : 'true',
-        'aria-label': `${t('priorityLabel')}：${flagLabel}`,
-        'aria-expanded': flagOpen,
-        'aria-haspopup': 'true',
-        title: `${t('priorityLabel')}：${flagLabel}`,
-        style: { color: priorityColor(flagValue), opacity: flagOpacity },
-        onClick: () => setFlagOpen((open) => !open),
-        onKeyDown: (event) => { if (event?.key === 'Escape') setFlagOpen(false); },
-      }, React.createElement(IconFlag, { filled: flagValue === 'high', dashed: flagValue === 'none' })),
-      flagOpen ? React.createElement(PriorityFlagsPopover, {
-        key: 'pop',
-        t,
-        value: flagValue,
-        // 选中即收弹层 + 走面板统一的写路径（POST /worktodo/update {ref, priority}）。
-        // 失败由面板顶部的错误条原样显示；成功后按现有 refresh() 机制重取列表，不整页刷新。
-        onPick: (value) => {
-          setFlagOpen(false);
-          Promise.resolve(onPriority?.(row.id, value)).catch(() => { /* 已在错误条上显示 */ });
-        },
-        onClose: () => setFlagOpen(false),
-      }) : null,
-    ]),
     React.createElement('button', {
       key: 'check',
       type: 'button',
@@ -2424,10 +2606,15 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       title: done ? t('unmarkDone') : t('markDone'),
       onClick: handleCheck,
     }, done ? React.createElement(IconCheck, { key: 'i', className: 'wt-check-mark' }) : null),
-    React.createElement('div', { key: 'main', style: { flex: 1, minWidth: 0 } }, [
+    React.createElement('div', {
+      key: 'main',
+      className: 'wt-row-main',
+      'data-wt-row-main': 'true',
+    }, [
       titleEditing
         ? React.createElement('input', {
           key: 'title',
+          ref: attachTitleEl,
           className: 'wt-title wt-title-input',
           'data-wt-title-input': 'true',
           value: titleDraft,
@@ -2458,6 +2645,7 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
         })
         : React.createElement('button', {
           key: 'title',
+          ref: attachTitleEl,
           type: 'button',
           className: 'wt-title wt-title-btn',
           'data-wt-title-btn': 'true',
@@ -2477,35 +2665,45 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
           role: 'status',
         }, titleError)
         : null,
-      meta.length
-        ? React.createElement('div', {
-          key: 'meta',
-          style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginTop: 2 },
-        }, meta)
-        : null,
     ]),
-    // 标题单击改成行内编辑之后，完整表单（备注 / 日期 / 优先级 / 项目）从这里进
-    React.createElement('button', {
-      key: 'details',
-      type: 'button',
-      className: 'wt-icon-btn',
-      'data-wt-edit-details': 'true',
-      title: t('editDetails'),
-      'aria-label': t('editDetails'),
-      onClick: beginEdit,
-    }, React.createElement(IconPencil, { key: 'i' })),
-    React.createElement('button', {
-      key: 'del',
-      type: 'button',
-      className: confirming ? 'wt-btn wt-btn-danger' : 'wt-icon-btn wt-icon-btn-danger',
-      title: confirming ? t('confirmDelete') : t('deleteBtn'),
-      'aria-label': t('deleteBtn'),
-      onClick: () => {
-        if (!confirming) { setConfirming(true); return; }
-        setConfirming(false);
-        Promise.resolve(onRemove(row.id)).catch(() => { /* 已在错误条上显示 */ });
-      },
-    }, confirming ? t('confirmDelete') : React.createElement(IconTrash, { key: 'i' })),
+    // 小字组：旗子 / 日期 / 项目 / 来源。单行时钉在标题右边；
+    // 换行时整组落到第二行、仍在标题这一列（grid-area: meta），所以与标题左对齐。
+    React.createElement('div', {
+      key: 'meta',
+      ref: metaElRef,
+      className: 'wt-meta',
+      'data-wt-meta': 'true',
+    }, meta),
+    // 行尾操作：默认不可见也不可点（CSS .wt-actions），行 hover / 内部聚焦才显形；
+    // 按钮始终在 DOM 里，所以键盘 Tab 仍能到达，聚焦即显示（:focus-within）。
+    React.createElement('div', {
+      key: 'actions',
+      className: `wt-actions${confirming ? ' is-armed' : ''}`,
+      'data-wt-actions': 'true',
+    }, [
+      // 标题单击改成行内编辑之后，完整表单（备注 / 日期 / 优先级 / 项目）从这里进
+      React.createElement('button', {
+        key: 'details',
+        type: 'button',
+        className: 'wt-icon-btn',
+        'data-wt-edit-details': 'true',
+        title: t('editDetails'),
+        'aria-label': t('editDetails'),
+        onClick: beginEdit,
+      }, React.createElement(IconPencil, { key: 'i' })),
+      React.createElement('button', {
+        key: 'del',
+        type: 'button',
+        className: confirming ? 'wt-btn wt-btn-danger' : 'wt-icon-btn wt-icon-btn-danger',
+        title: confirming ? t('confirmDelete') : t('deleteBtn'),
+        'aria-label': t('deleteBtn'),
+        onClick: () => {
+          if (!confirming) { setConfirming(true); return; }
+          setConfirming(false);
+          Promise.resolve(onRemove(row.id)).catch(() => { /* 已在错误条上显示 */ });
+        },
+      }, confirming ? t('confirmDelete') : React.createElement(IconTrash, { key: 'i' })),
+    ]),
   ]);
 });
 

@@ -277,7 +277,18 @@ const stubReact = {
     if (!hookCache.has(id)) hookCache.set(id, { value: fn });
     return hookCache.get(id).value;
   },
-  useRef: (value) => { hookSlotId(); return { current: value }; },
+  /**
+   * 真 React 的 useRef 在组件生命周期内是**同一个对象**。替身也必须一样：
+   * 行布局测量把「当前标题元素 / 是否已换行」放在 ref 里，回调只建一次，
+   * 如果每次渲染都换一个新 ref，稳定窗口里第二次渲染就读不到第一次挂上的元素了。
+   * 非稳定窗口仍保持旧行为（每次渲染全新对象 = 每次全新挂载）。
+   */
+  useRef: (value) => {
+    const id = hookSlotId();
+    if (!stableHooks) return { current: value };
+    if (!hookCache.has(id)) hookCache.set(id, { current: value });
+    return hookCache.get(id);
+  },
   useSyncExternalStore: (_subscribe, getSnapshot) => (typeof getSnapshot === 'function' ? getSnapshot() : undefined),
   useTransition: () => [false, (fn) => fn?.()],
   useId: () => 'stub-id',
@@ -2976,14 +2987,16 @@ await test('B1（护栏）：行高 ≥ 命中盒高度，相邻两行的勾选�
   const size = cssPx(checkBlock, 'width');
   const inset = Math.abs(cssPx(beforeBlock, 'inset'));
   const hitHeight = size + inset * 2;
-  const visualTop = paddingY + marginTop;
+  eq(size, mod.CHECK_SIZE_PX, '视觉尺寸要与常量一致：');
+  eq(marginTop, 0, '单行布局靠 align-items:center 居中，勾选框不许再用负 margin 顶对齐：');
+  // 单行态：勾选框在 44px 的行里垂直居中
+  const visualTop = paddingY + Math.max(0, (minHeight - paddingY * 2 - size) / 2);
   const hitTop = visualTop - inset;
   const hitBottom = visualTop + size + inset;
   const nextHitTop = minHeight + hitTop;
   const overlap = Math.max(0, hitBottom - nextHitTop);
   const geometry = mod.checkHitGeometry();
 
-  eq(size, mod.CHECK_SIZE_PX, '视觉尺寸要与常量一致：');
   eq(hitHeight >= 40, true, `命中盒高度必须 ≥40px（实际 ${hitHeight}）：`);
   eq(minHeight >= hitHeight, true, `B1：行高（${minHeight}）必须 ≥ 命中盒高度（${hitHeight}）：`);
   eq(overlap, 0, `B1：相邻两行的命中盒不许重叠（本行命中盒 y=[${hitTop},${hitBottom}]，下一行上沿 ${nextHitTop}）：`);
@@ -2994,6 +3007,184 @@ await test('B1（护栏）：行高 ≥ 命中盒高度，相邻两行的勾选�
   eq(geometry.overlap, 0, 'checkHitGeometry 也必须是零重叠：');
   console.log(`      [B1] 行高 ${minHeight}px / 视觉盒 ${size}px / 命中盒 ${size + inset * 2}×${hitHeight}px（y=[${hitTop},${hitBottom}]）`
     + ` / 下一行命中盒上沿 ${nextHitTop} / 重叠 ${overlap}px / 间隙 ${nextHitTop - hitBottom}px`);
+});
+
+/* ------------------------------------------------------------------ *
+ * 行布局（B + C）：默认单行 / 标题被截断时换行 / 行尾操作收进 hover-focus
+ *
+ * 这里钉住三件事：
+ *   1. 默认单行：同一份 DOM 的四个直接子元素顺序是 [勾选][标题][小字组][行尾操作]，
+ *      小字组不在标题容器里（否则它永远在第二行），标题单行省略；
+ *   2. 换行判定：注入 scrollWidth > clientWidth → 整行加 .wt-row--wrap、小字组落到
+ *      标题所在列的第二行；宽度回来时要「明显够宽」才解除（滞回），不是一不截断就弹回；
+ *   3. 行尾操作：默认 opacity:0 + pointer-events:none，行 hover / focus-within 才显示，
+ *      按钮始终在 DOM 里（Tab 可达、聚焦即显示）。
+ * 反向验证：删掉换行判定 → 第 2 条红；把 .wt-actions 改回常驻 → 第 3 条红。
+ * ------------------------------------------------------------------ */
+
+/** 找一行的直接子元素里某个类名的那个（只摊平数组，不跨层）。 */
+const rowChild = (tree, id, className) => {
+  const row = rowNode(tree, id);
+  if (!row) return null;
+  return directChildren(row)
+    .find((n) => String(n.props?.className ?? '').split(' ').includes(className)) ?? null;
+};
+
+/** 等过一轮防抖窗口（真实定时器；这个用例不装假定时器）。 */
+const waitForMeasure = () => new Promise((resolve) => setTimeout(resolve, mod.ROW_WRAP_DEBOUNCE_MS + 40));
+
+await testAsync('行布局 B：默认单行 —— [勾选][标题][小字组][行尾操作] 同一行容器，标题单行省略', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const tree = renderPanel({ t: mkT() });
+  const row = rowNode(tree, 'wt-1');
+  eq(Boolean(row), true, '必须找到待办行：');
+  eq(String(row.props.className).includes('wt-row--single'), true, `默认必须是单行类：${row.props.className}`);
+  eq(row.props['data-wt-row-wrap'], undefined, '默认不该有换行标记：');
+
+  const kids = directChildren(row);
+  const classes = kids.map((n) => String(n.props?.className ?? ''));
+  const indexOf = (className) => classes.findIndex((c) => c.split(' ').includes(className));
+  eq(indexOf('wt-check'), 0, `第一个直接子元素必须是勾选框：${classes.join(' | ')}`);
+  eq(indexOf('wt-row-main'), 1, '第二个是标题列：');
+  eq(indexOf('wt-meta'), 2, '第三个小字组（旗子/日期/项目）：');
+  eq(indexOf('wt-actions'), 3, '第四个行尾操作：');
+
+  const main = kids[indexOf('wt-row-main')];
+  const meta = kids[indexOf('wt-meta')];
+  eq(allNodes(main).includes(meta), false, '小字组不能在标题容器里（进去就只能是第二行）：');
+  eq(allNodes(main).some((n) => String(n.props?.className ?? '').split(' ').includes('wt-title')), true,
+    '标题必须渲染在标题列里：');
+  eq(allNodes(meta).some((n) => n.props?.['data-wt-priority-btn'] === 'true'), true,
+    '旗子必须在小字组里：');
+  eq(allNodes(meta).some((n) => n.props?.['data-wt-date-btn'] === 'true'), true,
+    '日期按钮必须在小字组里：');
+  eq(allNodes(meta).some((n) => n.props?.['data-wt-project-btn'] === 'true'), true,
+    '项目标签必须在小字组里：');
+
+  // 样式表原文：默认单行 = flex + 垂直居中 + 行高 ≥44；标题列可伸缩、小字组不压缩、标题单行省略
+  const rowRule = cssRule('.wt-row');
+  eq(/display:\s*flex/.test(rowRule), true, '默认单行必须用 flex 排在一行：');
+  eq(/align-items:\s*center/.test(rowRule), true, '勾选框/标题/小字组必须垂直居中：');
+  eq(cssPx(rowRule, 'min-height') >= 44, true, '行高下限仍必须 ≥44px：');
+  eq(/flex:\s*1/.test(cssRule('.wt-row-main')), true, '标题列必须 flex:1（吃掉剩余宽度）：');
+  eq(/flex:\s*none/.test(cssRule('.wt-meta')), true, '小字组必须 flex-shrink:0（不压小字）：');
+  // 注意：styled 里还有 `.wt-row.is-celebrating .wt-title {`，必须锚定行首才是标题那条规则
+  const titleRule = /\n\.wt-title \{([^}]*)\}/.exec(mod.STYLE_TEXT)?.[1] ?? '';
+  eq(/white-space:\s*nowrap/.test(titleRule), true, '标题必须单行（nowrap）：');
+  eq(/text-overflow:\s*ellipsis/.test(titleRule), true, '标题超出必须省略号：');
+});
+
+test('行布局判定：只有「标题会被截断」才换行；换行后要等单行放得下且多出 8px 才解除（滞回）', () => {
+  eq(typeof mod.decideRowWrap, 'function', '换行判定必须是可单测的纯函数：');
+  // 单行态：scrollWidth ≤ clientWidth 不换；多 1px 就换（亚像素误差由 SLACK 兜住）
+  eq(mod.decideRowWrap({ intrinsicWidth: 120, availableWidth: 120 }), false, '刚好放下不该换行：');
+  eq(mod.decideRowWrap({ intrinsicWidth: 121, availableWidth: 120 }), false, '1px 内含 SLACK，不算截断：');
+  eq(mod.decideRowWrap({ intrinsicWidth: 122, availableWidth: 120 }), true, '真的截断才换行：');
+  // 换行态：先预测「小字组回到第一行后标题还剩多少宽」= available − meta − gap
+  eq(mod.decideRowWrap({ wrapped: true, intrinsicWidth: 240, availableWidth: 300, metaWidth: 100 }), true,
+    '滞回：标题已经不被截断了，但塞回小字组后仍不够宽 → 保持换行：');
+  eq(mod.decideRowWrap({ wrapped: true, intrinsicWidth: 240, availableWidth: 348, metaWidth: 100 }), true,
+    '预测宽度 240 < 240+8 → 仍然保持换行：');
+  eq(mod.decideRowWrap({ wrapped: true, intrinsicWidth: 240, availableWidth: 356, metaWidth: 100 }), false,
+    '预测宽度 248 ≥ 240+8 → 明显变宽，解除换行：');
+  eq(mod.ROW_WRAP_HYSTERESIS_PX, 8, '滞回量固定 8px（可审计）：');
+  eq(mod.ROW_WRAP_DEBOUNCE_MS >= 80, true, `scrollWidth 测量必须有防抖窗口（实际 ${mod.ROW_WRAP_DEBOUNCE_MS}ms）：`);
+});
+
+await testAsync('行布局 C：scrollWidth > clientWidth → .wt-row--wrap + 小字组落到标题列第二行；变宽后带滞回解除', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const realResizeObserver = globalThis.ResizeObserver;
+  const observers = [];
+  const observed = [];
+  globalThis.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; this.disconnected = false; observers.push(this); }
+    observe(el) { observed.push(el); }
+    unobserve(el) { this.unobserved = el; }
+    disconnect() { this.disconnected = true; }
+  };
+  try {
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkT() });
+      let row = rowNode(tree, 'wt-1');
+      const rowEl = { tag: 'wt-row' };
+      row.props.ref(rowEl);
+      eq(observers.length, 1, '每行必须用 ResizeObserver 盯宽度变化：');
+      eq(observed.includes(rowEl), true, 'ResizeObserver 必须观察行（面板宽度变化会改变行宽）：');
+
+      const title = rowTitleBtnOf(tree, 'wt-1');
+      const meta = rowChild(tree, 'wt-1', 'wt-meta');
+      eq(Boolean(title), true, '必须找到标题按钮：');
+      eq(Boolean(meta), true, '必须找到小字组：');
+      meta.props.ref.current = { scrollWidth: 100, clientWidth: 100 };
+
+      // 注入「标题固有宽 240 > 列宽 120」= 会被省略号截断
+      title.props.ref({ scrollWidth: 240, clientWidth: 120 });
+      await waitForMeasure();
+      tree = renderPanel({ t: mkT() });
+      row = rowNode(tree, 'wt-1');
+      eq(String(row.props.className).includes('wt-row--wrap'), true, `标题会被截断时必须换行：${row.props.className}`);
+      eq(row.props['data-wt-row-wrap'], 'true', '换行态要能被断言到：');
+
+      // DOM/CSS：小字组仍在行里，但被 grid 放到第二行、与标题同一起点（content 列）
+      const wrapRule = cssRule('.wt-row--wrap');
+      eq(/display:\s*grid/.test(wrapRule), true, '换行态必须用 grid 两列（勾选框列 + 内容列）：');
+      eq(/grid-template-areas:\s*"check main actions"\s*"\. meta \."/.test(wrapRule), true,
+        `小字组必须落在第二行、标题那一列：${wrapRule}`);
+      eq(/\.wt-row--wrap \.wt-meta\s*\{[^}]*grid-area:\s*meta/.test(mod.STYLE_TEXT), true,
+        '小字组必须显式放进 meta 区（不是缩进到勾选框下面）：');
+      eq(/\.wt-row--wrap \.wt-check\s*\{[^}]*grid-area:\s*check/.test(mod.STYLE_TEXT), true,
+        '勾选框仍在第一行（标题行）自己的列里：');
+      eq(/\.wt-title\s*\{[^}]*white-space:\s*nowrap/.test(mod.STYLE_TEXT), true,
+        '换行态标题仍必须单行（nowrap），不许撑成两三行高：');
+      eq(/\.wt-title\s*\{[^}]*text-overflow:\s*ellipsis/.test(mod.STYLE_TEXT), true,
+        '换行态标题的省略号规则必须仍然生效（.wt-title 不按布局态分开写）：');
+
+      // 稍微变宽：当前标题列 300 > 固有宽 240（已不截断），但单行要把 100px 小字组塞回去 → 保持换行
+      title.props.ref({ scrollWidth: 240, clientWidth: 300 });
+      await waitForMeasure();
+      tree = renderPanel({ t: mkT() });
+      eq(String(rowNode(tree, 'wt-1').props.className).includes('wt-row--wrap'), true,
+        '滞回：只是不再截断还不够，必须等单行真的放得下（否则会来回抖）：');
+
+      // 明显变宽：360 − (100 + 8) = 252 ≥ 240 + 8 → 解除
+      title.props.ref({ scrollWidth: 240, clientWidth: 360 });
+      await waitForMeasure();
+      tree = renderPanel({ t: mkT() });
+      row = rowNode(tree, 'wt-1');
+      eq(String(row.props.className).includes('wt-row--single'), true, `明显变宽后必须解除换行：${row.props.className}`);
+      eq(row.props['data-wt-row-wrap'], undefined, '解除后换行标记必须消失：');
+
+      // 卸载时观察器要断开（不留悬空回调）
+      row.props.ref(null);
+      eq(observers[0].disconnected, true, '行卸载时必须 disconnect ResizeObserver：');
+    });
+  } finally {
+    globalThis.ResizeObserver = realResizeObserver;
+  }
+});
+
+test('行尾操作：默认 opacity:0 + pointer-events:none；行 hover / focus-within 才显形；按钮仍在 DOM 里（Tab 可达）', () => {
+  const css = mod.STYLE_TEXT;
+  const actionsRule = cssRule('.wt-actions');
+  eq(/opacity:\s*0/.test(actionsRule), true, '行尾操作平时必须不可见：');
+  eq(/pointer-events:\s*none/.test(actionsRule), true, '平时也不能被鼠标误点：');
+  eq(/display:\s*none/.test(actionsRule), false, '不能用 display:none 隐藏（那会把它从 Tab 顺序里摘掉）：');
+  eq(/visibility:\s*hidden/.test(actionsRule), false, '不能用 visibility:hidden 隐藏（同样会让 Tab 够不着）：');
+  eq(/\.wt-row:hover \.wt-actions[^{]*\{[^}]*opacity:\s*1/.test(css), true, '行 hover 时必须显示：');
+  eq(/\.wt-row:focus-within \.wt-actions[^{]*\{[^}]*opacity:\s*1/.test(css), true, '行内元素获得焦点（含 Tab）时必须显示：');
+  eq(/\.wt-row:focus-within \.wt-actions[^{]*\{[^}]*pointer-events:\s*auto/.test(css), true, '显示后必须可点：');
+  eq(/\.wt-actions\.is-armed\s*\{[^}]*opacity:\s*1/.test(css), true, '删除二次确认态必须常显（鼠标移开也能点「确认删除？」）：');
+
+  const tree = renderPanel({ t: mkT() });
+  const actions = rowChild(tree, 'wt-1', 'wt-actions');
+  eq(Boolean(actions), true, '行尾操作容器必须始终渲染：');
+  const buttons = allNodes(actions).filter((n) => n.type === 'button');
+  eq(buttons.length, 2, `行尾必须恰好两个按钮（铅笔 + 删除），实际 ${buttons.length}：`);
+  eq(buttons.some((n) => n.props?.['data-wt-edit-details'] === 'true'), true, '铅笔（整单编辑）必须在行尾操作里：');
+  eq(buttons.every((n) => n.props?.tabIndex !== -1 && n.props?.disabled !== true), true,
+    '两个按钮都必须留在 Tab 顺序里（不许 tabIndex:-1 / disabled）：');
 });
 
 await testAsync('勾选完成的动效：挂 is-celebrating / wt-check-celebrate / 对勾描边，动画结束自己摘掉', async () => {

@@ -231,10 +231,12 @@
     <h2>同一组待办，四种行的排法 · Four row layouts, one dataset</h2>
     <p>这页只是 <b>mockup</b>：不改应用代码，也不读写任何数据。四个方案用<b>同一组示例数据</b>，
        分别在<b>窄 320 / 中 420 / 宽 600</b> 的面板宽度下各渲染一遍；每格都含普通行、空白行（hover 才显出「＋日期」「＋项目」）、
-       长标题、hover 态、已完成态，以及高/中/低三档旗子。行尾的铅笔/删除与真实面板一致。</p>
+       长标题、hover 态、已完成态，以及高/中/低三档旗子。行尾的铅笔/删除与真实面板一致（常驻），所以窄 320px 下 B 的标题会被
+       元信息与操作按钮挤到只剩三四个字——这正是 C 存在的理由。</p>
     <p class="en">A static mockup comparing four layouts for a task row in the dsh-worktodo panel — no app code is touched.
        Every scheme renders the same sample rows at 320 / 420 / 600 px panel widths, covering normal, empty, long-title,
-       hover, done and all three priority flags. Hover any row for the real interaction; rows marked “hover” show it forced.</p>
+       hover, done and all three priority flags. Hover any row for the real interaction; rows marked “hover” show it forced.
+       At 320px, B leaves only a few characters for the title — exactly why C exists.</p>
     <div class="reco">
       <span class="k">推荐</span>
       <span>B 的骨架 + C 的窄屏自适应：宽面板永远单行、小字钉在行末；窄到标题被挤时，小字自己落到第二行并与标题左对齐。同一份结构，两种宽度表现。
@@ -297,7 +299,7 @@
       id: 'B', cls: 'b-row', name: 'B · 单行（推荐）', tag: '推荐', rec: true,
       sub: '固定 44px · 勾选框垂直居中 · 小字永远钉在行末',
       pros: '一眼一行、勾选框与整行垂直居中，小字不再参与标题排版，扫读最快。',
-      cons: '窄面板（320px）下元信息把标题挤到只剩一小截，长标题只能靠省略号。',
+      cons: '窄面板（320px）下元信息加行尾操作把标题挤到只剩三四个字，长标题只能靠省略号。',
       en: 'Fastest to scan and visually calm; the cost is a short title at 320px, where the meta takes almost half the width.'
     },
     {
@@ -382,8 +384,8 @@
   }
 
   function actionsHTML() {
-    return '<button type="button" class="ico" title="编辑详情">' + PENCIL + '</button>'
-      + '<button type="button" class="ico danger" title="删除">' + TRASH + '</button>';
+    return '<button type="button" class="ico" title="编辑详情" aria-label="编辑详情">' + PENCIL + '</button>'
+      + '<button type="button" class="ico danger" title="删除" aria-label="删除">' + TRASH + '</button>';
   }
 
   function rowAttrs(scheme, r) {
