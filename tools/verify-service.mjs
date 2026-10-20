@@ -213,12 +213,16 @@ await test('分组结果与筛选结果同时可用（面板一次请求拿全�
   const s = makeService();
   await s.create({ title: '已过期', due: '2026-10-10' });
   await s.create({ title: '今天', due: 'today' });
+  await s.create({ title: '明天', due: 'tomorrow' });
   await s.create({ title: '无期' });
   const view = await s.list({ filter: 'open' });
   eq(view.groups.overdue.map((t) => t.title), ['已过期']);
   eq(view.groups.today.map((t) => t.title), ['今天']);
+  eq(view.groups.tomorrow.map((t) => t.title), ['明天']);
+  eq(view.groups.week.map((t) => t.title), [], '明天不能再落进本周：');
   eq(view.groups.later.map((t) => t.title), ['无期']);
   eq(view.today, '2026-10-14');
+  eq(view.stats.tomorrow, 1, 'stats 顺带给出明天条数：');
 });
 
 console.log('会话待办提升');

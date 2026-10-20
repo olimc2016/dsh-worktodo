@@ -2307,6 +2307,51 @@ function openCompletedGroup(t) {
   return renderPanel({ t });
 }
 
+/* ------------------------------------------------------------------ *
+ * 「按截止」分组顺序：已过期 → 今天 → 明天 → 本周 → 以后 → 已完成
+ * ------------------------------------------------------------------ */
+
+console.log('按截止分组：明天');
+
+await testAsync('明天分组存在、顺序在 今天 与 本周 之间，中英文案各一条', async () => {
+  eq(mod.GROUPS.map((group) => group.key), ['overdue', 'today', 'tomorrow', 'week', 'later', 'completed'],
+    'GROUPS 顺序（明天必须夹在 今天 与 本周 之间）：');
+  const tomorrow = mod.GROUPS.find((group) => group.key === 'tomorrow');
+  eq(tomorrow.label, 'groupTomorrow', '明天分组的 i18n key：');
+  const dictionaries = localeRegistrations[0]?.dictionaries ?? {};
+  eq(dictionaries.zh?.groupTomorrow, '明天', '中文文案 ');
+  eq(dictionaries.en?.groupTomorrow, 'Tomorrow', '英文文案 ');
+  eq(Object.keys(dictionaries.zh).includes('groupTomorrow'), true);
+  eq(Object.keys(dictionaries.en).includes('groupTomorrow'), true);
+});
+
+await testAsync('渲染：明天分组标题出现、默认展开（不点也能看到行），恢复后空分组不渲染', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const payload = fakeListPayload.data;
+  const tomorrowTodo = {
+    id: 'wt-tomorrow', title: '明天的事', notes: '', status: 'pending', priority: 'normal',
+    due: '2026-10-15', project: null, source: 'human',
+    createdAt: 3, updatedAt: 3, completedAt: null,
+  };
+  payload.groups.tomorrow = [tomorrowTodo];
+  try {
+    const tree = renderPanel({ t: mkT() });
+    const head = allNodes(tree)
+      .find((n) => String(n.props?.className ?? '').includes('wt-group-head') && textOf(n).includes('[groupTomorrow]'));
+    eq(Boolean(head), true, '面板上必须有「明天」分组头：');
+    eq(head.props['aria-expanded'], true, '明天分组必须默认展开（与今天一致）：');
+    eq(head.props.title, '[collapse]', '默认状态是展开（title 应是 collapse）：');
+    eq(Boolean(rowNode(tree, 'wt-tomorrow')), true, '默认展开时明天那一行要直接可见：');
+  } finally {
+    delete payload.groups.tomorrow;
+  }
+  // 空分组整块不渲染（沿用现有行为）：恢复成空后，明天分组头必须消失
+  const emptyTree = renderPanel({ t: mkT() });
+  eq(allNodes(emptyTree).some((n) => String(n.props?.className ?? '').includes('wt-group-head')
+    && textOf(n).includes('[groupTomorrow]')), false, '空分组不该渲染标题：');
+});
+
 await test('四旗 UI 只有一份：快速添加与行内旗子共用同一个弹层实现（防两份漂移）', () => {
   const source = readFileSync(join(here, '..', 'src', 'client', 'index.js'), 'utf8');
   eq((source.match(/data-wt-priority-pop/g) ?? []).length, 1,

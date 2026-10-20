@@ -471,7 +471,7 @@ await test('GET /list 能读到刚建的条目，含分组与统计', async () =
   eq(body.ok, true);
   eq(body.data.todos.length, 1);
   eq(body.data.stats.open, 1);
-  eq(Object.keys(body.data.groups).sort(), ['completed', 'later', 'overdue', 'today', 'week']);
+  eq(Object.keys(body.data.groups).sort(), ['completed', 'later', 'overdue', 'today', 'tomorrow', 'week']);
 });
 
 await test('POST /status 勾选完成后再取消', async () => {

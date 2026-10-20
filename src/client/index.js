@@ -161,6 +161,7 @@ const zh = {
   'prioLow': '低',
   'groupOverdue': '已过期',
   'groupToday': '今天',
+  'groupTomorrow': '明天',
   'groupWeek': '本周',
   'groupLater': '以后',
   'groupCompleted': '已完成',
@@ -330,6 +331,7 @@ const en = {
   'prioLow': 'Low',
   'groupOverdue': 'Overdue',
   'groupToday': 'Today',
+  'groupTomorrow': 'Tomorrow',
   'groupWeek': 'This week',
   'groupLater': 'Later',
   'groupCompleted': 'Completed',
@@ -2999,9 +3001,14 @@ function SessionAdopt({ useProjection, t, onAdopt, busy }) {
 /* ------------------------------------------------------------------ *
  * 面板主体
  * ------------------------------------------------------------------ */
-const GROUPS = [
+/**
+ * 「按截止」视图的分组顺序：已过期 → 今天 → 明天 → 本周 → 以后 → 已完成。
+ * key 必须与宿主 groupRecords() 的桶名一一对应；空桶由 Group 组件整块跳过。
+ */
+export const GROUPS = [
   { key: 'overdue', label: 'groupOverdue' },
   { key: 'today', label: 'groupToday' },
+  { key: 'tomorrow', label: 'groupTomorrow' },
   { key: 'week', label: 'groupWeek' },
   { key: 'later', label: 'groupLater' },
   { key: 'completed', label: 'groupCompleted' },

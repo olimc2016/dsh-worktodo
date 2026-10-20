@@ -77,6 +77,22 @@ export function weekStartKey(now) {
   return dayKey(d.getTime() - offset * DAY_MS);
 }
 
+/**
+ * 某个 'YYYY-MM-DD' 往后 n 天的 'YYYY-MM-DD'。
+ *
+ * 用日历运算（`Date#setDate`）而不是 `dayStart(key) + n * DAY_MS`：
+ * 有夏令时的时区里一天可能是 23/25 小时，固定加 24h 会算错日期。
+ * 跨月、跨年、闰日都由 Date 自己处理。
+ * @param {string} key
+ * @param {number} days
+ * @returns {string}
+ */
+function addDaysKey(key, days) {
+  const d = new Date(dayStart(key));
+  d.setDate(d.getDate() + days);
+  return dayKey(d);
+}
+
 /** 是否形如 'YYYY-MM-DD' 且是真实存在的日期。 */
 export function isDayKey(value) {
   return typeof value === 'string' && !Number.isNaN(dayStart(value));
@@ -402,22 +418,28 @@ export function applyManualOrder(records, ids) {
 }
 
 /**
- * 分组成面板的五个区。
- * 「本周」= 今天之后到本周日；无截止日期的进「以后」。
+ * 分组成面板的六个区。
+ * 「明天」= 今天 + 1 天（本地时区，与 dayKey 同语义）；
+ * 「本周」= 明天之后到本周日（**不含**明天，今天与明天都已单独立栏）；
+ * 无截止日期的进「以后」。
  * @param {object[]} records
  * @param {number} [now]
- * @returns {{overdue: object[], today: object[], week: object[], later: object[], completed: object[]}}
+ * @returns {{overdue: object[], today: object[], tomorrow: object[], week: object[], later: object[], completed: object[]}}
  */
 export function groupRecords(records, now = Date.now(), mode = 'priority') {
   const today = dayKey(now);
+  const tomorrow = addDaysKey(today, 1);
   const weekEnd = dayKey(dayStart(weekStartKey(now)) + 6 * DAY_MS);
-  const groups = { overdue: [], today: [], week: [], later: [], completed: [] };
+  const groups = { overdue: [], today: [], tomorrow: [], week: [], later: [], completed: [] };
   for (const record of records) {
     if (record.status === 'completed') { groups.completed.push(record); continue; }
     const due = record.due;
     if (!due) { groups.later.push(record); continue; }
     if (due < today) { groups.overdue.push(record); continue; }
     if (due === today) { groups.today.push(record); continue; }
+    if (due === tomorrow) { groups.tomorrow.push(record); continue; }
+    // 走到这里 due > tomorrow，因此本周天然排除了今天与明天；
+    // 边界仍沿用原来的「到本周日为止」。
     if (due <= weekEnd) { groups.week.push(record); continue; }
     groups.later.push(record);
   }
@@ -427,9 +449,10 @@ export function groupRecords(records, now = Date.now(), mode = 'priority') {
 
 /**
  * 面板顶部的统计。
+ * `tomorrow` 与分组同口径（本地时区今天 + 1 天）；面板 chip 暂不展示，留给调用方按需使用。
  * @param {object[]} records
  * @param {number} [now]
- * @returns {{total: number, open: number, overdue: number, today: number, doing: number, completed: number, completedToday: number}}
+ * @returns {{total: number, open: number, overdue: number, today: number, tomorrow: number, doing: number, completed: number, completedToday: number}}
  */
 /**
  * 按项目分组：面板的「按项目」视图。
@@ -521,7 +544,8 @@ export function listProjects(records, limit = PROJECT_LIST_LIMIT) {
 
 export function statsOf(records, now = Date.now()) {
   const today = dayKey(now);
-  const stats = { total: records.length, open: 0, overdue: 0, today: 0, doing: 0, completed: 0, completedToday: 0 };
+  const tomorrow = addDaysKey(today, 1);
+  const stats = { total: records.length, open: 0, overdue: 0, today: 0, tomorrow: 0, doing: 0, completed: 0, completedToday: 0 };
   for (const record of records) {
     if (record.status === 'completed') {
       stats.completed += 1;
@@ -533,6 +557,7 @@ export function statsOf(records, now = Date.now()) {
     if (record.due) {
       if (record.due < today) stats.overdue += 1;
       else if (record.due === today) stats.today += 1;
+      else if (record.due === tomorrow) stats.tomorrow += 1;
     }
   }
   return stats;
@@ -544,7 +569,7 @@ export function statsOf(records, now = Date.now()) {
  * 注意 week 与 groupRecords 的 `week` 桶**语义不同**，这是有意的：
  *   - 这里（查询）是「今天起、到本周日为止」的**累计**视图——用户问「本周有什么事」时
  *     当然要看到今天的事，否则还得再查一次 today；
- *   - groupRecords 的桶是给面板**分栏**用的，今天已经单独立栏，再放进本周栏就是重复。
+ *   - groupRecords 的桶是给面板**分栏**用的，今天与明天已经各立一栏，再放进本周栏就是重复。
  * @param {object[]} records
  * @param {string} [filter] open / today / overdue / week / doing / completed / all
  * @param {number} [now]

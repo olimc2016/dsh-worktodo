@@ -504,13 +504,13 @@ await test('remove 的报文（ref）可用', async () => {
   eq(removed.ok, true);
 });
 
-await test('list 返回面板首屏需要的全部字段与五个分组', async () => {
+await test('list 返回面板首屏需要的全部字段与六个分组', async () => {
   const body = await hit('/worktodo/list?filter=all');
   eq(body.ok, true);
   for (const key of ['todos', 'groups', 'stats', 'today', 'store', 'projects', 'projectsTruncated', 'panel']) {
     eq(key in body.data, true, `面板需要的字段 ${key} 缺失：`);
   }
-  eq(Object.keys(body.data.groups).sort(), ['completed', 'later', 'overdue', 'today', 'week']);
+  eq(Object.keys(body.data.groups).sort(), ['completed', 'later', 'overdue', 'today', 'tomorrow', 'week']);
   eq(typeof body.data.store.kind, 'string');
   eq(typeof body.data.store.location, 'string');
   // 面板配置块：勾选完成动效的开关（宿主 config.celebrate → 面板 config.celebrate）

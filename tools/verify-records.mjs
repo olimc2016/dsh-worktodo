@@ -215,12 +215,71 @@ test('已完成的已过期事不再算已过期', () => {
   eq(g.overdue.some((r) => r.id === 'f'), false);
 });
 
+test('分桶：昨天/今天/明天/后天/下个月 → 已过期/今天/明天/本周/以后（明天不再进本周）', () => {
+  const five = [
+    mk({ title: '昨天', due: '2026-10-13' }, 'y'),
+    mk({ title: '今天', due: TODAY }, 't'),
+    mk({ title: '明天', due: '2026-10-15' }, 'm'),
+    mk({ title: '后天', due: '2026-10-16' }, 'a'),
+    mk({ title: '下个月', due: '2026-11-20' }, 'n'),
+  ];
+  const g = groupRecords(five, NOW);
+  eq(g.overdue.map((r) => r.id), ['y'], '昨天 ');
+  eq(g.today.map((r) => r.id), ['t'], '今天 ');
+  eq(g.tomorrow.map((r) => r.id), ['m'], '明天 ');
+  eq(g.week.map((r) => r.id), ['a'], '后天 ');
+  eq(g.later.map((r) => r.id), ['n'], '下个月 ');
+  eq(g.week.some((r) => r.id === 'm'), false, '明天不能再出现在本周：');
+});
+
+test('明天边界：跨月 / 跨年 / 闰日按本地日历推进', () => {
+  // 2026-10-31（周六）→ 明天 11-01，同时是本周日；明天优先，故本周桶为空
+  const monthEnd = new Date(2026, 9, 31, 10, 30, 0, 0).getTime();
+  const crossMonth = groupRecords([
+    mk({ title: '明天', due: '2026-11-01' }, 'cm'),
+    mk({ title: '后天', due: '2026-11-02' }, 'cm2'),
+  ], monthEnd);
+  eq(crossMonth.tomorrow.map((r) => r.id), ['cm'], '跨月明天 ');
+  eq(crossMonth.week, [], '11-01 是明天（也正好是本周日），必须进明天桶而不是本周：');
+
+  // 2026-12-31（周四）→ 明天 2027-01-01；2027-01-02 才是本周
+  const yearEnd = new Date(2026, 11, 31, 23, 50, 0, 0).getTime();
+  const crossYear = groupRecords([
+    mk({ title: '明天', due: '2027-01-01' }, 'cy'),
+    mk({ title: '后天', due: '2027-01-02' }, 'cy2'),
+  ], yearEnd);
+  eq(crossYear.tomorrow.map((r) => r.id), ['cy'], '跨年明天 ');
+  eq(crossYear.week.map((r) => r.id), ['cy2'], '跨年后天仍在本周：');
+
+  // 2028-02-28（周一，闰年）→ 明天 02-29
+  const leap = new Date(2028, 1, 28, 9, 0, 0, 0).getTime();
+  const leapDay = groupRecords([mk({ title: '明天', due: '2028-02-29' }, 'leap')], leap);
+  eq(leapDay.tomorrow.map((r) => r.id), ['leap'], '闰日明天 ');
+
+  // 非闰年 2027-02-28 → 明天 03-01
+  const nonLeap = new Date(2027, 1, 28, 9, 0, 0, 0).getTime();
+  const march = groupRecords([mk({ title: '明天', due: '2027-03-01' }, 'nl')], nonLeap);
+  eq(march.tomorrow.map((r) => r.id), ['nl'], '非闰年跨月明天 ');
+});
+
+test('统计口径：明天单独计数，不再混入今天/已过期', () => {
+  const s = statsOf([
+    mk({ title: '昨天', due: '2026-10-13' }, 'y'),
+    mk({ title: '今天', due: TODAY }, 't'),
+    mk({ title: '明天', due: '2026-10-15' }, 'm'),
+  ], NOW);
+  eq(s.overdue, 1);
+  eq(s.today, 1);
+  eq(s.tomorrow, 1);
+});
+
 test('统计口径：已过期/今天/未完成/今日完成', () => {
   const s = statsOf(records, NOW);
   eq(s.total, 6);
   eq(s.open, 5);
   eq(s.overdue, 1);
   eq(s.today, 1);
+  eq(s.tomorrow, 0);
   eq(s.completed, 1);
   eq(s.completedToday, 1);
 });
