@@ -599,20 +599,34 @@ export const ROW_GAP_PX = 8;
  */
 export const FLAG_SLOT_PX = 18;
 /**
- * 小字组里「日期/时间」列的固定宽度（px）。
+ * 小字组四只固定槽的宽度（px）与**固定顺序**：
  *
- * 为什么固定：旧实现把小字组当自由排布的 flex，日期贴着标题右端漂移，标题一长一短
- * 日期就换 x 坐标。现在日期列是网格里**定宽的一列**、内容右对齐，所有行的日期
- * 右边缘落在同一条竖线上。96px 的来历：11px 字号下 "2026-10-20 14:30" ≈ 93px
- * （日期按钮左右 padding 收到 2px），日期列必须放得下日期 + 时间。
+ *     [日期/时间 96px][来源 44px][已过期 44px][项目 96px]
+ *
+ * 为什么四只槽都定宽：旧实现把小字组当自由排布的 flex，日期贴着标题右端漂移，
+ * 标题一长一短、有没有来源，日期与项目的 x 就跟着变。现在四列都**恒占位**
+ * （无日期 / 无来源 / 未过期 / 无项目也留空），整组宽度恒定、贴着行右端，
+ * 所以日期永远在最左、项目永远在最右，任何两行的同一槽都落在同一条竖线上。
+ *
+ * 日期 96px 的来历：11px 字号下 "2026-10-20 14:30" ≈ 93px（日期按钮左右 padding
+ * 收到 2px），槽里必须放得下日期 + 时间。
+ * 来源 44px / 已过期 44px：来源只有 "AI" / "会话" 两个短词；「已过期」三个字在
+ * 10.5px 下 ≈ 31.5px，胶囊 padding 收到 4px 后整颗 ≈ 41.5px，44px 刚好放得下。
+ * 项目 96px ≈ 8 个汉字（11px 字号下≈88px + 内边距）——常见项目名完整显示，更长由省略号收尾。
+ *
+ * 满宽 = 96 + 44 + 44 + 72 + 3×6 = 298px（META_SLOT_TOTAL_PX，运行时由 scrollWidth 复算）。
  */
 export const META_DATE_SLOT_PX = 96;
-/**
- * 小字组里「项目」列的固定宽度（px）：`#项目` 定宽 + nowrap + 省略号，
- * 无项目的行也占住这一列（否则那行的日期又会因为少了项目列而左移）。
- * 72px 约等于 13 个半角字符，常见项目名够用，过长由省略号收尾。
- */
-export const META_PROJECT_SLOT_PX = 72;
+export const META_SOURCE_SLOT_PX = 44;
+export const META_OVERDUE_SLOT_PX = 44;
+export const META_PROJECT_SLOT_PX = 96;
+/** 小字组四列之间的间距（px）：与样式表 .wt-meta 的 column-gap 取同一个值。 */
+export const META_SLOT_GAP_PX = 6;
+/** 小字组的槽位顺序（DOM 顺序 = 视觉顺序，测试与实现共用这一份声明）。 */
+export const META_SLOT_ORDER = ['date', 'source', 'overdue', 'project'];
+/** 小字组满宽（px）：四只槽 + 三个列间距。恒占位，所以它与内容无关。 */
+export const META_SLOT_TOTAL_PX = META_DATE_SLOT_PX + META_SOURCE_SLOT_PX
+  + META_OVERDUE_SLOT_PX + META_PROJECT_SLOT_PX + META_SLOT_GAP_PX * (META_SLOT_ORDER.length - 1);
 /** 量标题时允许的亚像素误差：多出 1px 才算出界，避免 0.5px 抖动反复换行。 */
 export const ROW_WRAP_SLACK_PX = 1;
 /** 解除换行所需的额外余量（px）：一旦换行，要等单行真的放得下且多出这么多才收回。 */
@@ -765,8 +779,8 @@ export const STYLE_TEXT = `
 .wt-row { display: flex; align-items: center; gap: ${ROW_GAP_PX}px; padding: ${ROW_PADDING_Y_PX}px 8px; min-height: ${ROW_MIN_HEIGHT_PX}px; border-radius: 10px; }
 .wt-row:hover { background: ${C.hover}; }
 /* 标题列：唯一可伸缩的格子；min-width:0 是省略号能生效的前提。
-   列内是 [标题 flex:1][「已过期」/来源小胶囊]：胶囊永远贴在这一列的**右端**，
-   x 坐标固定、不随标题长短漂移，也不挤动右边小字组的固定列。
+   列内平时只有 [标题 flex:1]；来源/「已过期」胶囊已搬进右边小字组的固定槽（见 .wt-meta），
+   所以标题长短不会挤动日期/来源/状态/项目任何一列。
    行内错误（.wt-title-error）用 flex-basis:100% 强制换到第二行，保持「错误单独一行」。 */
 .wt-row-main { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
 .wt-row-main > .wt-title { flex: 1 1 0; width: auto; min-width: 0; }
@@ -780,13 +794,15 @@ export const STYLE_TEXT = `
   display: inline-flex; align-items: center; justify-content: center;
   flex: 0 0 ${FLAG_SLOT_PX}px; width: ${FLAG_SLOT_PX}px; height: 22px; position: relative;
 }
-/* 小字组：**固定两列** —— 日期/时间（定宽、右对齐）+ 项目（定宽、省略号）。
-   两列都恒占位（无日期 / 无项目也留空），所以任何两行的日期右边缘都落在同一条竖线上，
-   不再随标题长短、有没有项目漂移。换行态复用同一套列定义（见 .wt-row--wrap .wt-meta）。 */
+/* 小字组：**固定四列**，顺序就是 [日期/时间][来源][已过期][项目]。
+   四列都恒占位（无日期 / 无来源 / 未过期 / 无项目也留空），整组宽度恒为 META_SLOT_TOTAL_PX，
+   且贴在行右端（flex:none，后面只有行尾操作），所以日期永远在最左、项目永远在最右，
+   任何两行的同一槽都落在同一条竖线上，不随标题长短、有没有来源漂移。
+   换行态复用同一套列定义（见 .wt-row--wrap .wt-meta）。 */
 .wt-meta {
   display: grid;
-  grid-template-columns: ${META_DATE_SLOT_PX}px ${META_PROJECT_SLOT_PX}px;
-  column-gap: 6px;
+  grid-template-columns: ${META_DATE_SLOT_PX}px ${META_SOURCE_SLOT_PX}px ${META_OVERDUE_SLOT_PX}px ${META_PROJECT_SLOT_PX}px;
+  column-gap: ${META_SLOT_GAP_PX}px;
   align-items: center;
   flex: none;
   min-width: 0;
@@ -798,13 +814,30 @@ export const STYLE_TEXT = `
   width: ${META_DATE_SLOT_PX}px; min-width: 0;
 }
 .wt-date-node { flex: 1 1 auto; min-width: 0; justify-content: flex-end; }
-/* 项目槽：定宽 72px、单行、省略号；空槽同样占位。同理不能 overflow:hidden。 */
+/* 来源槽 / 「已过期」槽：同样定宽、**恒占位**（空着也占住这一列，否则项目列会左右跳）。
+   槽本身不裁切（保持 overflow:visible），由里面的胶囊自己单行 + 省略号收尾；
+   完整文案在胶囊的 title 里（悬停可看全）。 */
+.wt-meta-source,
+.wt-meta-overdue {
+  display: flex; align-items: center; min-width: 0; overflow: visible;
+}
+.wt-meta-source { width: ${META_SOURCE_SLOT_PX}px; }
+.wt-meta-overdue { width: ${META_OVERDUE_SLOT_PX}px; }
+.wt-meta-source > .wt-tag,
+.wt-meta-overdue > .wt-tag {
+  display: block; min-width: 0; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis;
+}
+/* 「已过期」三个字 10.5px ≈ 31.5px：左右 padding 收到 4px（+1px 边框）整颗 ≈41.5px，
+   才塞得进 44px 的槽；不然会被省略号截成「已过…」，术语就丢了。 */
+.wt-meta-overdue > .wt-tag { padding: 0 4px; }
+/* 项目槽：定宽 96px（≈8 个汉字）、单行、省略号；空槽同样占位。同理不能 overflow:hidden。 */
 .wt-meta-project {
   display: flex; align-items: center;
   width: ${META_PROJECT_SLOT_PX}px; min-width: 0; overflow: visible;
 }
 .wt-project-node { flex: 0 1 auto; min-width: 0; max-width: 100%; }
-/* 行内错误：跨两列、各自单独一行（不挤动日期/项目两列的 x 坐标）。 */
+/* 行内错误：跨四列、各自单独一行（不挤动四只槽的 x 坐标）。 */
 .wt-meta > .wt-date-error,
 .wt-meta > .wt-project-error { grid-column: 1 / -1; }
 /* 行尾操作（整单编辑 / 删除）：平时完全让出视线（opacity:0 + pointer-events:none），
@@ -820,14 +853,13 @@ export const STYLE_TEXT = `
   border: 1px solid ${C.border1}; background: ${C.layer1};
 }
 /* C（自适应换行）：同样的 DOM，标题会被截断时整行切成两行网格。
-   第一行 [旗子槽][勾选框][标题 + 状态/来源胶囊][行尾操作]；第二行小字组落在标题那一列，
-   **右端对齐**（justify-self: end）：与单行态 meta 的右边缘重合 → 96px 日期列的 x 跨换行不变 ✓（用户明确要求"日期位置固定"）。
+   第一行 [旗子槽][勾选框][标题][行尾操作]；第二行小字组落在标题那一列，
+   **右端对齐**（justify-self: end）：与单行态 meta 的右边缘重合 → 四列（含日期）的 x
+   跨换行不变 ✓（用户明确要求"日期位置固定"）。
    网格的前两列就是「旗子 + 勾选」的固定宽度：auto auto minmax(0,1fr) auto，
-   所以 meta 放在第 3 列时，它的起始 x 就是标题的起始 x。
-   小字组**不重定义列宽**：沿用 .wt-meta 的 96px/72px 两列。
-   勾选框与旗子仍只居中于第一行（标题行）。
-   取舍：同一布局内所有行的 96px 日期列仍严格对齐；跨「单行↔换行」时日期块从
-   标题列右端换到左端 —— 这是「与标题左对齐」的直接代价（本任务明确要求左对齐）。 */
+   所以 meta 放在第 3 列时，它的起始 x 就是标题列的起始 x。
+   小字组**不重定义列宽**：沿用 .wt-meta 的 96px/44px/44px/96px 四列。
+   勾选框与旗子仍只居中于第一行（标题行）。 */
 .wt-row--wrap {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr) auto;
@@ -842,7 +874,7 @@ export const STYLE_TEXT = `
 .wt-row--wrap .wt-flag-slot { grid-area: flag; }
 .wt-row--wrap .wt-row-main { grid-area: main; min-width: 0; }
 /* justify-self:end = 小字组贴标题列**右端**（关键：96px 日期列的 x 跨换行不变 ✓）；
-   固定列（96px 日期 / 72px 项目）照旧，不因换行重排。 */
+   固定列（96px 日期 / 96px 项目）照旧，不因换行重排。 */
 .wt-row--wrap .wt-meta { grid-area: meta; justify-self: end; max-width: 100%; }
 .wt-row--wrap .wt-actions { grid-area: actions; }
 .wt-seg {
@@ -923,7 +955,7 @@ export const STYLE_TEXT = `
   border-radius: 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, .12);
 }
 /* 行内项目标签：外观仍是那颗 #项目 小胶囊，但它是真按钮。
-   项目列定宽 72px：display:block（text-overflow 要块级盒子才生效）+ 单行 + 省略号。
+   项目列定宽 96px：display:block（text-overflow 要块级盒子才生效）+ 单行 + 省略号。
    浮层是按钮的兄弟节点，所以裁剪只发生在按钮自己身上，不会裁掉浮层。 */
 .wt-project-btn {
   appearance: none; display: block; font-family: inherit; cursor: pointer; color: inherit;
@@ -943,7 +975,7 @@ export const STYLE_TEXT = `
   white-space: nowrap;
 }
 /* 「已过期」小胶囊：从日期文案里挪出来的状态标记（日期列定宽 96px 后放不下一整串）。
-   它是标题列右端的一颗 chip，x 固定，不参与小字组的定宽列。 */
+   现在是**小字组第 3 槽**（来源之后、项目之前），固定 44px、恒占位；未过期时槽留空。 */
 .wt-tag.wt-overdue-tag { color: ${C.warn}; border-color: ${tint(C.warn, 45)}; }
 .wt-link { cursor: pointer; user-select: none; color: var(--dsw-alias-link); font-size: 11px; }
 .wt-link:hover { text-decoration: underline; }
@@ -2475,9 +2507,10 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
   ]);
 
   /**
-   * 小字组＝**两列固定网格**：日期/时间槽（96px，右对齐）+ 项目槽（72px，省略号）。
-   * 两个槽**无论有没有内容都渲染**，所以日期右边缘在所有行上落在同一条竖线；
-   * 旗子已在行首；「已过期」与来源胶囊挪到标题列右端（见 row-main 的注释）。
+   * 小字组＝**四列固定网格**，顺序固定：[日期/时间][来源][已过期][项目]。
+   * 四只槽**无论有没有内容都渲染**，整组宽度恒为 META_SLOT_TOTAL_PX 且贴行右端：
+   * 日期永远在最左、项目永远在最右，任何两行的同一槽都落在同一条竖线。
+   * 旗子仍在行首；标题列右端不再放宽胶囊（来源与状态都已搬进小字组）。
    */
   const meta = [];
 
@@ -2487,7 +2520,7 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
    * 浮层只在打开时挂载，关闭即卸载；时间是原生 input（该行有时间才出现）。
    *
    * 文案里不再带「已过期」前缀：日期列定宽 96px，放不下 "已过期 2026-10-20 14:30"
-   * （≈126px）。状态改由标题列右端的 .wt-overdue-tag 胶囊表达（颜色 + 文字都保留）。
+   * （≈126px）。状态改由小字组第 3 槽的 .wt-overdue-tag 胶囊表达（颜色 + 文字都保留）。
    */
   const dateText = shownDue
     ? `${shownDue}${shownDueTime ? ` ${shownDueTime}` : ''}`
@@ -2573,15 +2606,17 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     ]) : null,
   ]);
   /**
-   * 日期槽：定宽 96px、**恒占位**。无日期（且没 hover/没打开浮层）时就是一只空槽，
-   * 「＋ 日期」入口维持原来「hover/focus 才出现」的行为，但不再让整列消失。
+   * 日期槽：小字组**第 1 槽**（最左），定宽 96px、**恒占位**。无日期（且没 hover/没打开浮层）
+   * 时就是一只空槽，「＋ 日期」入口维持原来「hover/focus 才出现」的行为，但不再让整列消失。
    */
   const dateSlot = React.createElement('div', {
     key: 'meta-date',
     className: 'wt-meta-date',
     'data-wt-meta-date-slot': 'true',
+    'data-wt-meta-slot': 'date',
     // 渲染值与样式表取同一个常量，测试不会与实现漂移
     'data-wt-meta-date-width': META_DATE_SLOT_PX,
+    'data-wt-meta-slot-width': META_DATE_SLOT_PX,
   }, (shownDue || datePeek || dateOpen) ? dateNode : null);
 
   /**
@@ -2603,7 +2638,7 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       'aria-label': shownProject ? t('editProject') : t('addProjectLabel'),
       'aria-haspopup': 'true',
       'aria-expanded': projectOpen,
-      // 项目列定宽 72px，长项目名会被省略号截断；title 里给完整名字，鼠标悬停能看全
+      // 项目列定宽 96px，长项目名会被省略号截断；title 里给完整名字，鼠标悬停能看全
       title: shownProject ? `#${shownProject} · ${t('editProject')}` : t('addProjectLabel'),
       onClick: openProject,
       onKeyDown: (event) => { if (event?.key === 'Escape') setProjectOpen(false); },
@@ -2619,18 +2654,72 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     }) : null,
   ]);
   /**
-   * 项目槽：定宽 72px、**恒占位**（无项目时是空槽；「＋ 项目」入口仍在 hover/focus 时才出现）。
-   * 长项目名由 .wt-project-btn 的省略号收尾，绝不再把日期列往左推。
+   * 项目槽：小字组**第 4 槽（最后一个）**，定宽 96px、**恒占位**（无项目时是空槽；
+   * 「＋ 项目」入口仍在 hover/focus 时才出现）。长项目名由 .wt-project-btn 的省略号收尾，
+   * 放在最后 + 恒占位 ⇒ 项目槽左/右边缘都恒定，来源与「已过期」都挤不动它。
    */
   const projectSlot = React.createElement('div', {
     key: 'meta-project',
     className: 'wt-meta-project',
     'data-wt-meta-project-slot': 'true',
+    'data-wt-meta-slot': 'project',
     'data-wt-meta-project-width': META_PROJECT_SLOT_PX,
+    'data-wt-meta-slot-width': META_PROJECT_SLOT_PX,
   }, (shownProject || projectPeek || projectOpen) ? projectNode : null);
 
-  // 小字组＝两只定宽槽，顺序固定：日期在左、项目在右。错误信息跨两列另起一行。
-  meta.push(dateSlot, projectSlot);
+  /**
+   * 「已过期」状态标记：保留胶囊与 warn 色，但搬进小字组**第 3 槽**（来源之后、项目之前）。
+   * 文字与颜色都不变（旧实现是日期文案的前缀，96px 的日期槽放不下整串）。
+   */
+  const overdueChip = overdue
+    ? React.createElement('span', {
+      key: 'overdue',
+      className: 'wt-tag wt-overdue-tag',
+      'data-wt-overdue-chip': 'true',
+      title: t('overdueTag'),
+    }, t('overdueTag'))
+    : null;
+  /**
+   * 来源标记：让用户一眼看出这条是模型加的、还是从会话提升来的（人自己加的不用标）。
+   * 它是小字组**第 2 槽**：来源不是每行都有，所以槽位固定 44px 且**恒渲染** ——
+   * 若不给空来源占位，有来源的行会把后面的「已过期」与项目列整体挤动。
+   */
+  const sourceChip = (row.source === 'agent' || row.source === 'session')
+    ? React.createElement('span', {
+      key: 'source',
+      className: 'wt-tag',
+      'data-wt-source-chip': 'true',
+      title: row.source === 'agent' ? t('sourceAgent') : t('sourceSession'),
+    }, row.source === 'agent' ? t('sourceAgent') : t('sourceSession'))
+    : null;
+  /**
+   * 来源槽：小字组第 2 槽，定宽 44px、**恒占位**（无来源时留空）。
+   * 胶囊自己单行 + 省略号，完整文案（AI / 会话）在 title 里。
+   */
+  const sourceSlot = React.createElement('div', {
+    key: 'meta-source',
+    className: 'wt-meta-source',
+    'data-wt-meta-source-slot': 'true',
+    'data-wt-meta-slot': 'source',
+    'data-wt-meta-source-width': META_SOURCE_SLOT_PX,
+    'data-wt-meta-slot-width': META_SOURCE_SLOT_PX,
+  }, sourceChip);
+  /**
+   * 「已过期」槽：小字组第 3 槽，定宽 44px、**恒占位**（未过期时留空）。
+   * 空槽也占位 ⇒ 项目列的位置与上一行完全一致。
+   */
+  const overdueSlot = React.createElement('div', {
+    key: 'meta-overdue',
+    className: 'wt-meta-overdue',
+    'data-wt-meta-overdue-slot': 'true',
+    'data-wt-meta-slot': 'overdue',
+    'data-wt-meta-overdue-width': META_OVERDUE_SLOT_PX,
+    'data-wt-meta-slot-width': META_OVERDUE_SLOT_PX,
+  }, overdueChip);
+
+  // 小字组＝四只定宽槽，顺序固定：[日期][来源][已过期][项目]。
+  // 错误信息跨四列另起一行（grid-column:1/-1）。
+  meta.push(dateSlot, sourceSlot, overdueSlot, projectSlot);
   if (dateError) {
     meta.push(React.createElement('span', {
       key: 'de',
@@ -2645,31 +2734,6 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       role: 'status',
     }, projectError));
   }
-  /**
-   * 「已过期」胶囊：旧实现是日期文案的前缀，日期列定宽 96px 后放不下
-   * "已过期 2026-10-20 14:30"（≈126px），所以把状态挪到标题列右端的 chip 上。
-   * 文字与 warn 色都保留，位置固定（标题列右端），不参与小字组的定宽列。
-   */
-  const overdueChip = overdue
-    ? React.createElement('span', {
-      key: 'overdue',
-      className: 'wt-tag wt-overdue-tag',
-      'data-wt-overdue-chip': 'true',
-      title: t('overdueTag'),
-    }, t('overdueTag'))
-    : null;
-  /**
-   * 来源标记：让用户一眼看出这条是模型加的、还是从会话提升来的（人自己加的不用标）。
-   * 同样放在标题列右端：若留在小字组里，有来源的行会把日期列整体往左挤（日期就漂了）。
-   */
-  const sourceChip = (row.source === 'agent' || row.source === 'session')
-    ? React.createElement('span', {
-      key: 'source',
-      className: 'wt-tag',
-      'data-wt-source-chip': 'true',
-      title: row.source === 'agent' ? t('sourceAgent') : t('sourceSession'),
-    }, row.source === 'agent' ? t('sourceAgent') : t('sourceSession'))
-    : null;
 
   // 拖动属性：只有父级给了 drag 才可拖（未启用时行为与以前完全一致）
   const dragAttrs = drag
@@ -2799,9 +2863,7 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
             fontWeight: row.priority === 'high' && !done ? 650 : 400,
           },
         }, shownTitle || t('untitled')),
-      // 状态 / 来源胶囊：标题列右端（x 固定），不占用小字组的两个定宽列
-      overdueChip,
-      sourceChip,
+      // 来源 / 「已过期」胶囊已搬进小字组的固定槽（第 2、3 列），标题列不再放胶囊
       titleError
         ? React.createElement('span', {
           key: 'title-error',
@@ -2810,15 +2872,19 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
         }, titleError)
         : null,
     ]),
-    // 小字组：两列固定网格（日期 96px / 项目 72px），单行时钉在标题右边；
-    // 换行时整组落到第二行、仍在标题这一列（grid-area: meta），列宽不变。
+    // 小字组：四列固定网格（日期 96px / 来源 44px / 已过期 44px / 项目 96px），
+    // 单行时钉在标题右边；换行时整组落到第二行、仍在标题这一列（grid-area: meta），
+    // 列宽与占位完全不变（justify-self:end）。
     React.createElement('div', {
       key: 'meta',
       ref: metaElRef,
       className: 'wt-meta',
       'data-wt-meta': 'true',
       'data-wt-meta-date-width': META_DATE_SLOT_PX,
+      'data-wt-meta-source-width': META_SOURCE_SLOT_PX,
+      'data-wt-meta-overdue-width': META_OVERDUE_SLOT_PX,
       'data-wt-meta-project-width': META_PROJECT_SLOT_PX,
+      'data-wt-meta-total-width': META_SLOT_TOTAL_PX,
     }, meta),
     // 行尾操作：默认不可见也不可点（CSS .wt-actions），行 hover / 内部聚焦才显形；
     // 按钮始终在 DOM 里，所以键盘 Tab 仍能到达，聚焦即显示（:focus-within）。
