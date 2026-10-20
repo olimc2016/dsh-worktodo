@@ -533,6 +533,49 @@ await test('标题为空 → 200 且 ok=false 带原因（面板要能显示）'
   eq(typeof body.error, 'string');
 });
 
+await test('POST /update 的 title/project 校验：空白/超长/非字符串被拒且记录不变；合法值 trim 后落库', async () => {
+  const created = await call(routes.get('/worktodo/create').handler, {
+    method: 'POST', url: '/worktodo/create',
+    body: { title: '校验基准', project: 'base-proj' },
+  });
+  const id = created.json().data.todo.id;
+  const readRecord = async () => {
+    const list = (await call(routes.get('/worktodo/list').handler, {
+      method: 'GET', url: '/worktodo/list?filter=all&shapes=todos',
+    })).json();
+    return list.data.todos.find((todo) => todo.id === id);
+  };
+
+  // 非法输入：沿用既有约定「200 + ok:false + reason」，且**一个字节都不写**。
+  const cases = [
+    [{ title: '   ' }, 'empty-title'],
+    [{ title: 'x'.repeat(201) }, 'title-too-long'],
+    [{ title: 123 }, 'empty-title'],
+    [{ project: 'p'.repeat(61) }, 'project-too-long'],
+    [{ project: 42 }, 'bad-project'],
+  ];
+  for (const [patch, reason] of cases) {
+    const response = await call(routes.get('/worktodo/update').handler, {
+      method: 'POST', url: '/worktodo/update', body: { ref: id, ...patch },
+    });
+    eq(response.statusCode, 200, '输入错误沿用既有「200 + ok:false」约定：');
+    const body = response.json();
+    eq(body.ok, false, `${JSON.stringify(patch)} 必须被拒：`);
+    eq(body.reason, reason, `${JSON.stringify(patch)} 的原因码：`);
+    const record = await readRecord();
+    eq(record.title, '校验基准', '被拒的标题补丁不能写进记录：');
+    eq(record.project, 'base-proj', '被拒的项目补丁不能写进记录：');
+  }
+
+  // 合法输入：trim 后落库（与 createRecord 的归一化口径一致）。
+  const ok = await call(routes.get('/worktodo/update').handler, {
+    method: 'POST', url: '/worktodo/update', body: { ref: id, title: '  新名字  ', project: '  新项目  ' },
+  });
+  eq(ok.json().ok, true);
+  eq(ok.json().data.todo.title, '新名字', 'title 必须 trim 后落库：');
+  eq(ok.json().data.todo.project, '新项目', 'project 必须 trim 后落库：');
+});
+
 await test('请求体不是 JSON → 明确报错而不是崩', async () => {
   const response = await call(routes.get('/worktodo/create').handler, { method: 'POST', url: '/worktodo/create', body: '{ 坏 JSON' });
   eq(response.statusCode, 200);

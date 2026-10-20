@@ -241,6 +241,14 @@ const zh = {
   'todayWord': '今天',
   'fromParsed': '识别',
   'dueTimeLabel': '时间',
+  // 行内日期编辑：日期本身就是按钮（有日期＝修改，没日期＝添加）
+  'editDate': '修改日期',
+  'addDate': '＋ 日期',
+  'addDateLabel': '添加日期',
+  'datePopover': '修改截止日期',
+  'clearDate': '清除日期',
+  // 保存失败的温和提示：不出现原始异常/状态码，也不说「读取失败」
+  'dateSaveFailed': '日期没保存上，已恢复原值',
   'expand': '展开',
   'collapse': '收起',
   'empty': '还没有待办',
@@ -251,11 +259,19 @@ const zh = {
   'markDone': '标为完成',
   'unmarkDone': '取消完成',
   'editHint': '点击标题可编辑',
+  'editTitle': '编辑标题',
+  'titleSaveFailed': '标题没保存上，已恢复原文',
+  'titleEmptyHint': '标题不能为空，已还原',
   'deleteBtn': '删除',
   'confirmDelete': '确认删除？',
+  'editDetails': '编辑详情',
   'save': '保存',
   'cancel': '取消',
   'projectLabel': '项目',
+  'editProject': '修改项目',
+  'addProject': '＋ 项目',
+  'addProjectLabel': '添加项目',
+  'projectSaveFailed': '项目没保存上，已恢复原值',
   'projectPlaceholder': '项目名（可选）',
   'projectNew': '新建',
   'projectNewPlaceholder': '新项目名',
@@ -394,6 +410,14 @@ const en = {
   'todayWord': 'Today',
   'fromParsed': 'parsed',
   'dueTimeLabel': 'Time',
+  // Inline date editing: the date itself is a button (edit when set, add when unset)
+  'editDate': 'Edit date',
+  'addDate': '＋ Date',
+  'addDateLabel': 'Add date',
+  'datePopover': 'Edit due date',
+  'clearDate': 'Clear date',
+  // Gentle failure copy: no raw exception/status code, no "read failed" wording
+  'dateSaveFailed': "Couldn't save the date — reverted",
   'expand': 'Expand',
   'collapse': 'Collapse',
   'empty': 'No to-dos yet',
@@ -404,11 +428,19 @@ const en = {
   'markDone': 'Mark as done',
   'unmarkDone': 'Mark as not done',
   'editHint': 'Click the title to edit',
+  'editTitle': 'Edit title',
+  'titleSaveFailed': "Couldn't save the title — reverted",
+  'titleEmptyHint': "A title can't be empty — reverted",
   'deleteBtn': 'Delete',
   'confirmDelete': 'Delete?',
+  'editDetails': 'Edit details',
   'save': 'Save',
   'cancel': 'Cancel',
   'projectLabel': 'Project',
+  'editProject': 'Edit project',
+  'addProject': '＋ Project',
+  'addProjectLabel': 'Add project',
+  'projectSaveFailed': "Couldn't save the project — reverted",
   'projectPlaceholder': 'project (optional)',
   'projectNew': 'Create',
   'projectNewPlaceholder': 'New project name',
@@ -438,6 +470,35 @@ function dayKey(stamp) {
   const d = new Date(stamp);
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/**
+ * 行内日期浮层的估算高度（px）：日期输入（~30）+ 可选时间输入（~30）+ 清除按钮（~24）+ 内边距。
+ * 只用于「向下开还是向上开」的判断；不需要精确 —— 留出 8px 余量就够避免贴边。
+ */
+export const DATE_POPOVER_HEIGHT_PX = 112;
+
+/**
+ * 浮层向上/向下自动避让边界（纯函数，导出供单测）。
+ *
+ * 规则：优先向下（与日期所在行同方向展开）；下方放不下、上方放得下时向上；
+ * 两边都放不下时选空间大的一侧。拿不到几何信息（SSR / 测试替身）时默认向下。
+ * @param {{top?: number, bottom?: number}|null|undefined} rect 日期按钮的 getBoundingClientRect()
+ * @param {number} viewportHeight 视口高度（window.innerHeight）
+ * @param {number} [popHeight] 浮层估算高度
+ * @returns {'up'|'down'}
+ */
+export function chooseDatePopoverPlacement(rect, viewportHeight, popHeight = DATE_POPOVER_HEIGHT_PX) {
+  const bottom = Number(rect?.bottom);
+  const height = Number(viewportHeight);
+  const wanted = Number(popHeight);
+  if (!Number.isFinite(bottom) || !Number.isFinite(height) || height <= 0) return 'down';
+  const pad = Number.isFinite(wanted) && wanted > 0 ? wanted : DATE_POPOVER_HEIGHT_PX;
+  const spaceBelow = height - bottom;
+  const spaceAbove = Number.isFinite(Number(rect?.top)) ? Number(rect.top) : 0;
+  if (spaceBelow >= pad + 8) return 'down';
+  if (spaceAbove >= pad + 8) return 'up';
+  return spaceAbove > spaceBelow ? 'up' : 'down';
 }
 
 const C = {
@@ -683,6 +744,50 @@ export const STYLE_TEXT = `
   padding: 0 8px; border-radius: 999px; border: 1px solid ${C.border1}; color: ${C.label3};
   white-space: nowrap;
 }
+/* 行内日期：外观仍是那行小字，但它是真按钮（hover 有底色+下划线，键盘有 focus ring） */
+.wt-date-btn {
+  appearance: none; display: inline-flex; align-items: baseline; gap: 4px;
+  font: inherit; font-size: 11px; line-height: 1.7; padding: 0 4px; margin: 0;
+  color: inherit; background: transparent; border: 1px solid transparent; border-radius: 6px;
+  cursor: pointer; white-space: nowrap; text-align: left;
+}
+.wt-date-btn:hover { background: ${tint(C.brand, 10)}; text-decoration: underline; text-underline-offset: 2px; }
+.wt-date-btn:focus-visible { outline: 2px solid ${C.brand}; outline-offset: 1px; }
+/* 无日期的行：悬停/聚焦时才出现的淡色「＋ 日期」入口（与行首 ghost 旗子同一种做法） */
+.wt-date-btn.is-add { opacity: .7; border-style: dashed; border-color: ${C.border1}; }
+.wt-date-btn.is-add:hover { opacity: 1; color: ${C.label2}; }
+/* 浮层：挂载时才存在；默认向下，空间不够时由 is-up 改向上（见 chooseDatePopoverPlacement） */
+.wt-date-pop {
+  position: absolute; left: 0; z-index: 6; min-width: 188px; padding: 8px;
+  display: flex; flex-direction: column; gap: 6px; text-align: left;
+  background: ${C.layer1}; border: 1px solid ${C.border}; border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .12);
+}
+.wt-date-pop.is-down { top: calc(100% + 4px); }
+.wt-date-pop.is-up { bottom: calc(100% + 4px); }
+.wt-date-field { display: flex; align-items: center; gap: 6px; font-size: 11px; color: ${C.label3}; }
+.wt-date-field .wt-input { flex: 1 1 auto; min-width: 0; }
+.wt-date-pop-foot { display: flex; align-items: center; gap: 6px; }
+.wt-date-error { font-size: 10.5px; color: ${C.warn}; }
+/* 行内项目选择浮层：QuickAdd 与行内项目标签共用同一份组件与样式。
+   挂载时才存在；定位基准是持有它的那个 position:relative 的小盒子。 */
+.wt-project-pop {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 6; padding: 6px;
+  display: flex; flex-direction: column; gap: 4px; min-width: 176px; max-width: 260px;
+  text-align: left; background: ${C.layer1}; border: 1px solid ${C.border};
+  border-radius: 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, .12);
+}
+/* 行内项目标签：外观仍是那颗 #项目 小胶囊，但它是真按钮。 */
+.wt-project-btn {
+  appearance: none; font-family: inherit; cursor: pointer; color: inherit;
+  background: transparent;
+}
+.wt-project-btn:hover { background: ${tint(C.brand, 10)}; color: ${C.label}; }
+.wt-project-btn:focus-visible { outline: 2px solid ${C.brand}; outline-offset: 1px; }
+/* 没有项目的行：hover / 键盘聚焦时才出现的淡色「＋ 项目」（与＋日期同一种做法）。 */
+.wt-project-btn.is-add { opacity: .7; border-style: dashed; }
+.wt-project-btn.is-add:hover { opacity: 1; color: ${C.label2}; }
+.wt-project-error, .wt-title-error { font-size: 10.5px; color: ${C.warn}; }
 .wt-tag {
   display: inline-flex; align-items: center; gap: 3px; font-size: 10.5px; line-height: 1.6;
   padding: 0 6px; border-radius: 999px; border: 1px solid ${C.border1}; color: ${C.label3};
@@ -745,8 +850,23 @@ export const STYLE_TEXT = `
 }
 .wt-restart-banner-mark { flex: none; color: ${C.ok}; font-weight: 700; }
 .wt-restart-banner-text { flex: 1; min-width: 0; word-break: break-word; }
-.wt-title { cursor: pointer; word-break: break-word; }
-.wt-title:hover { text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
+/* 行内标题：视觉上就是原来那行字（同字号/行高/颜色），但它是真按钮。
+   cursor:text 是「点进去改文字」的暗示；hover 只加一条虚线下划线，不改任何布局。 */
+.wt-title { word-break: break-word; }
+.wt-title-btn {
+  appearance: none; display: block; width: 100%; margin: 0; padding: 0;
+  border: 0; background: transparent; font: inherit; line-height: inherit;
+  text-align: left; cursor: text;
+}
+.wt-title-btn:hover { text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
+.wt-title-btn:focus-visible { outline: 2px solid ${C.brand}; outline-offset: 2px; border-radius: 4px; }
+/* 原地编辑用的输入：与标题同一套字体/行高，0 边框 0 内边距 → 行高不跳。 */
+.wt-title-input {
+  display: block; width: 100%; min-width: 0; box-sizing: border-box;
+  margin: 0; padding: 0; border: 0; background: transparent;
+  font: inherit; line-height: inherit; color: inherit;
+}
+.wt-title-input:focus { outline: 2px solid ${C.brand}; outline-offset: 2px; border-radius: 4px; }
 .wt-spin {
   display: inline-block; width: 12px; height: 12px; border-radius: 50%;
   border: 2px solid ${C.border}; border-top-color: ${C.brand}; animation: wt-spin .8s linear infinite;
@@ -1253,6 +1373,11 @@ const IconClock = () => React.createElement('svg', { width: 13, height: 13, view
 const IconFolder = () => React.createElement('svg', { width: 13, height: 13, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, 'aria-hidden': 'true' }, [
   React.createElement('path', { key: 'f', d: 'M1.8 4.4a1.4 1.4 0 0 1 1.4-1.4h2.6l1.4 1.7h5a1.4 1.4 0 0 1 1.4 1.4v5.5a1.4 1.4 0 0 1-1.4 1.4H3.2a1.4 1.4 0 0 1-1.4-1.4z' }),
 ]);
+/** 铅笔：行尾「编辑详情」入口（标题单击改成行内编辑后，备注/日期等完整表单从这里进）。 */
+const IconPencil = () => React.createElement('svg', { width: 13, height: 13, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, 'aria-hidden': 'true' }, [
+  React.createElement('path', { key: 'p', d: 'M10.4 2.8 13.2 5.6 5.8 13H3v-2.8z' }),
+  React.createElement('path', { key: 'l', d: 'M8.9 4.3 11.7 7.1' }),
+]);
 
 /**
  * 「项目」选择器弹层里的查重：把用户输入对齐到已有项目。
@@ -1269,6 +1394,95 @@ export function matchExistingProject(options, input) {
   const key = name.toLowerCase();
   const found = asArray(options).find((option) => typeof option === 'string' && option.trim().toLowerCase() === key);
   return found ? found.trim() : null;
+}
+
+/**
+ * 项目选择浮层：**QuickAdd 与行内项目标签共用这一份**（需求要求复用，不复制两份）。
+ *
+ * 内容与顺序：已有项目（点选）→「未归类」（清除 = null）→ 新建（输入 + 新建）。
+ * 只在打开时挂载；Esc 关闭由浮层与触发按钮共同保证，点外部关闭由调用方注册。
+ * 不使用 innerHTML；没有引入新依赖。
+ *
+ * @param {object} props
+ * @param {(key: string) => string} props.t 文案
+ * @param {string|null} props.value 当前项目（null = 未归类）
+ * @param {string[]} props.options 宿主 /list 给的已有项目
+ * @param {boolean} [props.truncated] 项目太多、列表被截断
+ * @param {(project: string|null) => void} props.onPick 选中/清除/新建
+ * @param {() => void} props.onClose 关闭
+ */
+function ProjectPopover({ t, value, options, truncated, onPick, onClose }) {
+  const [draft, setDraft] = React.useState('');
+  const names = asArray(options)
+    .map((name) => (typeof name === 'string' ? name.trim() : ''))
+    .filter(Boolean);
+  /** 新建：重名（忽略大小写与首尾空白）直接选中已有项目；空输入什么都不做。 */
+  const create = () => {
+    const name = String(draft ?? '').trim();
+    if (!name) return;
+    onPick?.(matchExistingProject(names, name) ?? name);
+  };
+  /** Esc 关闭：浮层与内部输入都能触发（键盘从哪儿进来都关得掉）。 */
+  const closeOnEscape = (event) => {
+    if (event?.key === 'Escape') {
+      event.preventDefault?.();
+      onClose?.();
+    }
+  };
+  return React.createElement('div', {
+    role: 'group',
+    className: 'wt-project-pop',
+    'aria-label': t('projectLabel'),
+    'data-wt-project-pop': 'true',
+    onKeyDown: closeOnEscape,
+  }, [
+    ...names.map((name) => React.createElement('button', {
+      key: `p:${name}`, type: 'button', className: 'wt-chip', 'data-wt-project': name,
+      title: name, 'aria-pressed': value === name,
+      style: {
+        color: value === name ? C.label : C.label2, font: 'inherit', fontSize: 11.5,
+        cursor: 'pointer', justifyContent: 'flex-start',
+        borderColor: value === name ? C.brand : undefined,
+      },
+      onClick: () => onPick?.(name),
+    }, React.createElement('span', { key: 'v' }, name))),
+    // 未归类：一键清除（等价 project = null）
+    React.createElement('button', {
+      key: 'none', type: 'button', className: 'wt-chip', 'data-wt-project-clear': 'true',
+      title: t('noProject'), 'aria-pressed': value === null,
+      style: {
+        color: value === null ? C.label : C.label3, font: 'inherit', fontSize: 11.5,
+        cursor: 'pointer', justifyContent: 'flex-start',
+        borderColor: value === null ? C.brand : undefined,
+      },
+      onClick: () => onPick?.(null),
+    }, React.createElement('span', { key: 'v' }, t('noProject'))),
+    // 新建：文本输入 + 「新建」（回车即新建）
+    React.createElement('div', {
+      key: 'new', style: { display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 },
+    }, [
+      React.createElement('input', {
+        key: 'in', className: 'wt-input', value: draft,
+        placeholder: t('projectNewPlaceholder'),
+        'aria-label': t('projectNewPlaceholder'),
+        onChange: (event) => setDraft(event.target.value),
+        onKeyDown: (event) => {
+          if (event.key === 'Enter') create();
+          else if (event.key === 'Escape') closeOnEscape(event);
+        },
+        style: { flex: '1 1 auto', minWidth: 0, fontSize: 11.5 },
+      }),
+      React.createElement('button', {
+        key: 'go', type: 'button', className: 'wt-btn', 'data-wt-project-create': 'true',
+        title: t('projectNew'), onClick: create,
+      }, t('projectNew')),
+    ]),
+    truncated
+      ? React.createElement('div', {
+        key: 'more', style: { fontSize: 10.5, color: C.label3 },
+      }, fillTemplate(t('projectListTruncated'), { count: names.length }))
+      : null,
+  ]);
 }
 
 
@@ -1291,7 +1505,6 @@ function QuickAdd({ t, onAdd, busy, projects, projectsTruncated }) {
   const [manual, setManual] = React.useState(false); // 用户手动改过日期/时间
   const [flagOpen, setFlagOpen] = React.useState(false);
   const [projectOpen, setProjectOpen] = React.useState(false);
-  const [projectDraft, setProjectDraft] = React.useState('');
   // 点"整块胶囊"都要弹出选择器：Safari 里带值的 date/time 输入光靠点击只会聚焦，
   // 所以统一主动调 showPicker()（不可用时退回 focus+click）
   const dateRef = React.useRef(null);
@@ -1382,18 +1595,8 @@ function QuickAdd({ t, onAdd, busy, projects, projectsTruncated }) {
   };
 
   /**
-   * 弹层里的「新建」（点按钮或输入框回车）：
-   * 重名（忽略大小写与首尾空白）时**直接选中已有项目**——不报错，也不造一份近重复项
-   * （那会让「按项目」视图立刻裂成两个桶）；否则就用输入的名字。
+   * 弹层里的「新建」逻辑现在收在共用的 ProjectPopover 里（重名对齐到已有项目）。
    */
-  const createProject = () => {
-    const name = String(projectDraft ?? '').trim();
-    if (!name) return; // 空输入：什么都不做（不建空项目，也不关弹层）
-    setProject(matchExistingProject(projectOptions, name) ?? name);
-    setProjectDraft('');
-    setProjectOpen(false);
-  };
-
   return React.createElement('div', { key: 'qa', style: { marginBottom: 12 } }, [
     // ---- 第一行：内容 + 添加 ----
     React.createElement('div', { key: 'l1', style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
@@ -1490,66 +1693,15 @@ function QuickAdd({ t, onAdd, busy, projects, projectsTruncated }) {
           React.createElement(IconFolder, { key: 'i' }),
           React.createElement('span', { key: 'v' }, project ? project : `${t('projectLabel')} · ${t('noProject')}`),
         ]),
-        projectOpen ? React.createElement('div', {
+        projectOpen ? React.createElement(ProjectPopover, {
           key: 'pop',
-          role: 'group',
-          'aria-label': t('projectLabel'),
-          onKeyDown: closeProjectOnEscape,
-          style: {
-            position: 'absolute', top: '100%', left: 0, zIndex: 5, marginTop: 4, padding: 6,
-            display: 'flex', flexDirection: 'column', gap: 4, minWidth: 176, maxWidth: 260,
-            background: C.layer1, border: `1px solid ${C.border}`, borderRadius: 10,
-            boxShadow: '0 8px 24px rgba(0,0,0,.12)',
-          },
-        }, [
-          // 已有项目：一行一个，当前选中的高亮（aria-pressed 供读屏与测试识别）
-          ...projectOptions.map((name) => React.createElement('button', {
-            key: `p:${name}`, type: 'button', className: 'wt-chip', 'data-wt-project': name,
-            title: name, 'aria-pressed': project === name,
-            style: {
-              color: project === name ? C.label : C.label2, font: 'inherit', fontSize: 11.5,
-              cursor: 'pointer', justifyContent: 'flex-start',
-              borderColor: project === name ? C.brand : undefined,
-            },
-            onClick: () => { setProject(name); setProjectOpen(false); },
-          }, React.createElement('span', { key: 'v' }, name))),
-          // 未归类：一键清除（等价 project = null）
-          React.createElement('button', {
-            key: 'none', type: 'button', className: 'wt-chip', 'data-wt-project-clear': 'true',
-            title: t('noProject'), 'aria-pressed': project === null,
-            style: {
-              color: project === null ? C.label : C.label3, font: 'inherit', fontSize: 11.5,
-              cursor: 'pointer', justifyContent: 'flex-start',
-              borderColor: project === null ? C.brand : undefined,
-            },
-            onClick: () => { setProject(null); setProjectOpen(false); },
-          }, React.createElement('span', { key: 'v' }, t('noProject'))),
-          // 新建：文本输入 + 「新建」（回车即新建）
-          React.createElement('div', {
-            key: 'new', style: { display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 },
-          }, [
-            React.createElement('input', {
-              key: 'in', className: 'wt-input', value: projectDraft,
-              placeholder: t('projectNewPlaceholder'),
-              'aria-label': t('projectNewPlaceholder'),
-              onChange: (event) => setProjectDraft(event.target.value),
-              onKeyDown: (event) => {
-                if (event.key === 'Enter') createProject();
-                else if (event.key === 'Escape') setProjectOpen(false);
-              },
-              style: { flex: '1 1 auto', minWidth: 0, fontSize: 11.5 },
-            }),
-            React.createElement('button', {
-              key: 'go', type: 'button', className: 'wt-btn', 'data-wt-project-create': 'true',
-              title: t('projectNew'), onClick: createProject,
-            }, t('projectNew')),
-          ]),
-          projectsTruncated
-            ? React.createElement('div', {
-              key: 'more', style: { fontSize: 10.5, color: C.label3 },
-            }, fillTemplate(t('projectListTruncated'), { count: projectOptions.length }))
-            : null,
-        ]) : null,
+          t,
+          value: project,
+          options: projectOptions,
+          truncated: projectsTruncated,
+          onPick: (name) => { setProject(name); setProjectOpen(false); },
+          onClose: () => setProjectOpen(false),
+        }) : null,
       ]),
     ]),
   ]);
@@ -1568,7 +1720,7 @@ function QuickAdd({ t, onAdd, busy, projects, projectsTruncated }) {
  *   - `drag`：共享的 dragHandlers 对象（useMemo），每一行不再各造一个新对象；
  *     每一行与拖动相关的差异只有布尔 `dragging`。
  * ------------------------------------------------------------------ */
-const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove, onSave, onPriority, celebrate, drag, dragging }) {
+const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove, onSave, onPriority, onDue, onTitle, onProject, projects, projectsTruncated, celebrate, drag, dragging }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(null);
   const [notesOpen, setNotesOpen] = React.useState(false);
@@ -1581,6 +1733,22 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
    * 键盘 Tab 进这一行时（onFocus 冒泡）旗子同样会淡出来，所以纯键盘也够得着。
    */
   const [flagPeek, setFlagPeek] = React.useState(false);
+  /**
+   * 行内日期编辑（本轮新增）：
+   *   - `dateOpen`：浮层是否挂载（关闭即卸载，绝不常驻）；
+   *   - `datePeek`：无日期的行在 hover/focus 时才显示「＋ 日期」入口（与 ghost 旗子同一种状态驱动）；
+   *   - `datePlacement`：浮层向下/向上（见 chooseDatePopoverPlacement）；
+   *   - `dateOverride` + `dateOverrideFor`：乐观值，只对「点击那一刻的数据对象」有效，
+   *     refresh 拿回新对象后自动失效，以服务端真相为准；
+   *   - `dateError`：保存失败的行内温和提示（不把原始异常带进 DOM）。
+   */
+  const [dateOpen, setDateOpen] = React.useState(false);
+  const [datePeek, setDatePeek] = React.useState(false);
+  const [datePlacement, setDatePlacement] = React.useState('down');
+  const [dateOverride, setDateOverride] = React.useState(null);
+  const [dateOverrideFor, setDateOverrideFor] = React.useState(null);
+  const [dateError, setDateError] = React.useState(null);
+  const dateWrapRef = React.useRef(null);
   /** 勾选完成时挂上的动效类（纯 CSS 动画，见 STYLE_TEXT 的 wt-check-pop / wt-row-celebrate）。 */
   const [celebrating, setCelebrating] = React.useState(false);
   /**
@@ -1597,6 +1765,31 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
    */
   const [optimisticDone, setOptimisticDone] = React.useState(null);
   const [optimisticFor, setOptimisticFor] = React.useState(null);
+  /**
+   * 行内标题编辑：
+   *   - `titleEditing`：标题是否原地变成 input（同一位置，不换行）；
+   *   - `titleOverride` + `titleOverrideFor`：乐观值（只对点击那一刻的 todo 有效，refresh 后失效）；
+   *   - `titleError`：空白被拒 / 保存失败的温和提示（不含原始异常串）；
+   *   - `titleCommittedRef`：Enter 或失焦只能提交一次（Esc 提交后用 ref 挡住随后的 blur）。
+   */
+  const [titleEditing, setTitleEditing] = React.useState(false);
+  const [titleDraft, setTitleDraft] = React.useState('');
+  const [titleOverride, setTitleOverride] = React.useState(null);
+  const [titleOverrideFor, setTitleOverrideFor] = React.useState(null);
+  const [titleError, setTitleError] = React.useState(null);
+  const titleCommittedRef = React.useRef(false);
+  /**
+   * 行内项目编辑：
+   *   - `projectOpen`：选择浮层是否挂载（与 QuickAdd 共用 ProjectPopover）；
+   *   - `projectPeek`：没有项目的行 hover / focus 时才出现「＋ 项目」（与日期入口同一做法）；
+   *   - `projectOverride`：`undefined` = 没有乐观值（注意 null 是合法值 = 清除项目）。
+   */
+  const [projectOpen, setProjectOpen] = React.useState(false);
+  const [projectPeek, setProjectPeek] = React.useState(false);
+  const [projectOverride, setProjectOverride] = React.useState(undefined);
+  const [projectOverrideFor, setProjectOverrideFor] = React.useState(null);
+  const [projectError, setProjectError] = React.useState(null);
+  const projectWrapRef = React.useRef(null);
 
   // 二次确认要能自己失效：点了删除又改主意的人，不该在几分钟后误触一次就真删掉
   React.useEffect(() => {
@@ -1610,7 +1803,196 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
   const optimisticActive = optimisticDone !== null && optimisticFor === todo;
   const done = (optimisticActive ? optimisticDone : null) ?? row.status === 'completed';
   const due = typeof row.due === 'string' ? row.due : '';
-  const overdue = !done && Boolean(due) && Boolean(today) && due < today;
+  const dueTime = typeof row.dueTime === 'string' ? row.dueTime : '';
+  // 乐观日期只对「点击那一刻的数据对象」有效（B2 的同一条口径）：refresh 拿回新对象即失效
+  const dateOverrideActive = dateOverride !== null && dateOverrideFor === todo;
+  const shownDue = dateOverrideActive ? (dateOverride.due ?? '') : due;
+  const shownDueTime = dateOverrideActive ? (dateOverride.dueTime ?? '') : dueTime;
+  const overdue = !done && Boolean(shownDue) && Boolean(today) && shownDue < today;
+  // 标题 / 项目也遵循同一条乐观值口径：只认「点击那一刻的数据对象」
+  const baseTitle = typeof row.title === 'string' ? row.title : '';
+  const titleOverrideActive = titleOverride !== null && titleOverrideFor === todo;
+  const shownTitle = titleOverrideActive ? titleOverride : baseTitle;
+  const baseProject = typeof row.project === 'string' && row.project ? row.project : null;
+  const projectOverrideActive = projectOverride !== undefined && projectOverrideFor === todo;
+  const shownProject = projectOverrideActive ? projectOverride : baseProject;
+
+  /**
+   * 打开/关闭日期浮层。
+   *
+   * 打开时才计算一次「向下还是向上」：拿日期按钮的视口位置与浮层估算高度比一下，
+   * 下方放不下就翻到上方。拿不到几何信息（测试替身/SSR）时默认向下。
+   */
+  const openDate = () => {
+    const el = dateWrapRef.current;
+    let rect = null;
+    try { rect = el?.getBoundingClientRect?.() ?? null; } catch { rect = null; }
+    const viewportHeight = typeof window !== 'undefined' && Number.isFinite(window.innerHeight)
+      ? window.innerHeight
+      : 0;
+    setDatePlacement(chooseDatePopoverPlacement(rect, viewportHeight));
+    setDateError(null);
+    setDateOpen(true);
+  };
+  const closeDate = () => setDateOpen(false);
+
+  /**
+   * 提交一次日期/时间改动：**先改本地**（乐观），再打 `POST /worktodo/update`；
+   * 失败时把乐观值清掉（回到 row.due），并显示一行温和提示。
+   *
+   * @param {object} patch 发给宿主的 patch（due / dueTime），不含 ref
+   * @param {{due: string, dueTime: string}} local 乐观本地值
+   */
+  const commitDate = (patch, local) => {
+    setDateOverride(local);
+    setDateOverrideFor(todo);
+    setDateError(null);
+    const fail = () => {
+      setDateOverride(null);
+      setDateOverrideFor(null);
+      setDateError(t('dateSaveFailed'));
+    };
+    Promise.resolve(onDue?.(row.id, patch)).then(
+      (result) => { if (result && result.ok === false) fail(); },
+      fail,
+    );
+  };
+
+  /** 日期变了：日期字符串（YYYY-MM-DD）→ due；清空（''）→ due:null（时间由宿主一并清掉）。 */
+  const changeDate = (value) => {
+    if (!value) {
+      commitDate({ due: null }, { due: '', dueTime: '' });
+      return;
+    }
+    // 时间改动才带 dueTime；改日期时保留行上已有的时间（宿主 patch 不会动它）
+    commitDate({ due: value }, { due: value, dueTime: shownDueTime });
+  };
+
+  /** 时间变了：同时带 due 与 dueTime（清空时间＝dueTime:null）。 */
+  const changeTime = (value) => {
+    const nextTime = value || '';
+    commitDate({ due: shownDue, dueTime: nextTime || null }, { due: shownDue, dueTime: nextTime });
+  };
+
+  /* ---------------- 行内标题：点标题 → 原地 input ---------------- */
+
+  /** 进入标题编辑：草稿从「当前显示值」起，自动聚焦并全选由 input 自己的 autoFocus/onFocus 完成。 */
+  const startTitleEdit = () => {
+    titleCommittedRef.current = false;
+    setTitleDraft(shownTitle);
+    setTitleError(null);
+    setTitleEditing(true);
+  };
+
+  /**
+   * 提交标题：Enter 或失焦各触发一次，用 ref 保证只提交一次（Esc 之后紧跟的 blur 不会再保存）。
+   * - 空白：不发请求，关掉编辑并给一句温和提示（内容还原）；
+   * - 没改：静默关闭，不发空 patch；
+   * - 改了：先乐观显示新标题，再 POST；失败回滚原文 + 温和提示。
+   */
+  const commitTitle = () => {
+    if (titleCommittedRef.current) return;
+    titleCommittedRef.current = true;
+    const next = String(titleDraft ?? '').trim();
+    setTitleEditing(false);
+    setTitleDraft('');
+    if (!next) {
+      setTitleError(t('titleEmptyHint'));
+      return;
+    }
+    if (next === baseTitle) {
+      setTitleError(null);
+      return;
+    }
+    setTitleOverride(next);
+    setTitleOverrideFor(todo);
+    setTitleError(null);
+    const fail = () => {
+      setTitleOverride(null);
+      setTitleOverrideFor(null);
+      setTitleError(t('titleSaveFailed'));
+    };
+    Promise.resolve(onTitle?.(row.id, next)).then(
+      (result) => { if (result && result.ok === false) fail(); },
+      fail,
+    );
+  };
+
+  /** Esc / 取消：关掉编辑、丢掉草稿，绝不发请求；标记已收口，挡住随后的 blur。 */
+  const cancelTitle = () => {
+    titleCommittedRef.current = true;
+    setTitleEditing(false);
+    setTitleDraft('');
+  };
+
+  /* ---------------- 行内项目：点标签 → 选择浮层 ---------------- */
+
+  /** 已知项目（宿主 /list 的 projects 字段；与 QuickAdd 用同一份数据与同一个浮层）。 */
+  const projectOptions = asArray(projects)
+    .map((name) => (typeof name === 'string' ? name.trim() : ''))
+    .filter(Boolean);
+
+  const openProject = () => {
+    setProjectError(null);
+    setProjectOpen(true);
+  };
+
+  /**
+   * 选中一个项目（null = 清除）。
+   * 与当前值相同就只关浮层，不发空 patch；否则先乐观更新，再 POST；失败回滚原值 + 温和提示。
+   * @param {string|null} next
+   */
+  const commitProject = (next) => {
+    setProjectOpen(false);
+    const value = next === null || next === undefined
+      ? null
+      : (String(next).trim() || null);
+    if (value === baseProject) return;
+    setProjectOverride(value);
+    setProjectOverrideFor(todo);
+    setProjectError(null);
+    const fail = () => {
+      setProjectOverride(undefined);
+      setProjectOverrideFor(null);
+      setProjectError(t('projectSaveFailed'));
+    };
+    Promise.resolve(onProject?.(row.id, value)).then(
+      (result) => { if (result && result.ok === false) fail(); },
+      fail,
+    );
+  };
+
+  /**
+   * 点外部关闭：只在浮层打开时挂 listener，关闭/卸载立刻移除。
+   * 用 mousedown 而不是 click，避免「点了项目标签 → 冒泡到 document 又立刻关掉」。
+   */
+  React.useEffect(() => {
+    if (!projectOpen) return undefined;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined;
+    const onPointerDown = (event) => {
+      const wrap = projectWrapRef.current;
+      if (wrap && typeof wrap.contains === 'function' && event?.target && wrap.contains(event.target)) return;
+      setProjectOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [projectOpen]);
+
+  /**
+   * 点外部关闭：只在浮层打开时挂 listener，关闭/卸载立刻移除。
+   * 用 mousedown 而不是 click，避免「点了日期按钮 → 冒泡到 document 又立刻关掉」。
+   */
+  React.useEffect(() => {
+    if (!dateOpen) return undefined;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined;
+    const onPointerDown = (event) => {
+      const wrap = dateWrapRef.current;
+      if (wrap && typeof wrap.contains === 'function' && event?.target && wrap.contains(event.target)) return;
+      setDateOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [dateOpen]);
   // 优先级档位：非法/缺省一律按「无」处理（与宿主 records.mjs 的归一化口径一致）
   const flagValue = EDIT_PRIORITY_OPTIONS.includes(row.priority) ? row.priority : 'none';
   const flagLabel = t(PRIORITY_LABEL_KEYS[flagValue]);
@@ -1793,14 +2175,142 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
   } else if (row.priority === 'low') {
     meta.push(React.createElement('span', { key: 'p', className: 'wt-tag' }, t('prioLow')));
   }
-  if (due) {
+
+  /**
+   * 行内日期控件：已设日期＝一直显示的按钮（点一下改日期）；
+   * 未设日期＝只在 hover/focus 时才出现（`datePeek`）的淡色「＋ 日期」。
+   * 浮层只在打开时挂载，关闭即卸载；时间是原生 input（该行有时间才出现）。
+   */
+  const dateText = shownDue
+    ? `${overdue ? `${t('overdueTag')} ` : ''}${shownDue}${shownDueTime ? ` ${shownDueTime}` : ''}`
+    : '';
+  const hasTimeField = Boolean(dueTime || shownDueTime);
+  const dateNode = React.createElement('span', {
+    key: 'd',
+    ref: dateWrapRef,
+    style: { position: 'relative', display: 'inline-flex', alignItems: 'center', gap: 4 },
+  }, [
+    React.createElement('button', {
+      key: 'btn',
+      type: 'button',
+      className: `wt-date-btn${shownDue ? '' : ' is-add'}`,
+      ...(shownDue ? { 'data-wt-date-btn': 'true' } : { 'data-wt-date-add': 'true' }),
+      'aria-label': shownDue ? t('editDate') : t('addDateLabel'),
+      'aria-haspopup': 'dialog',
+      'aria-expanded': dateOpen,
+      title: shownDue ? t('editDate') : t('addDateLabel'),
+      // 视觉与旧文案一致（11px 小字）；逾期仍用 warn 色
+      style: { color: overdue ? C.warn : C.label3 },
+      onClick: openDate,
+      onKeyDown: (event) => { if (event?.key === 'Escape') closeDate(); },
+    }, shownDue ? dateText : t('addDate')),
+    dateOpen ? React.createElement('div', {
+      key: 'pop',
+      className: `wt-date-pop is-${datePlacement}`,
+      role: 'dialog',
+      'aria-label': t('datePopover'),
+      'data-wt-date-pop': 'true',
+      onKeyDown: (event) => {
+        if (event?.key === 'Escape') {
+          event.preventDefault?.();
+          closeDate();
+        }
+      },
+    }, [
+      React.createElement('label', { key: 'd', className: 'wt-date-field' }, [
+        React.createElement('span', { key: 'l' }, t('dueLabel')),
+        React.createElement('input', {
+          key: 'in',
+          className: 'wt-input',
+          type: 'date',
+          value: shownDue,
+          autoFocus: true,
+          'aria-label': t('dueLabel'),
+          onChange: (event) => changeDate(String(event?.target?.value ?? '')),
+        }),
+      ]),
+      hasTimeField
+        ? React.createElement('label', { key: 't', className: 'wt-date-field' }, [
+          React.createElement('span', { key: 'l' }, t('dueTimeLabel')),
+          React.createElement('input', {
+            key: 'in',
+            className: 'wt-input',
+            type: 'time',
+            value: shownDueTime,
+            'aria-label': t('dueTimeLabel'),
+            onChange: (event) => changeTime(String(event?.target?.value ?? '')),
+          }),
+        ])
+        : null,
+      React.createElement('div', { key: 'f', className: 'wt-date-pop-foot' }, [
+        shownDue
+          ? React.createElement('button', {
+            key: 'clear',
+            type: 'button',
+            className: 'wt-btn',
+            'data-wt-date-clear': 'true',
+            onClick: () => changeDate(''),
+          }, t('clearDate'))
+          : null,
+        React.createElement('span', { key: 'sp', style: { flex: 1 } }),
+        React.createElement('button', {
+          key: 'done',
+          type: 'button',
+          className: 'wt-btn',
+          'data-wt-date-done': 'true',
+          onClick: closeDate,
+        }, t('dismiss')),
+      ]),
+    ]) : null,
+  ]);
+  if (shownDue || datePeek || dateOpen || dateError) meta.push(dateNode);
+  if (dateError) {
     meta.push(React.createElement('span', {
-      key: 'd',
-      style: { color: overdue ? C.warn : C.label3, fontSize: 11 },
-    }, overdue ? `${t('overdueTag')} ${due}` : due));
+      key: 'de',
+      className: 'wt-date-error',
+      role: 'status',
+    }, dateError));
   }
-  if (row.project) {
-    meta.push(React.createElement('span', { key: 'j', className: 'wt-tag' }, `#${row.project}`));
+
+  /**
+   * 行内项目标签：已设项目＝一直显示的 `#项目` 按钮（点一下改）；
+   * 未设项目＝只在 hover/focus 时才出现的淡色「＋ 项目」。
+   * 浮层复用 QuickAdd 的 ProjectPopover（已有 / 新建 / 未归类），关闭即卸载。
+   */
+  const projectNode = React.createElement('span', {
+    key: 'j',
+    ref: projectWrapRef,
+    style: { position: 'relative', display: 'inline-flex', alignItems: 'center' },
+  }, [
+    React.createElement('button', {
+      key: 'btn',
+      type: 'button',
+      className: `wt-tag wt-project-btn${shownProject ? '' : ' is-add'}`,
+      ...(shownProject ? { 'data-wt-project-btn': 'true' } : { 'data-wt-project-add': 'true' }),
+      'aria-label': shownProject ? t('editProject') : t('addProjectLabel'),
+      'aria-haspopup': 'true',
+      'aria-expanded': projectOpen,
+      title: shownProject ? t('editProject') : t('addProjectLabel'),
+      onClick: openProject,
+      onKeyDown: (event) => { if (event?.key === 'Escape') setProjectOpen(false); },
+    }, shownProject ? `#${shownProject}` : t('addProject')),
+    projectOpen ? React.createElement(ProjectPopover, {
+      key: 'pop',
+      t,
+      value: shownProject,
+      options: projectOptions,
+      truncated: projectsTruncated,
+      onPick: commitProject,
+      onClose: () => setProjectOpen(false),
+    }) : null,
+  ]);
+  if (shownProject || projectPeek || projectOpen || projectError) meta.push(projectNode);
+  if (projectError) {
+    meta.push(React.createElement('span', {
+      key: 'je',
+      className: 'wt-project-error',
+      role: 'status',
+    }, projectError));
   }
   // 来源标记：让用户一眼看出这条是模型加的、还是从会话提升来的（人自己加的不用标）
   if (row.source === 'agent' || row.source === 'session') {
@@ -1843,11 +2353,19 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     'data-wt-celebrating': celebrating ? 'true' : undefined,
     'data-wt-row': row.id ?? '',
     'data-wt-row-priority': flagValue,
-    // hover / focus 都让「无优先级」行的旗子淡出来（focus 冒泡自子元素，纯键盘同样到达）
-    onMouseEnter: () => setFlagPeek(true),
-    onMouseLeave: () => setFlagPeek(false),
-    onFocus: () => setFlagPeek(true),
-    onBlur: () => setFlagPeek(false),
+    // hover / focus 都让「无优先级」行的旗子、「无日期」行的＋日期、「无项目」行的＋项目淡出来。
+    // focus 冒泡自子元素，纯键盘同样到达；日期/项目入口在「焦点仍在本行内」时不收起，
+    // 否则刚从勾选框 Tab 到入口按钮，它会在被聚焦的瞬间消失。旗子保持原来的行为。
+    onMouseEnter: () => { setFlagPeek(true); setDatePeek(true); setProjectPeek(true); },
+    onMouseLeave: () => { setFlagPeek(false); setDatePeek(false); setProjectPeek(false); },
+    onFocus: () => { setFlagPeek(true); setDatePeek(true); setProjectPeek(true); },
+    onBlur: (event) => {
+      setFlagPeek(false);
+      const rowEl = event?.currentTarget;
+      if (rowEl && event?.relatedTarget && typeof rowEl.contains === 'function' && rowEl.contains(event.relatedTarget)) return;
+      setDatePeek(false);
+      setProjectPeek(false);
+    },
     // 动效是纯 CSS 的：动画跑完自己摘掉类，不需要逐帧 setState；列表刷新的延后由面板负责。
     // B3：`animationend` 会**冒泡** —— 勾选框的呼吸（620ms）与对勾描边（140→660ms）结束也会冒到行上，
     // 旧写法在 320ms 就把 is-celebrating 摘掉，整行高亮被截断（视觉跳变）。
@@ -1907,17 +2425,58 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       onClick: handleCheck,
     }, done ? React.createElement(IconCheck, { key: 'i', className: 'wt-check-mark' }) : null),
     React.createElement('div', { key: 'main', style: { flex: 1, minWidth: 0 } }, [
-      React.createElement('div', {
-        key: 'title',
-        className: 'wt-title',
-        title: t('editHint'),
-        onClick: beginEdit,
-        style: {
-          color: done ? C.label3 : C.label,
-          textDecoration: done ? 'line-through' : 'none',
-          fontWeight: row.priority === 'high' && !done ? 650 : 400,
-        },
-      }, typeof row.title === 'string' && row.title ? row.title : t('untitled')),
+      titleEditing
+        ? React.createElement('input', {
+          key: 'title',
+          className: 'wt-title wt-title-input',
+          'data-wt-title-input': 'true',
+          value: titleDraft,
+          autoFocus: true,
+          'aria-label': t('editTitle'),
+          title: t('editTitle'),
+          // 自动聚焦后全选：点一下就能直接重写；键盘 Tab 进来同样成立
+          onFocus: (event) => {
+            try { event?.target?.select?.(); } catch { /* 测试替身/旧内核没有 select，忽略 */ }
+          },
+          onChange: (event) => setTitleDraft(String(event?.target?.value ?? '')),
+          onKeyDown: (event) => {
+            if (event?.key === 'Enter') {
+              event.preventDefault?.();
+              commitTitle();
+            } else if (event?.key === 'Escape') {
+              event.preventDefault?.();
+              cancelTitle();
+            }
+          },
+          // 失焦 = 保存（用 ref 去重：Enter 已提交过就不会再发一次）
+          onBlur: commitTitle,
+          style: {
+            color: done ? C.label3 : C.label,
+            textDecoration: done ? 'line-through' : 'none',
+            fontWeight: row.priority === 'high' && !done ? 650 : 400,
+          },
+        })
+        : React.createElement('button', {
+          key: 'title',
+          type: 'button',
+          className: 'wt-title wt-title-btn',
+          'data-wt-title-btn': 'true',
+          'aria-label': t('editTitle'),
+          title: t('editHint'),
+          onClick: startTitleEdit,
+          style: {
+            color: done ? C.label3 : C.label,
+            textDecoration: done ? 'line-through' : 'none',
+            fontWeight: row.priority === 'high' && !done ? 650 : 400,
+          },
+        }, shownTitle || t('untitled')),
+      titleError
+        ? React.createElement('span', {
+          key: 'title-error',
+          className: 'wt-title-error',
+          role: 'status',
+        }, titleError)
+        : null,
       meta.length
         ? React.createElement('div', {
           key: 'meta',
@@ -1925,6 +2484,16 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
         }, meta)
         : null,
     ]),
+    // 标题单击改成行内编辑之后，完整表单（备注 / 日期 / 优先级 / 项目）从这里进
+    React.createElement('button', {
+      key: 'details',
+      type: 'button',
+      className: 'wt-icon-btn',
+      'data-wt-edit-details': 'true',
+      title: t('editDetails'),
+      'aria-label': t('editDetails'),
+      onClick: beginEdit,
+    }, React.createElement(IconPencil, { key: 'i' })),
     React.createElement('button', {
       key: 'del',
       type: 'button',
@@ -1943,7 +2512,7 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
 /* ------------------------------------------------------------------ *
  * 分组：空组整块不渲染，避免五个空标题堆在面板上
  * ------------------------------------------------------------------ */
-function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTodo, onRemove, onSave, onPriority, celebrate, drag }) {
+function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTodo, onRemove, onSave, onPriority, onDue, onTitle, onProject, projects, projectsTruncated, celebrate, drag }) {
   const list = asArray(items);
   if (!list.length) return null;
   return React.createElement('div', { style: { marginTop: 6 } }, [
@@ -1970,6 +2539,11 @@ function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTod
       onRemove,
       onSave,
       onPriority,
+      onDue,
+      onTitle,
+      onProject,
+      projects,
+      projectsTruncated,
       celebrate,
       // S3-3：共享同一个 drag 对象（引用稳定），每行只有布尔 dragging 不同 ——
       // 否则每一行每次父级重渲染都会收到一个新的 drag 对象，memo 的浅比较必然失效
@@ -2624,6 +3198,14 @@ function WorkTodoPanel(props) {
   const [pending, setPending] = React.useState(0);
   // 「已完成」默认折叠（做完的事不用占满屏幕），其余默认展开
   const [closed, setClosed] = React.useState({ completed: true });
+  /**
+   * 已知项目清单：QuickAdd 与行内项目浮层共用。
+   * 必须**引用稳定**（只在 data 变了才重建），否则每一行的 React.memo 浅比较都会失效。
+   */
+  const projectOptions = React.useMemo(
+    () => asArray(data?.projects).map((name) => (typeof name === 'string' ? name.trim() : '')).filter(Boolean),
+    [data],
+  );
 
   /**
    * 所有写操作的统一外壳：成功清掉错误条，失败把宿主的 error 原文放上去，
@@ -2632,8 +3214,10 @@ function WorkTodoPanel(props) {
    * `options.deferRefreshMs`：完成类动画专用 —— 写成功后**不立刻** refresh，
    * 而是交给 celebrationRefresh 在动画播完后补一次，期间行留在原位把动画播完。
    * 失败 / 取消完成 / 其他写操作仍然立即 refresh（reduced-motion、celebrate:false 也走这条）。
+   * `options.quietError`：不把原始异常贴到顶部错误条（行内日期用它显示一句温和提示），
+   * 避免把 `HTTP 500` / `Error: …` 这类原始串直接丢给用户。
    * @param {() => Promise<object>} job
-   * @param {{deferRefreshMs?: number}} [options]
+   * @param {{deferRefreshMs?: number, quietError?: boolean}} [options]
    * @returns {Promise<{ok: boolean, data: object}>} data 是宿主返回的 data（失败时为空对象）
    */
   const runWrite = React.useCallback(async (job, options = {}) => {
@@ -2650,7 +3234,8 @@ function WorkTodoPanel(props) {
       return { ok: true, data: data ?? {} };
     } catch (writeError) {
       writeFailed = true;
-      setBarError(String(writeError?.message ?? writeError));
+      // 行内日期走 quietError：原样报错留给静默路径，用户只看到行内那句温和提示
+      if (options?.quietError !== true) setBarError(String(writeError?.message ?? writeError));
       // 写失败：取消完成动画的待刷新，立刻拿服务端真相（行不该停在假完成态）
       celebrationRefresh.cancel();
       return { ok: false, data: {} };
@@ -2750,6 +3335,30 @@ function WorkTodoPanel(props) {
    * `none` 是**真实档位**（不设优先级），宿主 patchRecord 已支持，不需要额外协议。
    */
   const handlePriority = React.useCallback((ref, priority) => runWrite(() => postJson('/update', { ref, priority })), [runWrite]);
+  /**
+   * 行内日期改动：走同一个写路径，body 形如 `{ref, due}` / `{ref, due, dueTime}` / `{ref, due:null}`。
+   * 失败时**不贴原始异常**（quietError）—— 行组件已回滚乐观值，并在行内显示一句温和提示。
+   */
+  const handleDue = React.useCallback((ref, patch) => runWrite(
+    () => postJson('/update', { ref, ...patch }),
+    { quietError: true },
+  ), [runWrite]);
+  /**
+   * 行内标题：`POST /worktodo/update {ref, title}`。
+   * 与日期同一套温和失败路径：不贴原始异常，行组件负责回滚并显示行内提示。
+   */
+  const handleTitle = React.useCallback((ref, title) => runWrite(
+    () => postJson('/update', { ref, title }),
+    { quietError: true },
+  ), [runWrite]);
+  /**
+   * 行内项目：`POST /worktodo/update {ref, project}`；清除时显式发 null。
+   * 同样走 quietError —— 失败由行内回滚 + 温和提示收口。
+   */
+  const handleProject = React.useCallback((ref, project) => runWrite(
+    () => postJson('/update', { ref, project: project ?? null }),
+    { quietError: true },
+  ), [runWrite]);
 
   /** 把 dragId 挪到目标之前，得到新的完整顺序并落盘（manual 模式生效） */
 
@@ -3109,7 +3718,7 @@ function WorkTodoPanel(props) {
       onAdd: handleAdd,
       // 已知项目：宿主 /list 的 projects 在**任何 shapes 下都有**（见 service.list），
       // 所以面板无论停在「按截止」还是「按项目」，选择器都能列出已有项目。
-      projects: asArray(data?.projects).filter((name) => typeof name === 'string' && name.trim()),
+      projects: projectOptions,
       projectsTruncated: Boolean(data?.projectsTruncated),
     }),
 
@@ -3128,6 +3737,11 @@ function WorkTodoPanel(props) {
         onRemove: handleRemove,
         onSave: handleSave,
         onPriority: handlePriority,
+        onDue: handleDue,
+        onTitle: handleTitle,
+        onProject: handleProject,
+        projects: projectOptions,
+        projectsTruncated: Boolean(data?.projectsTruncated),
         celebrate,
         drag: dragHandlers,
       })))

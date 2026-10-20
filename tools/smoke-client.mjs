@@ -2406,6 +2406,508 @@ await testAsync('行内旗子选「高」/「无」：发出 POST /worktodo/upda
   eq(report.expandedAfterPick, false, '选中之后 aria-expanded 要回到 false：');
 });
 
+/* ------------------------------------------------------------------ *
+ * 行内日期编辑
+ *
+ * 已创建的行里，日期不再是纯文本：点一下就是原生 date（有时间再带 time）浮层，
+ * 改完立刻 POST /worktodo/update；失败先回滚本地值，再给一句不含原始异常的温和提示。
+ * 没有日期的行，hover / focus 时才出现「＋ 日期」入口（默认不渲染）。
+ * ------------------------------------------------------------------ */
+
+/** 找一行里的日期按钮（已设日期＝data-wt-date-btn，未设＝data-wt-date-add）。 */
+const dateBtnOf = (tree, id) => {
+  const row = rowNode(tree, id);
+  if (!row) return null;
+  return allNodes(row).find((n) => n.props?.['data-wt-date-btn'] === 'true'
+    || n.props?.['data-wt-date-add'] === 'true') ?? null;
+};
+
+/** 找当前挂载的日期浮层（关闭时应当为 null —— 浮层只在打开时存在）。 */
+const datePopOf = (tree) => allNodes(tree).find((n) => n.props?.['data-wt-date-pop'] === 'true') ?? null;
+
+test('日期浮层向上/向下自动避让边界（纯函数，拿不到几何信息时默认向下）', () => {
+  eq(typeof mod.chooseDatePopoverPlacement, 'function', '应当导出浮层定位函数：');
+  eq(mod.chooseDatePopoverPlacement({ top: 500, bottom: 520 }, 600), 'up', '下方放不下、上方放得下 → 向上：');
+  eq(mod.chooseDatePopoverPlacement({ top: 100, bottom: 120 }, 600), 'down', '下方放得下 → 向下：');
+  eq(mod.chooseDatePopoverPlacement({ top: 500, bottom: 590 }, 600, 100), 'up', '边界附近仍要避开：');
+  eq(mod.chooseDatePopoverPlacement(null, 600), 'down', '没有几何信息（测试替身/SSR）默认向下：');
+  eq(mod.chooseDatePopoverPlacement({ top: 0, bottom: 0 }, 0), 'down', '视口高度不可用时默认向下：');
+});
+
+await testAsync('行内日期：点日期按钮 → 原生 date 浮层 → 改期立即 POST /worktodo/update（ref 正确、due 为新值）', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const report = withStableHooks(() => {
+    let tree = renderPanel({ t: mkT() });
+    const btn = dateBtnOf(tree, 'wt-1');
+    eq(Boolean(btn), true, '有日期的行必须把日期渲染成可点按钮：');
+    eq(btn.type, 'button', '日期必须是 <button>（键盘可达）：');
+    eq(btn.props['aria-label'], '[editDate]', '日期按钮的 aria-label 必须是「修改日期」：');
+    eq(String(btn.props.className).includes('wt-date-btn'), true, '日期按钮要带 wt-date-btn 样式（hover 有可点反馈）：');
+    eq(textOf(btn).includes('2026-10-20'), true, '视觉上仍然是那行小字日期：');
+    eq(datePopOf(tree), null, '未点开时浮层绝不能挂载：');
+
+    btn.props.onClick();
+    tree = renderPanel({ t: mkT() });
+    const pop = datePopOf(tree);
+    eq(Boolean(pop), true, '点日期必须打开浮层：');
+    eq(pop.props.role, 'dialog', '浮层是可读的 dialog：');
+    const dateInput = allNodes(pop).find((n) => n.type === 'input' && n.props?.type === 'date');
+    eq(Boolean(dateInput), true, '浮层里必须是原生 <input type="date">：');
+    eq(dateInput.props.value, '2026-10-20', '日期输入要带当前值：');
+
+    const before = fetchCalls.length;
+    dateInput.props.onChange({ target: { value: '2026-11-01' } });
+    const posts = fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/update'));
+    const after = renderPanel({ t: mkT() });
+    return {
+      posts: posts.map((c) => JSON.parse(c.options.body)),
+      url: posts[0]?.url ?? '',
+      optimisticText: textOf(dateBtnOf(after, 'wt-1') ?? { children: [] }),
+      stillOpen: Boolean(datePopOf(after)),
+    };
+  });
+  eq(report.url, '/worktodo/update', `必须 POST 到 /worktodo/update：${report.url}`);
+  eq(report.posts, [{ ref: 'wt-1', due: '2026-11-01' }], '改期的报文必须是 {ref, due}：');
+  eq(report.optimisticText.includes('2026-11-01'), true, '乐观更新：本地先显示新日期：');
+  eq(report.stillOpen, true, '改期后浮层留着（还能接着调时间/再改）：');
+
+  // 视觉与可点反馈必须真的在样式表里（不是只在节点上挂个 class）
+  const css = mod.STYLE_TEXT;
+  eq(/\.wt-date-btn\s*\{[^}]*cursor:\s*pointer/.test(css), true, '日期按钮必须是 cursor:pointer：');
+  eq(/\.wt-date-btn:hover\s*\{[^}]*background:/.test(css), true, 'hover 要有底色反馈：');
+  eq(/\.wt-date-btn:hover\s*\{[^}]*text-decoration:\s*underline/.test(css), true, 'hover 要有下划线反馈：');
+  eq(/\.wt-date-btn:focus-visible\s*\{[^}]*outline:/.test(css), true, '键盘 focus 要有可见 focus ring：');
+  eq(/\.wt-date-pop\.is-up\s*\{[^}]*bottom:/.test(css), true, '向上开的浮层要贴按钮上沿：');
+  eq(/\.wt-date-pop\.is-down\s*\{[^}]*top:/.test(css), true, '向下开的浮层要贴按钮下沿：');
+});
+
+await testAsync('行内日期：该行有时间就带原生 time 输入，改时间同时发 due + dueTime', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const saved = fakeListPayload.data.groups.later[0].dueTime;
+  fakeListPayload.data.groups.later[0].dueTime = '14:30';
+  try {
+    const report = withStableHooks(() => {
+      let tree = renderPanel({ t: mkT() });
+      eq(textOf(dateBtnOf(tree, 'wt-1')).includes('14:30'), true, '行上已有的时间要显示在日期旁边：');
+      dateBtnOf(tree, 'wt-1').props.onClick();
+      tree = renderPanel({ t: mkT() });
+      const pop = datePopOf(tree);
+      const timeInput = allNodes(pop).find((n) => n.type === 'input' && n.props?.type === 'time');
+      eq(Boolean(timeInput), true, '该行有时间时浮层必须带原生 <input type="time">：');
+      eq(timeInput.props.value, '14:30', '时间输入要带当前值：');
+      const before = fetchCalls.length;
+      timeInput.props.onChange({ target: { value: '09:05' } });
+      const posts = fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/update'));
+      return posts.map((c) => JSON.parse(c.options.body));
+    });
+    eq(report, [{ ref: 'wt-1', due: '2026-10-20', dueTime: '09:05' }],
+      '改时间的报文要同时带 due 与 dueTime：');
+  } finally {
+    fakeListPayload.data.groups.later[0].dueTime = saved;
+  }
+});
+
+await testAsync('行内日期：清空日期 → POST {ref, due:null}，本地立即不再显示该日期', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const report = withStableHooks(() => {
+    let tree = renderPanel({ t: mkT() });
+    dateBtnOf(tree, 'wt-1').props.onClick();
+    tree = renderPanel({ t: mkT() });
+    const pop = datePopOf(tree);
+    const dateInput = allNodes(pop).find((n) => n.type === 'input' && n.props?.type === 'date');
+    const before = fetchCalls.length;
+    dateInput.props.onChange({ target: { value: '' } });
+    const posts = fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/update'));
+    const after = renderPanel({ t: mkT() });
+    const row = rowNode(after, 'wt-1');
+    return {
+      posts: posts.map((c) => JSON.parse(c.options.body)),
+      dated: Boolean(allNodes(row).find((n) => n.props?.['data-wt-date-btn'] === 'true')),
+      text: textOf(row),
+    };
+  });
+  eq(report.posts, [{ ref: 'wt-1', due: null }], '清空日期必须发 due:null（时间由宿主一并清掉）：');
+  eq(report.dated, false, '清空后本地立即不再显示旧日期：');
+  eq(report.text.includes('2026-10-20'), false, '乐观清空：旧日期不能还留在行上：');
+});
+
+await testAsync('无日期的行：默认不渲染「＋ 日期」，hover / focus 才出现，点击同样打开浮层', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const record = fakeListPayload.data.groups.later[0];
+  const saved = record.due;
+  record.due = null;
+  try {
+    withStableHooks(() => {
+      let tree = renderPanel({ t: mkT() });
+      eq(dateBtnOf(tree, 'wt-1'), null, '无日期的行默认不得渲染「＋ 日期」入口（平时不占位）：');
+      eq(textOf(rowNode(tree, 'wt-1')).includes('[addDate]'), false, '默认连文案都不该出现：');
+
+      // 鼠标悬停该行 → 出现淡色入口
+      rowNode(tree, 'wt-1').props.onMouseEnter();
+      tree = renderPanel({ t: mkT() });
+      const add = dateBtnOf(tree, 'wt-1');
+      eq(Boolean(add), true, 'hover 时必须出现「＋ 日期」入口：');
+      eq(add.props['data-wt-date-add'], 'true', '入口要打上可断言的 data 属性：');
+      eq(add.props['aria-label'], '[addDateLabel]', '入口要有「添加日期」的 aria-label：');
+      eq(String(add.props.className).includes('is-add'), true, '入口是淡色的 is-add 样式：');
+      eq(textOf(add).includes('[addDate]'), true, '入口文案是「＋ 日期」：');
+
+      // 点击入口 → 同一个浮层（里面是空的 date 输入）
+      add.props.onClick();
+      tree = renderPanel({ t: mkT() });
+      const pop = datePopOf(tree);
+      eq(Boolean(pop), true, '点「＋ 日期」同样打开浮层：');
+      const input = allNodes(pop).find((n) => n.type === 'input' && n.props?.type === 'date');
+      eq(input?.props?.value, '', '新日期的输入初始为空：');
+      // Esc 关闭 → 浮层卸载
+      pop.props.onKeyDown({ key: 'Escape' });
+      tree = renderPanel({ t: mkT() });
+      eq(datePopOf(tree), null, 'Esc 关闭后浮层必须卸载：');
+
+      // 移开 + 失焦 → 入口收回；纯键盘 focus → 再次出现
+      rowNode(tree, 'wt-1').props.onMouseLeave();
+      rowNode(tree, 'wt-1').props.onBlur();
+      tree = renderPanel({ t: mkT() });
+      eq(dateBtnOf(tree, 'wt-1'), null, '移开/失焦后入口要收回：');
+      rowNode(tree, 'wt-1').props.onFocus();
+      tree = renderPanel({ t: mkT() });
+      eq(Boolean(dateBtnOf(tree, 'wt-1')), true, '键盘 focus 该行时入口必须出现（纯键盘够得着）：');
+    });
+  } finally {
+    record.due = saved;
+  }
+});
+
+await testAsync('行内日期保存失败（stub 返回 500）：本地回滚 + 温和提示（不含原始异常串）', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const realFetch = globalThis.fetch;
+  const failingFetch = (url, options) => {
+    if (String(url).includes('/worktodo/update')) {
+      fetchCalls.push({ url: String(url), options });
+      const detail = 'HTTP 500 internal boom';
+      return Promise.resolve({
+        ok: false,
+        status: 500,
+        json: () => Promise.resolve({ ok: false, error: detail }),
+        text: () => Promise.resolve(detail),
+      });
+    }
+    return realFetch(url, options);
+  };
+  globalThis.fetch = failingFetch;
+  globalThis.window.fetch = failingFetch;
+  try {
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkT() });
+      dateBtnOf(tree, 'wt-1').props.onClick();
+      tree = renderPanel({ t: mkT() });
+      const input = allNodes(datePopOf(tree)).find((n) => n.type === 'input' && n.props?.type === 'date');
+      input.props.onChange({ target: { value: '2026-12-01' } });
+
+      // 先乐观显示新值
+      tree = renderPanel({ t: mkT() });
+      eq(textOf(dateBtnOf(tree, 'wt-1')).includes('2026-12-01'), true, '失败前先乐观显示新日期：');
+
+      // 等 POST 失败 + refresh 落地
+      await settleList();
+      tree = renderPanel({ t: mkT() });
+      const btn = dateBtnOf(tree, 'wt-1');
+      eq(textOf(btn).includes('2026-10-20'), true, '保存失败必须回滚到原日期：');
+      eq(textOf(btn).includes('2026-12-01'), false, '回滚后不能再显示乐观值：');
+      const rowText = textOf(rowNode(tree, 'wt-1'));
+      eq(rowText.includes('[dateSaveFailed]'), true, `失败要给温和提示：${rowText}`);
+      eq(rowText.includes('HTTP 500'), false, '提示里不能出现原始异常串：');
+      eq(rowText.includes('internal boom'), false, '提示里不能出现底层错误细节：');
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.window.fetch = realFetch;
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * 行内标题 / 行内项目
+ *
+ * 标题：点一下原地变 input（同字号/行高/颜色），Enter 或失焦保存、Esc 还原、
+ * 空白被本地拦下；项目：点 `#项目` 标签打开与 QuickAdd 共用的选择浮层，
+ * 选已有 / 新建 / 未归类（project:null）都能改；没有项目的行只在 hover/focus
+ * 时出现「＋ 项目」。两条写路径都先乐观更新，失败回滚原文 + 温和提示。
+ * ------------------------------------------------------------------ */
+
+/** 找一行里的标题按钮（`data-wt-title-btn`）。 */
+const rowTitleBtnOf = (tree, id) => {
+  const row = rowNode(tree, id);
+  return row ? allNodes(row).find((n) => n.props?.['data-wt-title-btn'] === 'true') ?? null : null;
+};
+
+/** 找一行里的行内标题输入框（`data-wt-title-input`）。 */
+const rowTitleInputOf = (tree, id) => {
+  const row = rowNode(tree, id);
+  return row ? allNodes(row).find((n) => n.props?.['data-wt-title-input'] === 'true') ?? null : null;
+};
+
+/** 找一行里的项目标签按钮（已设=`data-wt-project-btn`，未设=`data-wt-project-add`）。 */
+const projectBtnOf = (tree, id) => {
+  const row = rowNode(tree, id);
+  if (!row) return null;
+  return allNodes(row).find((n) => n.props?.['data-wt-project-btn'] === 'true'
+    || n.props?.['data-wt-project-add'] === 'true') ?? null;
+};
+
+/** 找当前挂载的项目选择浮层（关闭时应当为 null）。 */
+const projectPopOf = (tree) => allNodes(tree).find((n) => n.props?.['data-wt-project-pop'] === 'true') ?? null;
+
+await testAsync('行内标题：点标题 → 原地 <input>（同字号行高）→ 改文字 + Enter 发 {ref,title}；Esc 不请求且还原；空白被拒', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  let posts = [];
+  let optimisticText = '';
+  // 第一段：保存路径（Enter → POST）。乐观值绑定点击那一刻的 todo；
+  // 测试替身的 refresh 仍回同一批对象，所以这里只看「发请求 + 立即显示新值」，
+  // Esc / 空白另开一个稳定窗口（模拟重新挂载后的服务端真相）。
+  await withStableHooksAsync(async () => {
+    let tree = renderPanel({ t: mkT() });
+    const btn = rowTitleBtnOf(tree, 'wt-1');
+    eq(Boolean(btn), true, '标题必须渲染成可点按钮：');
+    eq(btn.type, 'button', '标题必须是 <button>（键盘可达）：');
+    eq(btn.props['aria-label'], '[editTitle]', '标题按钮的 aria-label 是「编辑标题」：');
+    eq(String(btn.props.className).includes('wt-title-btn'), true, '标题按钮要带行内编辑样式：');
+    eq(textOf(btn), '写 README', '未编辑时视觉仍是标题原文：');
+    eq(rowTitleInputOf(tree, 'wt-1'), null, '未点击时绝不能挂 input：');
+
+    // 点标题 → 原地 input
+    btn.props.onClick();
+    tree = renderPanel({ t: mkT() });
+    const input = rowTitleInputOf(tree, 'wt-1');
+    eq(Boolean(input), true, '点标题必须原地变成 <input>：');
+    eq(input.type, 'input');
+    eq(input.props.value, '写 README', '输入框带当前标题：');
+    eq(input.props.autoFocus, true, '输入框必须自动聚焦：');
+    let selected = false;
+    input.props.onFocus({ target: { select() { selected = true; } } });
+    eq(selected, true, '聚焦后必须全选（点一下就能直接重写）：');
+
+    // 改文字 + Enter → POST {ref, title}
+    input.props.onChange({ target: { value: '写周报' } });
+    // 真 React 里每敲一个键都会重渲染；替身需要显式再渲染一次，才能拿到带新草稿的 handler
+    tree = renderPanel({ t: mkT() });
+    const typed = rowTitleInputOf(tree, 'wt-1');
+    const before = fetchCalls.length;
+    typed.props.onKeyDown({ key: 'Enter', preventDefault() {} });
+    posts = fetchCalls.slice(before).filter((call) => call.url.includes('/worktodo/update'));
+    tree = renderPanel({ t: mkT() });
+    optimisticText = textOf(rowTitleBtnOf(tree, 'wt-1') ?? { children: [] });
+    eq(rowTitleInputOf(tree, 'wt-1'), null, 'Enter 后编辑态必须收起：');
+  });
+
+  // 第二段：Esc / 空白（新的稳定窗口 = 没有残留的乐观值）
+  await withStableHooksAsync(async () => {
+    let tree = renderPanel({ t: mkT() });
+    const original = rowTitleBtnOf(tree, 'wt-1');
+    eq(textOf(original), '写 README', '重新挂载后显示服务端原文：');
+
+    // Esc → 不请求、文字还原
+    original.props.onClick();
+    tree = renderPanel({ t: mkT() });
+    const escInput = rowTitleInputOf(tree, 'wt-1');
+    escInput.props.onChange({ target: { value: '不要保存' } });
+    tree = renderPanel({ t: mkT() });
+    const escTyped = rowTitleInputOf(tree, 'wt-1');
+    const escBefore = fetchCalls.length;
+    escTyped.props.onKeyDown({ key: 'Escape', preventDefault() {} });
+    tree = renderPanel({ t: mkT() });
+    const afterEsc = rowTitleBtnOf(tree, 'wt-1');
+    const escPosts = fetchCalls.slice(escBefore).filter((call) => call.url.includes('/worktodo/update'));
+
+    // 空白 → 不保存（还原 + 温和提示）
+    afterEsc.props.onClick();
+    tree = renderPanel({ t: mkT() });
+    const blankInput = rowTitleInputOf(tree, 'wt-1');
+    blankInput.props.onChange({ target: { value: '   ' } });
+    tree = renderPanel({ t: mkT() });
+    const blankTyped = rowTitleInputOf(tree, 'wt-1');
+    const blankBefore = fetchCalls.length;
+    blankTyped.props.onKeyDown({ key: 'Enter', preventDefault() {} });
+    tree = renderPanel({ t: mkT() });
+    const afterBlank = rowTitleBtnOf(tree, 'wt-1');
+    const blankPosts = fetchCalls.slice(blankBefore).filter((call) => call.url.includes('/worktodo/update'));
+    const rowText = textOf(rowNode(tree, 'wt-1'));
+
+    eq(escPosts.length, 0, 'Esc 不能发任何写请求：');
+    eq(textOf(afterEsc), '写 README', 'Esc 后标题必须还原：');
+    eq(blankPosts.length, 0, '空白标题必须被本地拦下（不发请求）：');
+    eq(textOf(afterBlank), '写 README', '空白标题不保存，还原原文：');
+    eq(rowText.includes('[titleEmptyHint]'), true, `空白标题要给温和提示：${rowText}`);
+  });
+
+  eq(posts.length, 1, '保存标题必须恰好发一次请求：');
+  eq(posts[0].url, '/worktodo/update', `必须 POST 到 /worktodo/update：${posts[0].url}`);
+  eq(JSON.parse(posts[0].options.body), { ref: 'wt-1', title: '写周报' }, '标题报文必须是 {ref,title}：');
+  eq(optimisticText, '写周报', '乐观更新：本地先显示新标题：');
+
+  // 样式必须真的让 input 与标题同字号/行高（不是只在节点上换个 class）
+  const css = mod.STYLE_TEXT;
+  eq(/\.wt-title-btn\s*\{[^}]*cursor:\s*text/.test(css), true, '标题按钮必须是 cursor:text：');
+  eq(/\.wt-title-btn:hover\s*\{[^}]*text-decoration:\s*underline/.test(css), true, 'hover 要有可编辑暗示：');
+  eq(/\.wt-title-input\s*\{[^}]*font:\s*inherit/.test(css), true, 'input 字号/字体与标题一致：');
+  eq(/\.wt-title-input\s*\{[^}]*line-height:\s*inherit/.test(css), true, 'input 行高与标题一致：');
+  eq(/\.wt-title-input\s*\{[^}]*padding:\s*0/.test(css), true, 'input 不能有内边距（否则行高跳动）：');
+  eq(/\.wt-title-input\s*\{[^}]*border:\s*0/.test(css), true, 'input 不能有边框（否则行高跳动）：');
+});
+
+await testAsync('行内项目：点标签 → 共用项目浮层 → 选已有项目发 {ref,project}；清除发 null；无项目行 hover/focus 才出现「＋ 项目」', async () => {
+  document.visibilityState = 'visible';
+  const savedProjects = fakeListPayload.data.projects;
+  fakeListPayload.data.projects = ['dsh-worktodo', 'alpha'];
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkT() });
+      const btn = projectBtnOf(tree, 'wt-1');
+      eq(Boolean(btn), true, '有项目的行必须把项目标签渲染成按钮：');
+      eq(btn.type, 'button', '项目标签必须是 <button>：');
+      eq(btn.props['aria-label'], '[editProject]', '标签的 aria-label 是「修改项目」：');
+      eq(String(btn.props.className).includes('wt-project-btn'), true, '标签要带行内项目样式：');
+      eq(textOf(btn), '#dsh-worktodo', '视觉仍是那颗 #项目 小胶囊：');
+      eq(projectPopOf(tree), null, '未点开时浮层绝不能挂载：');
+
+      // 点标签 → 浮层（复用 QuickAdd 的选项 / 新建 / 清除）
+      btn.props.onClick();
+      tree = renderPanel({ t: mkT() });
+      const pop = projectPopOf(tree);
+      eq(Boolean(pop), true, '点项目标签必须打开选择浮层：');
+      eq(allNodes(pop).some((n) => n.props?.['data-wt-project'] === 'alpha'), true, '浮层要列出已有项目：');
+      eq(Boolean(allNodes(pop).find((n) => n.props?.['data-wt-project-clear'] === 'true')), true, '浮层要有「未归类」清除：');
+      eq(Boolean(allNodes(pop).find((n) => n.props?.['data-wt-project-create'] === 'true')), true, '浮层要有「新建」：');
+
+      // 选已有项目
+      const beforePick = fetchCalls.length;
+      allNodes(pop).find((n) => n.props?.['data-wt-project'] === 'alpha').props.onClick();
+      const pickPosts = fetchCalls.slice(beforePick).filter((call) => call.url.includes('/worktodo/update'));
+      tree = renderPanel({ t: mkT() });
+      const optimisticText = textOf(projectBtnOf(tree, 'wt-1') ?? { children: [] });
+      eq(projectPopOf(tree), null, '选中后浮层必须关闭：');
+
+      // 清除 → project:null
+      await settleList();
+      tree = renderPanel({ t: mkT() });
+      const afterRefresh = projectBtnOf(tree, 'wt-1');
+      afterRefresh.props.onClick();
+      tree = renderPanel({ t: mkT() });
+      const clearPop = projectPopOf(tree);
+      const beforeClear = fetchCalls.length;
+      allNodes(clearPop).find((n) => n.props?.['data-wt-project-clear'] === 'true').props.onClick();
+      const clearPosts = fetchCalls.slice(beforeClear).filter((call) => call.url.includes('/worktodo/update'));
+      tree = renderPanel({ t: mkT() });
+      const clearedButton = projectBtnOf(tree, 'wt-1');
+      const clearedText = textOf(rowNode(tree, 'wt-1'));
+
+      eq(pickPosts.length, 1, '选已有项目必须恰好发一次请求：');
+      eq(JSON.parse(pickPosts[0].options.body), { ref: 'wt-1', project: 'alpha' }, '选项目的报文：');
+      eq(optimisticText, '#alpha', '乐观更新：本地先显示新项目：');
+      eq(clearPosts.length, 1, '清除必须恰好发一次请求：');
+      eq(JSON.parse(clearPosts[0].options.body), { ref: 'wt-1', project: null }, '清除必须显式发 project:null：');
+      eq(clearedButton, null, '清除后（未 hover）不渲染项目入口，平时不占位：');
+      eq(clearedText.includes('#dsh-worktodo'), false, '乐观清除后旧项目不能还在行上：');
+
+      // hover → 出现「＋ 项目」；点开 → 同一个浮层；Esc 关闭
+      rowNode(tree, 'wt-1').props.onMouseEnter();
+      tree = renderPanel({ t: mkT() });
+      const add = projectBtnOf(tree, 'wt-1');
+      eq(Boolean(add), true, 'hover 时必须出现「＋ 项目」入口：');
+      eq(add.props['data-wt-project-add'], 'true');
+      eq(add.props['aria-label'], '[addProjectLabel]', '入口要有「添加项目」的 aria-label：');
+      eq(textOf(add), '[addProject]', '入口文案是「＋ 项目」：');
+      add.props.onClick();
+      tree = renderPanel({ t: mkT() });
+      eq(Boolean(projectPopOf(tree)), true, '点「＋ 项目」同样打开浮层：');
+      projectPopOf(tree).props.onKeyDown({ key: 'Escape', preventDefault() {} });
+      tree = renderPanel({ t: mkT() });
+      eq(projectPopOf(tree), null, 'Esc 关闭后浮层必须卸载：');
+
+      // 移开 + 失焦 → 收回；键盘 focus → 再出现
+      rowNode(tree, 'wt-1').props.onMouseLeave();
+      rowNode(tree, 'wt-1').props.onBlur();
+      tree = renderPanel({ t: mkT() });
+      eq(projectBtnOf(tree, 'wt-1'), null, '移开/失焦后入口要收回：');
+      rowNode(tree, 'wt-1').props.onFocus();
+      tree = renderPanel({ t: mkT() });
+      eq(Boolean(projectBtnOf(tree, 'wt-1')), true, '键盘 focus 时入口必须出现：');
+    });
+  } finally {
+    fakeListPayload.data.projects = savedProjects;
+  }
+});
+
+await testAsync('行内标题/项目保存失败（stub 返回 500）：都回滚原值 + 温和提示（不含原始异常串）', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const realFetch = globalThis.fetch;
+  const failingFetch = (url, options) => {
+    if (String(url).includes('/worktodo/update')) {
+      fetchCalls.push({ url: String(url), options });
+      const detail = 'HTTP 500 internal boom';
+      return Promise.resolve({
+        ok: false,
+        status: 500,
+        json: () => Promise.resolve({ ok: false, error: detail }),
+        text: () => Promise.resolve(detail),
+      });
+    }
+    return realFetch(url, options);
+  };
+  globalThis.fetch = failingFetch;
+  globalThis.window.fetch = failingFetch;
+  const savedProjects = fakeListPayload.data.projects;
+  fakeListPayload.data.projects = ['dsh-worktodo', 'alpha'];
+  try {
+    await withStableHooksAsync(async () => {
+      // 标题失败
+      let tree = renderPanel({ t: mkT() });
+      rowTitleBtnOf(tree, 'wt-1').props.onClick();
+      tree = renderPanel({ t: mkT() });
+      const titleInput = rowTitleInputOf(tree, 'wt-1');
+      titleInput.props.onChange({ target: { value: '会失败的标题' } });
+      tree = renderPanel({ t: mkT() });
+      const titleTyped = rowTitleInputOf(tree, 'wt-1');
+      titleTyped.props.onKeyDown({ key: 'Enter', preventDefault() {} });
+      tree = renderPanel({ t: mkT() });
+      eq(textOf(rowTitleBtnOf(tree, 'wt-1')), '会失败的标题', '失败前先乐观显示新标题：');
+      await settleList();
+      tree = renderPanel({ t: mkT() });
+      eq(textOf(rowTitleBtnOf(tree, 'wt-1')), '写 README', '标题保存失败必须回滚原文：');
+
+      // 项目失败
+      projectBtnOf(tree, 'wt-1').props.onClick();
+      tree = renderPanel({ t: mkT() });
+      const pop = projectPopOf(tree);
+      allNodes(pop).find((n) => n.props?.['data-wt-project'] === 'alpha').props.onClick();
+      tree = renderPanel({ t: mkT() });
+      const optimistic = projectBtnOf(tree, 'wt-1');
+      eq(textOf(optimistic), '#alpha', '失败前先乐观显示新项目：');
+      await settleList();
+      tree = renderPanel({ t: mkT() });
+      const rowText = textOf(rowNode(tree, 'wt-1'));
+      eq(rowText.includes('#dsh-worktodo'), true, '项目保存失败必须回滚原项目：');
+      eq(rowText.includes('#alpha'), false, '回滚后不能再显示乐观项目：');
+      eq(rowText.includes('[titleSaveFailed]'), true, `标题失败要给温和提示：${rowText}`);
+      eq(rowText.includes('[projectSaveFailed]'), true, `项目失败要给温和提示：${rowText}`);
+      eq(rowText.includes('HTTP 500'), false, '提示里不能出现原始异常串：');
+      eq(rowText.includes('internal boom'), false, '提示里不能出现底层错误细节：');
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.window.fetch = realFetch;
+    fakeListPayload.data.projects = savedProjects;
+  }
+});
+
+
 await testAsync('勾选框：视觉 26px、可点区域 ≥40×40、有 aria-label，点击仍走 onToggle（POST /status）', async () => {
   document.visibilityState = 'visible';
   await settleList();
