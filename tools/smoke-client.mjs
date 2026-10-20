@@ -2436,6 +2436,24 @@ const dateBtnOf = (tree, id) => {
 /** 找当前挂载的日期浮层（关闭时应当为 null —— 浮层只在打开时存在）。 */
 const datePopOf = (tree) => allNodes(tree).find((n) => n.props?.['data-wt-date-pop'] === 'true') ?? null;
 
+/** 小字组里某类 chip（date / source / overdue / project）。 */
+const metaChipOf = (tree, id, kind) => {
+  const row = rowNode(tree, id);
+  return row ? allNodes(row).find((n) => n.props?.['data-wt-meta-chip'] === kind) ?? null : null;
+};
+/** 小字组的直接子节点（chip 顺序的依据；没有则是空数组）。 */
+const metaChipsOf = (tree, id) => {
+  const row = rowNode(tree, id);
+  if (!row) return [];
+  const meta = directChildren(row)
+    .find((n) => String(n.props?.className ?? '').split(' ').includes('wt-meta')) ?? null;
+  return meta ? directChildren(meta) : [];
+};
+/** 小字组里实际渲染出来的 chip 种类（空槽不会出现在这里）。 */
+const metaChipKinds = (tree, id) => metaChipsOf(tree, id)
+  .map((n) => n.props?.['data-wt-meta-chip'])
+  .filter(Boolean);
+
 test('日期浮层向上/向下自动避让边界（纯函数，拿不到几何信息时默认向下）', () => {
   eq(typeof mod.chooseDatePopoverPlacement, 'function', '应当导出浮层定位函数：');
   eq(mod.chooseDatePopoverPlacement({ top: 500, bottom: 520 }, 600), 'up', '下方放不下、上方放得下 → 向上：');
@@ -2545,7 +2563,7 @@ await testAsync('行内日期：清空日期 → POST {ref, due:null}，本地�
   eq(report.text.includes('2026-10-20'), false, '乐观清空：旧日期不能还留在行上：');
 });
 
-await testAsync('无日期的行：日期槽恒占位，但「＋ 日期」入口默认不渲染，hover / focus 才出现，点击同样打开浮层', async () => {
+await testAsync('无日期的行：默认不渲染日期 chip（不占位），「＋ 日期」入口 hover / focus 才出现，点击同样打开浮层', async () => {
   document.visibilityState = 'visible';
   await settleList();
   const record = fakeListPayload.data.groups.later[0];
@@ -2554,7 +2572,8 @@ await testAsync('无日期的行：日期槽恒占位，但「＋ 日期」入�
   try {
     withStableHooks(() => {
       let tree = renderPanel({ t: mkT() });
-      eq(dateBtnOf(tree, 'wt-1'), null, '无日期的行默认不得渲染「＋ 日期」入口（空槽占位、入口 hover 才出现）：');
+      eq(dateBtnOf(tree, 'wt-1'), null, '无日期的行默认不得渲染「＋ 日期」入口（没有内容就不占位）：');
+      eq(metaChipOf(tree, 'wt-1', 'date'), null, '无日期时连日期 chip 都不渲染（不占位）：');
       eq(textOf(rowNode(tree, 'wt-1')).includes('[addDate]'), false, '默认连文案都不该出现：');
 
       // 鼠标悬停该行 → 出现淡色入口
@@ -2823,7 +2842,7 @@ await testAsync('行内项目：点标签 → 共用项目浮层 → 选已有�
       eq(optimisticText, '#alpha', '乐观更新：本地先显示新项目：');
       eq(clearPosts.length, 1, '清除必须恰好发一次请求：');
       eq(JSON.parse(clearPosts[0].options.body), { ref: 'wt-1', project: null }, '清除必须显式发 project:null：');
-      eq(clearedButton, null, '清除后（未 hover）不渲染项目入口（空槽占位）：');
+      eq(clearedButton, null, '清除后（未 hover）不渲染项目入口（没有项目就不占位）：');
       eq(clearedText.includes('#dsh-worktodo'), false, '乐观清除后旧项目不能还在行上：');
 
       // hover → 出现「＋ 项目」；点开 → 同一个浮层；Esc 关闭
@@ -3016,7 +3035,8 @@ await test('B1（护栏）：行高 ≥ 命中盒高度，相邻两行的勾选�
  *   1. 默认单行：同一份 DOM 的五个直接子元素顺序是 [旗子槽][勾选][标题][小字组][行尾操作]，
  *      旗子槽在勾选框**之前**（行首）、小字组不在标题容器里（否则它永远在第二行），标题单行省略；
  *   2. 换行判定：注入 scrollWidth > clientWidth → 整行加 .wt-row--wrap、小字组落到
- *      标题所在列的第二行；宽度回来时要「明显够宽」才解除（滞回），不是一不截断就弹回；
+ *      标题所在列的第二行；变窄超过 8px 死区才换行，放宽到「真的放得下」就解除
+ *      （双向），阈值附近有 9–10px 死区不会反复切换；
  *   3. 行尾操作：默认 opacity:0 + pointer-events:none，行 hover / focus-within 才显示，
  *      按钮始终在 DOM 里（Tab 可达、聚焦即显示）。
  * 反向验证：删掉换行判定 → 第 2 条红；把 .wt-actions 改回常驻 → 第 3 条红。
@@ -3033,6 +3053,15 @@ const rowChild = (tree, id, className) => {
 /** 等过一轮防抖窗口（真实定时器；这个用例不装假定时器）。 */
 const waitForMeasure = () => new Promise((resolve) => setTimeout(resolve, mod.ROW_WRAP_DEBOUNCE_MS + 40));
 
+/**
+ * 注入标题几何，**模拟真 DOM 的 scrollWidth 语义**：
+ * 标题没被截断时 scrollWidth == clientWidth（会被列宽撑满），只有内容更宽时 scrollWidth
+ * 才是内容宽。0.2.13 的「永不解除」正是因为换行态把撑满后的 scrollWidth 当成了固有宽度。
+ */
+const injectTitleGeometry = (title, { content, client }) => {
+  title.props.ref({ scrollWidth: Math.max(content, client), clientWidth: client });
+};
+
 await testAsync('行布局 B：默认单行 —— [旗子槽][勾选][标题][小字组][行尾操作] 同一行容器，标题单行省略', async () => {
   document.visibilityState = 'visible';
   await settleList();
@@ -3048,7 +3077,7 @@ await testAsync('行布局 B：默认单行 —— [旗子槽][勾选][标题][�
   eq(indexOf('wt-flag-slot'), 0, `第一个直接子元素必须是行首旗子槽：${classes.join(' | ')}`);
   eq(indexOf('wt-check'), 1, '第二个是勾选框（旗子在勾选之前）：');
   eq(indexOf('wt-row-main'), 2, '第三个是标题列：');
-  eq(indexOf('wt-meta'), 3, '第四个小字组（四槽：日期/来源/已过期/项目）：');
+  eq(indexOf('wt-meta'), 3, '第四个小字组（紧凑 chip 组：日期/来源/已过期/项目）：');
   eq(indexOf('wt-actions'), 4, '第五个行尾操作：');
   // 用户要求的顺序，单独再钉一遍（把旗子放回勾选之后 → 这两条立刻红）
   eq(indexOf('wt-flag-slot') < indexOf('wt-check'), true, '旗子必须在勾选框**之前**：');
@@ -3157,24 +3186,39 @@ await testAsync('行首旗子槽：none 行也固定占位 18px，hover 只淡�
   }
 });
 
-test('行布局判定：只有「标题会被截断」才换行；换行后要等单行放得下且多出 8px 才解除（滞回）', () => {
+test('行布局判定：单行侧 8px 死区 / 换行侧真的放得下（+1px）就解除 —— 双向、不会卡死', () => {
   eq(typeof mod.decideRowWrap, 'function', '换行判定必须是可单测的纯函数：');
-  // 单行态：scrollWidth ≤ clientWidth 不换；多 1px 就换（亚像素误差由 SLACK 兜住）
+  // 单行态：截断 ≤8px 先留在单行（死区），多出 8px 以上才换行
   eq(mod.decideRowWrap({ intrinsicWidth: 120, availableWidth: 120 }), false, '刚好放下不该换行：');
-  eq(mod.decideRowWrap({ intrinsicWidth: 121, availableWidth: 120 }), false, '1px 内含 SLACK，不算截断：');
-  eq(mod.decideRowWrap({ intrinsicWidth: 122, availableWidth: 120 }), true, '真的截断才换行：');
+  eq(mod.decideRowWrap({ intrinsicWidth: 128, availableWidth: 120 }), false,
+    '只截断 8px（死区内）先不换行，避免阈值边缘每像素切一次：');
+  eq(mod.decideRowWrap({ intrinsicWidth: 129, availableWidth: 120 }), true, '截断超过死区才换行：');
   // 换行态：先预测「小字组回到第一行后标题还剩多少宽」= available − meta − gap
   eq(mod.decideRowWrap({ wrapped: true, intrinsicWidth: 240, availableWidth: 300, metaWidth: 100 }), true,
-    '滞回：标题已经不被截断了，但塞回小字组后仍不够宽 → 保持换行：');
+    '预测宽度 192 不够 → 保持换行：');
   eq(mod.decideRowWrap({ wrapped: true, intrinsicWidth: 240, availableWidth: 348, metaWidth: 100 }), true,
-    '预测宽度 240 < 240+8 → 仍然保持换行：');
-  eq(mod.decideRowWrap({ wrapped: true, intrinsicWidth: 240, availableWidth: 356, metaWidth: 100 }), false,
-    '预测宽度 248 ≥ 240+8 → 明显变宽，解除换行：');
-  eq(mod.ROW_WRAP_HYSTERESIS_PX, 8, '滞回量固定 8px（可审计）：');
+    '预测宽度 240 只差 1px（死区内）→ 仍保持换行，不抖：');
+  eq(mod.decideRowWrap({ wrapped: true, intrinsicWidth: 240, availableWidth: 349, metaWidth: 100 }), false,
+    '预测宽度 241 ≥ 240+1 → 真的放得下，必须解除换行：');
+  // 双向：换行点在单行可用宽 231（240 = 231+8+1），解除点在单行预测 241 →
+  // 死区 10px；把宽度在 231..240 之间来回拨，状态不切换。
+  const singleAt = (width) => mod.decideRowWrap({ intrinsicWidth: 240, availableWidth: width });
+  const wrappedAt = (predicted) => mod.decideRowWrap({
+    wrapped: true, intrinsicWidth: 240, availableWidth: predicted + 100 + mod.ROW_GAP_PX, metaWidth: 100,
+  });
+  eq(singleAt(231), true, '231 是换行点（截断 9px）：');
+  eq(singleAt(232), false, '232 起回到单行（截断 8px，单行侧死区）：');
+  for (let width = 232; width <= 240; width += 1) {
+    eq(singleAt(width), false, `单行态在死区内（${width}）不许再换行：`);
+    eq(wrappedAt(width), true, `换行态在死区内（预测 ${width}）不许解除：`);
+  }
+  eq(wrappedAt(241), false, '预测 241 才解除（比换行点宽 10px，死区 10px）：');
+  eq(mod.ROW_WRAP_HYSTERESIS_PX, 8, '死区 8px（可审计）：');
+  eq(mod.ROW_WRAP_SLACK_PX, 1, '解除侧只留 1px 亚像素余量：');
   eq(mod.ROW_WRAP_DEBOUNCE_MS >= 80, true, `scrollWidth 测量必须有防抖窗口（实际 ${mod.ROW_WRAP_DEBOUNCE_MS}ms）：`);
 });
 
-await testAsync('行布局 C：scrollWidth > clientWidth → .wt-row--wrap + 小字组落到标题列第二行；变宽后带滞回解除', async () => {
+await testAsync('行布局 C：变窄换行 ↔ 放宽解除（双向），解除后重量不抖；换行态不拿被撑满的 scrollWidth 当固有宽度', async () => {
   document.visibilityState = 'visible';
   await settleList();
   const realResizeObserver = globalThis.ResizeObserver;
@@ -3201,16 +3245,15 @@ await testAsync('行布局 C：scrollWidth > clientWidth → .wt-row--wrap + 小
       eq(Boolean(meta), true, '必须找到小字组：');
       meta.props.ref.current = { scrollWidth: 100, clientWidth: 100 };
 
-      // 注入「标题固有宽 240 > 列宽 120」= 会被省略号截断
-      title.props.ref({ scrollWidth: 240, clientWidth: 120 });
+      // 变窄：标题固有宽 240 > 列宽 120 → 会被省略号截断 → 换行
+      injectTitleGeometry(title, { content: 240, client: 120 });
       await waitForMeasure();
       tree = renderPanel({ t: mkT() });
       row = rowNode(tree, 'wt-1');
       eq(String(row.props.className).includes('wt-row--wrap'), true, `标题会被截断时必须换行：${row.props.className}`);
       eq(row.props['data-wt-row-wrap'], 'true', '换行态要能被断言到：');
 
-      // DOM/CSS：第一行 [旗子][勾选][标题][操作]，小字组被 grid 放到第二行、
-      // 仍在标题那一列并**左对齐到标题左边缘**（见下面的 meta 断言与固定列用例）
+      // DOM/CSS：第一行 [旗子][勾选][标题][操作]，小字组被 grid 放到第二行、仍在标题那一列
       const wrapRule = cssRule('.wt-row--wrap');
       eq(/display:\s*grid/.test(wrapRule), true, '换行态必须用 grid 两列（勾选框列 + 内容列）：');
       eq(/grid-template-columns:\s*auto auto minmax\(0, 1fr\) auto/.test(wrapRule), true,
@@ -3223,14 +3266,11 @@ await testAsync('行布局 C：scrollWidth > clientWidth → .wt-row--wrap + 小
         '换行态旗子仍在第一行（勾选之前）：');
       eq(allNodes(rowChild(tree, 'wt-1', 'wt-meta')).includes(wrapFlagSlot), false,
         '换行态旗子不许跟着小字组落到第二行：');
-      // meta 在第 3 列（标题列）+ justify-self:end → 右端与单行态重合（日期 x 不变）；
-      // 网格前两列的 auto 宽度就是「旗子 + 勾选」的固定宽度，所以 meta 不会对齐到旗子下面。
+      // meta 在第 3 列（标题列）+ justify-self:end → 整组右边缘与单行态重合
       eq(/\.wt-row--wrap \.wt-meta\s*\{[^}]*justify-self:\s*end/.test(mod.STYLE_TEXT), true,
-        '换行态小字组必须右对齐（日期 x 跨换行不变）：');
+        '换行态小字组必须右对齐（整组右边缘跨换行不变）：');
       eq(/\.wt-row--wrap \.wt-meta\s*\{[^}]*justify-self:\s*start/.test(mod.STYLE_TEXT), false,
-        '换行态小字组不许右对齐到列尾（那样左边缘就不与标题对齐了）：');
-      eq(/grid-template-columns:\s*auto auto minmax\(0, 1fr\) auto/.test(wrapRule), true,
-        `前两列必须是「旗子 + 勾选」的固定宽度（meta 因此不会缩进到旗子下面）：${wrapRule}`);
+        '换行态小字组不许左对齐（那样跨换行会左右跳）：');
       // 单行态：meta 仍是 actions 的前一个兄弟（DOM 顺序未变）
       const rowKids = directChildren(rowNode(tree, 'wt-1')).map((n) => String(n.props?.className ?? ''));
       eq(rowKids.indexOf('wt-meta') === rowKids.indexOf('wt-actions') - 1, true,
@@ -3246,23 +3286,38 @@ await testAsync('行布局 C：scrollWidth > clientWidth → .wt-row--wrap + 小
       eq(/\.wt-title\s*\{[^}]*text-overflow:\s*ellipsis/.test(mod.STYLE_TEXT), true,
         '换行态标题的省略号规则必须仍然生效（.wt-title 不按布局态分开写）：');
 
-      // 稍微变宽：当前标题列 300 > 固有宽 240（已不截断），但单行要把 100px 小字组塞回去 → 保持换行
-      title.props.ref({ scrollWidth: 240, clientWidth: 300 });
+      // 稍宽：标题列 300 已不截断，但单行要把 100px 小字组塞回去 →
+      // 预测 300 − (100+8) = 192 < 240+1，必须保持换行。
+      // 关键：此时真 DOM 的 scrollWidth == clientWidth == 300（被标题列撑满），
+      // 拿它当固有宽度就会得出「永远不够」——这里正是 0.2.13 解不开的地方。
+      injectTitleGeometry(title, { content: 240, client: 300 });
       await waitForMeasure();
       tree = renderPanel({ t: mkT() });
       eq(String(rowNode(tree, 'wt-1').props.className).includes('wt-row--wrap'), true,
-        '滞回：只是不再截断还不够，必须等单行真的放得下（否则会来回抖）：');
+        '只是不再截断还不够，必须等单行真的放得下（否则会来回抖）：');
 
-      // 明显变宽：360 − (100 + 8) = 252 ≥ 240 + 8 → 解除
-      title.props.ref({ scrollWidth: 240, clientWidth: 360 });
+      // 放宽到刚好放得下：349 − (100+8) = 241 ≥ 240+1 → 必须解除（旧实现会卡死在这里）
+      injectTitleGeometry(title, { content: 240, client: 349 });
       await waitForMeasure();
       tree = renderPanel({ t: mkT() });
       row = rowNode(tree, 'wt-1');
-      eq(String(row.props.className).includes('wt-row--single'), true, `明显变宽后必须解除换行：${row.props.className}`);
+      eq(String(row.props.className).includes('wt-row--single'), true, `放宽到放得下后必须解除换行：${row.props.className}`);
       eq(row.props['data-wt-row-wrap'], undefined, '解除后换行标记必须消失：');
 
+      // 解除后会再测一次：不能「解除 → 又省略 → 再换行」。再等一个防抖窗口仍然是单行。
+      await waitForMeasure();
+      tree = renderPanel({ t: mkT() });
+      eq(String(rowNode(tree, 'wt-1').props.className).includes('wt-row--single'), true,
+        '解除后重新测量必须仍判定为单行（不抖回换行）：');
+
+      // 再收窄 → 又能换行（双向不是单向锁死）
+      injectTitleGeometry(title, { content: 240, client: 120 });
+      await waitForMeasure();
+      eq(String(rowNode(renderPanel({ t: mkT() }), 'wt-1').props.className).includes('wt-row--wrap'), true,
+        '收窄后必须再次换行（双向判定）：');
+
       // 卸载时观察器要断开（不留悬空回调）
-      row.props.ref(null);
+      rowNode(renderPanel({ t: mkT() }), 'wt-1').props.ref(null);
       eq(observers[0].disconnected, true, '行卸载时必须 disconnect ResizeObserver：');
     });
   } finally {
@@ -3270,239 +3325,273 @@ await testAsync('行布局 C：scrollWidth > clientWidth → .wt-row--wrap + 小
   }
 });
 
-/* ------------------------------------------------------------------ *
- * 小字组固定列：四槽固定网格（日期/来源/已过期/项目）、恒占位；换行态复用同一套列定义
- *
- * 旧实现里小字组是自由排布的 flex，日期贴着标题右端跑：标题一长一短，日期就换 x 坐标。
- * 现在 .wt-meta 是四列固定网格，顺序固定为 META_SLOT_ORDER = [日期][来源][已过期][项目]：
- * 日期 96px、来源 44px、已过期 44px、项目 96px（宽度都取导出常量）。四只槽无论有没有内容
- * 都渲染，所以任何行的同一槽都落在同一条竖线上；来源与「已过期」胶囊都在小字组自己的槽里，
- * 不再挂在标题列右端。换行态不重写列宽，仍复用这四列。
- * 反向验证：
- *   - 把 .wt-meta 的日期列改回自适应（flex:1 1 auto / grid 列改 auto）→ 用例 1 必红；
- *   - 把无日期行的日期槽去掉（条件渲染整只槽）→ 用例 2 必红；
- *   - 把「已过期」胶囊搬回标题列 → 用例 3 必红。
- * ------------------------------------------------------------------ */
-
-/** 找一行里某个「槽」节点（按 data 属性）。 */
-const slotOf = (tree, id, attr) => {
-  const row = rowNode(tree, id);
-  return row ? allNodes(row).find((n) => n.props?.[attr] === 'true') ?? null : null;
-};
-const dateSlotOf = (tree, id) => slotOf(tree, id, 'data-wt-meta-date-slot');
-const sourceSlotOf = (tree, id) => slotOf(tree, id, 'data-wt-meta-source-slot');
-const overdueSlotOf = (tree, id) => slotOf(tree, id, 'data-wt-meta-overdue-slot');
-const projectSlotOf = (tree, id) => slotOf(tree, id, 'data-wt-meta-project-slot');
-
-/** 槽位 → 导出宽度常量（期望的列定义/槽宽都从这一份映射派生，避免与实现漂移）。 */
-const META_SLOT_WIDTHS = {
-  date: mod.META_DATE_SLOT_PX,
-  source: mod.META_SOURCE_SLOT_PX,
-  overdue: mod.META_OVERDUE_SLOT_PX,
-  project: mod.META_PROJECT_SLOT_PX,
-};
-
-/** .wt-meta 的 grid-template-columns 原文（列定义是「同一列」的结构依据）。 */
-const metaColumns = () => {
-  const rule = cssRule('.wt-meta');
-  const match = /grid-template-columns:\s*([^;]+);/.exec(rule);
-  return match ? match[1].trim() : '';
-};
-
-/** 按 META_SLOT_ORDER + 宽度常量派生的四列定义（不写死列宽/顺序）。 */
-const expectedMetaColumns = () => mod.META_SLOT_ORDER
-  .map((slot) => `${META_SLOT_WIDTHS[slot]}px`).join(' ');
-
-await testAsync('小字组固定列：标题一长一短的两行，日期槽同宽、同在网格第 1 列（日期不随标题漂）', async () => {
+await testAsync('双向换行：标题编辑变短后重新判定 —— 提交短标题必须从换行态回到单行', async () => {
   document.visibilityState = 'visible';
-  const longTodo = {
-    id: 'wt-long', title: '一条非常非常长的标题'.repeat(3), notes: '', status: 'pending',
-    priority: 'normal', due: '2026-10-20', project: 'dsh-worktodo', source: 'agent',
-    createdAt: 3, updatedAt: 3, completedAt: null,
+  await settleList();
+  const realResizeObserver = globalThis.ResizeObserver;
+  globalThis.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
   };
-  fakeListPayload.data.todos.push(longTodo);
-  fakeListPayload.data.groups.later.push(longTodo);
   try {
-    await settleList();
-    const tree = renderPanel({ t: mkT() });
-    const shortSlot = dateSlotOf(tree, 'wt-1');
-    const longSlot = dateSlotOf(tree, 'wt-long');
-    eq(Boolean(shortSlot), true, '短标题行必须有日期槽：');
-    eq(Boolean(longSlot), true, '长标题行必须有日期槽：');
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkT() });
+      rowNode(tree, 'wt-1').props.ref({ tag: 'wt-row' });
+      rowChild(tree, 'wt-1', 'wt-meta').props.ref.current = { scrollWidth: 100, clientWidth: 100 };
+      injectTitleGeometry(rowTitleBtnOf(tree, 'wt-1'), { content: 240, client: 120 });
+      await waitForMeasure();
+      tree = renderPanel({ t: mkT() });
+      eq(String(rowNode(tree, 'wt-1').props.className).includes('wt-row--wrap'), true,
+        '前提：先进入换行态：');
 
-    // 1) 两行的日期槽宽度相同，且等于导出的常量（渲染值与样式表取同一个数）
-    eq(shortSlot.props['data-wt-meta-date-width'], mod.META_DATE_SLOT_PX, '短标题行日期槽宽＝常量：');
-    eq(longSlot.props['data-wt-meta-date-width'], shortSlot.props['data-wt-meta-date-width'],
-      '两行标题长度差很大，日期槽宽度仍必须相同：');
-    eq(mod.META_DATE_SLOT_PX, 96, '日期槽固定 96px（11px 字号下放得下 2026-10-20 14:30）：');
-
-    // 2) 结构上同一列：.wt-meta 是四列固定网格，日期槽是它的第 1 个子节点（grid 列 1）
-    eq(/display:\s*grid/.test(cssRule('.wt-meta')), true, '小字组必须用 grid 固定列，不能再是自由排布的 flex：');
-    eq(metaColumns(), expectedMetaColumns(),
-      `列定义必须是「日期/来源/已过期/项目」四列（按 META_SLOT_ORDER + 导出宽度常量派生）：${metaColumns()}`);
-    const shortMeta = rowChild(tree, 'wt-1', 'wt-meta');
-    const longMeta = rowChild(tree, 'wt-long', 'wt-meta');
-    const kidsOf = (node) => directChildren(node).map((n) => String(n.props?.className ?? '').split(' '));
-    eq(kidsOf(shortMeta)[0].includes('wt-meta-date'), true, '日期槽是网格第 1 列（第 1 个子节点）：');
-    eq(kidsOf(longMeta)[0].includes('wt-meta-date'), true, '长标题行的日期槽也在网格第 1 列：');
-    const projectIndex = mod.META_SLOT_ORDER.indexOf('project');
-    eq(kidsOf(shortMeta)[projectIndex].includes('wt-meta-project'), true,
-      `项目槽是小字组最后一槽（网格第 ${projectIndex + 1} 列）：`);
-    eq(shortMeta.props['data-wt-meta-date-width'], longMeta.props['data-wt-meta-date-width'],
-      '两行小字组声明的日期列宽必须一致：');
-    // 有 offsetLeft（真实 DOM）就断言两条日期槽的 x 相同；测试替身没有几何信息则跳过。
-    if (typeof shortSlot.offsetLeft === 'number' && typeof longSlot.offsetLeft === 'number') {
-      eq(longSlot.offsetLeft, shortSlot.offsetLeft, '两行日期槽的 offsetLeft 必须相同（同一 x）：');
-    }
-
-    // 3) 日期槽/项目槽本身定宽、不参与伸缩；日期也不再靠 margin-left:auto 漂移
-    const slotRule = cssRule('.wt-meta-date');
-    eq(/width:\s*96px/.test(slotRule), true, `日期槽必须定宽 96px：${slotRule}`);
-    eq(/flex:\s*1 1 auto/.test(slotRule), false, '日期槽不许改成自适应宽度（那正是日期漂移的旧实现）：');
-    eq(/margin-left:\s*auto/.test(mod.STYLE_TEXT), false, '不许再用 margin-left:auto 让日期贴着标题右端漂：');
-    eq(/width:\s*96px/.test(cssRule('.wt-meta-project')), true, '项目槽必须定宽 96px：');
-    eq(/text-overflow:\s*ellipsis/.test(cssRule('.wt-project-btn')), true, '项目名超长必须省略号收尾：');
-    eq(/white-space:\s*nowrap/.test(cssRule('\n.wt-tag')), true, '项目胶囊必须单行：');
-
-    // 4) 四槽顺序固定（DOM 顺序 = META_SLOT_ORDER），每只槽带自己的导出宽度
-    const metaChildren = directChildren(shortMeta);
-    eq(metaChildren.map((n) => n.props?.['data-wt-meta-slot']), mod.META_SLOT_ORDER,
-      `小字组顺序必须固定为 [日期][来源][已过期][项目]（按 META_SLOT_ORDER 派生）：${kidsOf(shortMeta).map((c) => c.join('.')).join(' | ')}`);
-    eq(metaChildren.map((n) => n.props?.['data-wt-meta-slot-width']),
-      mod.META_SLOT_ORDER.map((slot) => META_SLOT_WIDTHS[slot]),
-      '四只槽各自声明的宽度必须按顺序等于导出常量：');
-
-    // 5) 来源胶囊在小字组第 2 槽（日期之后、已过期之前），不再挂在标题列右端
-    const longMain = rowChild(tree, 'wt-long', 'wt-row-main');
-    const longSource = sourceSlotOf(tree, 'wt-long');
-    eq(Boolean(longSource), true, '有来源的行必须有来源槽：');
-    const longChip = allNodes(longSource).find((n) => n.props?.['data-wt-source-chip'] === 'true') ?? null;
-    eq(Boolean(longChip), true, '有来源的行必须渲染来源胶囊：');
-    eq(allNodes(longMain).includes(longChip), false, '来源胶囊不许再留在标题列右端（它会挤动标题）：');
-    const sourceIndex = mod.META_SLOT_ORDER.indexOf('source');
-    eq(directChildren(longMeta).indexOf(longSource), sourceIndex,
-      `来源槽必须是 META_SLOT_ORDER 里的第 ${sourceIndex + 1} 槽：`);
-    eq(sourceIndex > mod.META_SLOT_ORDER.indexOf('date')
-      && sourceIndex < mod.META_SLOT_ORDER.indexOf('overdue'), true,
-      '来源槽必须在日期之后、已过期之前：');
-    eq(textOf(longChip), '[sourceAgent]', '来源胶囊文案不变：');
-    eq(dateSlotOf(tree, 'wt-long').props['data-wt-meta-date-width'], mod.META_DATE_SLOT_PX,
-      '有来源胶囊的行，日期槽宽度也不变：');
+      // 原地编辑成短标题并提交
+      rowTitleBtnOf(tree, 'wt-1').props.onClick();
+      tree = renderPanel({ t: mkT() });
+      rowTitleInputOf(tree, 'wt-1').props.onChange({ target: { value: '短' } });
+      tree = renderPanel({ t: mkT() });
+      const before = fetchCalls.length;
+      rowTitleInputOf(tree, 'wt-1').props.onKeyDown({ key: 'Enter', preventDefault() {} });
+      tree = renderPanel({ t: mkT() });
+      eq(String(rowNode(tree, 'wt-1').props.className).includes('wt-row--single'), true,
+        '提交短标题后必须立刻回到单行（不能沿用换行态）：');
+      // 新标题按钮挂上（模拟 React 的 ref 回调）：短标题 80px，可用 300px
+      injectTitleGeometry(rowTitleBtnOf(tree, 'wt-1'), { content: 80, client: 300 });
+      await waitForMeasure();
+      tree = renderPanel({ t: mkT() });
+      eq(String(rowNode(tree, 'wt-1').props.className).includes('wt-row--single'), true,
+        '重量后仍是单行（短标题不需要换行）：');
+      const posts = fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/update'))
+        .map((c) => JSON.parse(c.options.body));
+      eq(posts, [{ ref: 'wt-1', title: '短' }], '短标题仍走同一条提交路径：');
+    });
   } finally {
-    fakeListPayload.data.todos.splice(fakeListPayload.data.todos.indexOf(longTodo), 1);
-    fakeListPayload.data.groups.later.splice(fakeListPayload.data.groups.later.indexOf(longTodo), 1);
+    globalThis.ResizeObserver = realResizeObserver;
   }
 });
 
-await testAsync('小字组占位：无日期 / 无来源 / 未过期 / 无项目的行也渲染四只槽（宽度与有内容的行完全相同）', async () => {
+/* ------------------------------------------------------------------ *
+ * 小字组紧凑 chip 组：按内容定宽、有内容才占位、chip 之间只有一个 gap
+ * 旧实现是四只固定宽度的槽（96/44/44/96，恒占位），内容短时槽里大片留白，
+ * 看起来日期/AI/项目是隔开的。现在 .wt-meta 是 flex chip 组：
+ *   - 每颗 chip 的宽度由内容决定；项目 chip 只有 max-width:96px（≈8 汉字）；
+ *   - 有内容才渲染 chip，没内容就不占位（无来源 / 未过期 / 无项目时整颗消失）；
+ *   - 相邻 chip 之间只有一个 META_CHIP_GAP_PX（6px）的 gap，没有固定空槽。
+ * 顺序仍是 META_CHIP_ORDER = [日期][来源][已过期][项目]。
+ *
+ * 反向验证：把 .wt-meta 改回 grid 四列 / 给 chip 加回 96/44/44/96 的固定宽度
+ * → 用例 1 必红（会断言 .wt-meta 是 flex、chip 上没有固定宽度、旧槽常量不存在）。
+ * ------------------------------------------------------------------ */
+
+await testAsync('小字组紧凑：三项都有 / 只有日期 / 只有项目 —— chip 按内容定宽、同 gap、无空槽占位', async () => {
   document.visibilityState = 'visible';
-  const record = fakeListPayload.data.groups.later[0];
-  const saved = { due: record.due, project: record.project };
-  const fullTodo = {
-    id: 'wt-full', title: '有日期有项目的对照行', notes: '', status: 'pending', priority: 'normal',
-    due: '2026-10-20', project: 'dsh-worktodo', source: 'human',
-    createdAt: 4, updatedAt: 4, completedAt: null,
-  };
-  // wt-1 临时变成「无日期、无项目」的行；再放一条有日期/项目的对照行
-  record.due = null;
-  record.project = null;
-  fakeListPayload.data.groups.later.push(fullTodo);
+  const extra = [
+    {
+      id: 'wt-all', title: '三项都有的行', notes: '', status: 'pending', priority: 'normal',
+      due: '2026-10-20', project: 'dsh-worktodo', source: 'agent',
+      createdAt: 3, updatedAt: 3, completedAt: null,
+    },
+    {
+      id: 'wt-date', title: '只有日期的行', notes: '', status: 'pending', priority: 'normal',
+      due: '2026-10-20', project: null, source: 'human',
+      createdAt: 4, updatedAt: 4, completedAt: null,
+    },
+    {
+      id: 'wt-proj', title: '只有项目的行', notes: '', status: 'pending', priority: 'normal',
+      due: null, project: 'alpha', source: 'human',
+      createdAt: 5, updatedAt: 5, completedAt: null,
+    },
+    {
+      id: 'wt-proj8', title: '项目名 8 个汉字的行', notes: '', status: 'pending', priority: 'normal',
+      due: null, project: '八个汉字项目名啊', source: 'human',
+      createdAt: 6, updatedAt: 6, completedAt: null,
+    },
+  ];
+  for (const todo of extra) {
+    fakeListPayload.data.todos.push(todo);
+    fakeListPayload.data.groups.later.push(todo);
+  }
   try {
     await settleList();
     const tree = renderPanel({ t: mkT() });
-    const emptyDate = dateSlotOf(tree, 'wt-1');
-    const emptyProject = projectSlotOf(tree, 'wt-1');
-    const emptySource = sourceSlotOf(tree, 'wt-1');
-    const emptyOverdue = overdueSlotOf(tree, 'wt-1');
-    eq(Boolean(emptyDate), true, '无日期的行也必须渲染日期槽（空槽占位，否则日期会左右跳）：');
-    eq(Boolean(emptyProject), true, '无项目的行也必须渲染项目槽（空槽占位）：');
-    eq(Boolean(emptySource), true, '无来源的行也必须渲染来源槽（空槽占位，否则日期/已过期/项目会左右跳）：');
-    eq(Boolean(emptyOverdue), true, '未过期的行也必须渲染「已过期」槽（空槽占位）：');
-    eq(emptyDate.props['data-wt-meta-date-width'], mod.META_DATE_SLOT_PX, '空日期槽宽度仍是 96px：');
-    eq(emptySource.props['data-wt-meta-source-width'], mod.META_SOURCE_SLOT_PX, '空来源槽宽度仍是 44px：');
-    eq(emptyOverdue.props['data-wt-meta-overdue-width'], mod.META_OVERDUE_SLOT_PX,
-      '空「已过期」槽宽度仍是 44px：');
-    eq(emptyProject.props['data-wt-meta-project-width'], mod.META_PROJECT_SLOT_PX, '空项目槽宽度仍是 96px：');
-    eq(dateSlotOf(tree, 'wt-full').props['data-wt-meta-date-width'],
-      emptyDate.props['data-wt-meta-date-width'], '空日期槽与有内容的日期槽同宽：');
-    eq(sourceSlotOf(tree, 'wt-full').props['data-wt-meta-source-width'],
-      emptySource.props['data-wt-meta-source-width'], '空来源槽与有内容的来源槽同宽：');
-    eq(overdueSlotOf(tree, 'wt-full').props['data-wt-meta-overdue-width'],
-      emptyOverdue.props['data-wt-meta-overdue-width'], '空「已过期」槽与有内容的槽同宽：');
-    eq(projectSlotOf(tree, 'wt-full').props['data-wt-meta-project-width'],
-      emptyProject.props['data-wt-meta-project-width'], '空项目槽与有内容的项目槽同宽：');
-    eq(/display:\s*none/.test(cssRule('.wt-meta-date')), false, '空槽不许用 display:none 藏（占位消失＝日期又漂）：');
 
-    // 空槽里默认没有入口按钮（「＋日期」/「＋项目」仍然 hover/focus 才出现），槽位本身照旧占着
-    eq(allNodes(emptyDate).some((n) => n.props?.['data-wt-date-btn'] === 'true'
-      || n.props?.['data-wt-date-add'] === 'true'), false, '无日期行平时不渲染「＋日期」入口（槽还在）：');
-    eq(allNodes(emptyProject).some((n) => n.props?.['data-wt-project-btn'] === 'true'
-      || n.props?.['data-wt-project-add'] === 'true'), false, '无项目行平时不渲染「＋项目」入口（槽还在）：');
+    // 1) chip 顺序：日期 → 来源 → 已过期 → 项目；没有内容的 chip 不渲染（不是空槽）
+    eq(mod.META_CHIP_ORDER, ['date', 'source', 'overdue', 'project'], 'chip 顺序声明不变：');
+    eq(metaChipKinds(tree, 'wt-all'), ['date', 'source', 'project'], '三项都有时按序渲染三颗 chip：');
+    eq(metaChipKinds(tree, 'wt-date'), ['date'], '只有日期时只渲染日期 chip：');
+    eq(metaChipKinds(tree, 'wt-proj'), ['project'], '只有项目时只渲染项目 chip：');
+    eq(metaChipKinds(tree, 'wt-1'), ['date', 'project'], '日期 + 项目两 chip（人加的无来源）：');
+    eq(metaChipOf(tree, 'wt-proj', 'date'), null, '无日期时不渲染日期 chip（不占位）：');
+    eq(metaChipOf(tree, 'wt-proj', 'source'), null, '无来源时不渲染来源 chip（不占位）：');
+    eq(metaChipOf(tree, 'wt-proj', 'overdue'), null, '未过期时不渲染「已过期」chip（不占位）：');
+    eq(metaChipOf(tree, 'wt-date', 'project'), null, '无项目时不渲染项目 chip（不占位）：');
+    // 每颗 chip 都有内容，没有「空壳」占位节点
+    for (const id of ['wt-all', 'wt-date', 'wt-proj', 'wt-1']) {
+      const chips = metaChipsOf(tree, id);
+      eq(chips.every((n) => n.props?.['data-wt-meta-chip']), true, `${id} 的小字组里不许有空槽节点：`);
+      eq(chips.every((n) => textOf(n).trim().length > 0), true, `${id} 的每颗 chip 都必须有文案（不许空占位）：`);
+    }
 
-    // hover 之后入口出现，且仍挂在同一只槽里（不新增节点层级、不改槽宽）。
-    // 行内 hover 是 setState：必须在同一实例的稳定窗口里再渲染一次才看得到。
-    const hoveredWidth = withStableHooks(() => {
-      let next = renderPanel({ t: mkT() });
-      rowNode(next, 'wt-1').props.onMouseEnter();
-      next = renderPanel({ t: mkT() });
-      const hoveredDate = dateSlotOf(next, 'wt-1');
-      const hoveredProject = projectSlotOf(next, 'wt-1');
-      eq(Boolean(hoveredDate) && Boolean(hoveredProject), true, 'hover 后日期槽与项目槽必须还在：');
+    // 2) 样式：flex 按内容排、统一 gap；不是固定列网格，也不再有 96/44/44/96 常量
+    const metaRule = cssRule('.wt-meta');
+    eq(/display:\s*flex/.test(metaRule), true, `小字组必须是按内容排布的 flex（不是固定列网格）：${metaRule}`);
+    eq(/grid-template-columns/.test(metaRule), false, '小字组不许再用 grid 固定列：');
+    eq(/gap:\s*6px/.test(metaRule), true, `chip 之间必须只有一个 6px 的 gap：${metaRule}`);
+    eq(/margin-left:\s*auto/.test(metaRule), true, '小字组必须靠右（margin-left:auto，整组右边缘固定）：');
+    eq(/justify-content:\s*flex-end/.test(metaRule), true, '组内也靠右排（顺序仍是日期→…→项目）：');
+    eq(mod.META_CHIP_GAP_PX, 6, 'gap 常量必须是 6px：');
+    eq(rowChild(tree, 'wt-all', 'wt-meta').props['data-wt-meta-gap'], mod.META_CHIP_GAP_PX,
+      '渲染出来的 gap 与常量同源：');
+    eq(mod.META_DATE_SLOT_PX, undefined, '旧的日期固定槽常量必须删除（防止改回 96px 空槽）：');
+    eq(mod.META_SOURCE_SLOT_PX, undefined, '旧的来源固定槽常量必须删除：');
+    eq(mod.META_OVERDUE_SLOT_PX, undefined, '旧的已过期固定槽常量必须删除：');
+    eq(mod.META_PROJECT_SLOT_PX, undefined, '旧的项目固定槽常量必须删除：');
+    eq(mod.META_SLOT_TOTAL_PX, undefined, '旧的「整组恒宽」常量必须删除：');
+    // 没有额外 margin 堆叠：chip 之间只有 gap
+    for (const kind of ['date', 'source', 'overdue', 'project']) {
+      const chip = metaChipOf(tree, 'wt-all', kind) ?? metaChipOf(tree, 'wt-proj8', kind);
+      if (!chip) continue;
+      eq(chip.props.style?.margin, undefined, `${kind} chip 不许自带 margin（间距只由 gap 提供）：`);
+      eq(chip.props.style?.marginLeft, undefined, `${kind} chip 不许自带 margin-left：`);
+    }
+    eq(/margin:/.test(cssRule('.wt-meta-date')), false, '日期 chip 不许加额外 margin：');
+    eq(/margin:/.test(cssRule('.wt-meta-project')), false, '项目 chip 不许加额外 margin：');
+    eq(/padding:/.test(cssRule('.wt-meta-date')), false, '日期 chip 不许加额外内边距（间距只由 gap 提供）：');
+
+    // 3) 日期 chip 宽度按内容：样式里没有 96px 固定宽度，渲染上也没有固定宽度声明
+    eq(/width:\s*96px/.test(cssRule('.wt-meta-date')), false, `日期 chip 不许定宽 96px：${cssRule('.wt-meta-date')}`);
+    eq(/width:\s*96px/.test(cssRule('.wt-date-btn')), false, '日期按钮不许定宽 96px：');
+    eq(/white-space:\s*nowrap/.test(cssRule('.wt-date-btn')), true, '日期/时间必须 nowrap：');
+    eq(metaChipOf(tree, 'wt-all', 'date').props['data-wt-meta-date-width'], undefined,
+      '日期 chip 不许再声明固定槽宽（宽度按内容）：');
+    eq(metaChipOf(tree, 'wt-all', 'source').props['data-wt-meta-source-width'], undefined,
+      '来源 chip 不许再声明固定槽宽：');
+    eq(metaChipOf(tree, 'wt-all', 'source').props['data-wt-meta-slot-width'], undefined,
+      'chip 上不许再有旧槽宽声明：');
+    eq(/white-space:\s*nowrap/.test(cssRule('\n.wt-tag')), true, '来源/已过期胶囊必须 nowrap：');
+
+    // 4) 项目名：最大宽度 96px（≈8 个汉字）+ 省略号 + title 全名
+    const projectRule = cssRule('.wt-meta-project');
+    eq(/max-width:\s*96px/.test(projectRule), true, `项目 chip 必须 max-width:96px（不是固定 96px 空槽）：${projectRule}`);
+    eq(/(?:^|[;\s])width:\s*96px/.test(projectRule), false, '项目 chip 不许写成固定 96px 宽：');
+    eq(mod.META_PROJECT_MAX_PX, 96, '项目 chip 最大宽度常量 96px：');
+    const projectBtnRule = cssRule('.wt-project-btn');
+    eq(/text-overflow:\s*ellipsis/.test(projectBtnRule), true, '项目名超长必须省略号收尾：');
+    eq(/overflow:\s*hidden/.test(projectBtnRule), true, '项目名超出必须裁切：');
+    eq(/white-space:\s*nowrap/.test(projectBtnRule), true, '项目名必须单行：');
+    const eight = metaChipOf(tree, 'wt-proj8', 'project');
+    eq(Boolean(eight), true, '8 个汉字的项目名仍要渲染项目 chip：');
+    const eightBtn = allNodes(eight).find((n) => n.props?.['data-wt-project-btn'] === 'true') ?? null;
+    eq(Boolean(eightBtn), true, '8 个汉字项目名必须有项目按钮：');
+    eq(String(eightBtn.props.title).includes('#八个汉字项目名啊'), true,
+      `完整项目名必须在 title 里（悬停可看全）：${eightBtn.props.title}`);
+    eq(textOf(eightBtn), '#八个汉字项目名啊', '8 个汉字项目名按内容渲染（是否省略由 CSS 决定）：');
+  } finally {
+    for (const todo of extra) {
+      const ti = fakeListPayload.data.todos.indexOf(todo);
+      if (ti !== -1) fakeListPayload.data.todos.splice(ti, 1);
+      const gi = fakeListPayload.data.groups.later.indexOf(todo);
+      if (gi !== -1) fakeListPayload.data.groups.later.splice(gi, 1);
+    }
+  }
+});
+
+await testAsync('小字组按内容占位：没有日期/来源/项目时 chip 全不渲染；hover 才出现「＋日期」「＋项目」chip', async () => {
+  document.visibilityState = 'visible';
+  const record = fakeListPayload.data.groups.later[0];
+  const saved = { due: record.due, project: record.project, source: record.source };
+  // wt-1 临时变成「无日期、无项目、无来源」的行
+  record.due = null;
+  record.project = null;
+  record.source = 'human';
+  try {
+    await settleList();
+    const report = withStableHooks(() => {
+      let tree = renderPanel({ t: mkT() });
+      const emptyKinds = metaChipKinds(tree, 'wt-1');
+      const emptyChildren = metaChipsOf(tree, 'wt-1').length;
+      // 没有内容时一颗 chip 都不渲染 —— 不是「空槽占位」
+      eq(emptyKinds, [], `没有内容就不许占位：${emptyKinds.join(' | ')}`);
+      eq(emptyChildren, 0, '小字组里不许有空壳节点（空槽消失）：');
+      eq(metaChipOf(tree, 'wt-1', 'date'), null, '无日期 → 无日期 chip：');
+      eq(metaChipOf(tree, 'wt-1', 'project'), null, '无项目 → 无项目 chip：');
+      eq(metaChipOf(tree, 'wt-1', 'source'), null, '无来源 → 无来源 chip：');
+
+      // hover：入口以 chip 的形式出现（＋日期 / ＋项目），顺序仍是日期在项目之前
+      rowNode(tree, 'wt-1').props.onMouseEnter();
+      tree = renderPanel({ t: mkT() });
+      const hoveredKinds = metaChipKinds(tree, 'wt-1');
+      eq(hoveredKinds, ['date', 'project'], `hover 后只多出「＋日期」「＋项目」两颗 chip：${hoveredKinds.join(' | ')}`);
+      const hoveredDate = metaChipOf(tree, 'wt-1', 'date');
+      const hoveredProject = metaChipOf(tree, 'wt-1', 'project');
       eq(allNodes(hoveredDate).some((n) => n.props?.['data-wt-date-add'] === 'true'), true,
-        'hover 后「＋日期」入口必须出现在日期槽里：');
+        'hover 后「＋日期」入口必须出现在日期 chip 里：');
       eq(allNodes(hoveredProject).some((n) => n.props?.['data-wt-project-add'] === 'true'), true,
-        'hover 后「＋项目」入口必须出现在项目槽里：');
-      return hoveredDate.props['data-wt-meta-date-width'];
+        'hover 后「＋项目」入口必须出现在项目 chip 里：');
+      eq(allNodes(hoveredDate).some((n) => n.props?.['data-wt-date-btn'] === 'true'), false,
+        '「＋日期」是入口，不是已有日期的按钮：');
+
+      // 移开 → 两颗入口 chip 一起收回（又回到「没有内容就不占位」）
+      rowNode(tree, 'wt-1').props.onMouseLeave();
+      tree = renderPanel({ t: mkT() });
+      return { afterLeave: metaChipKinds(tree, 'wt-1') };
     });
-    eq(hoveredWidth, emptyDate.props['data-wt-meta-date-width'],
-      '入口出现前后日期槽宽度不变（否则日期会横跳）：');
+    eq(report.afterLeave, [], '移开后入口 chip 必须收回（不许留下空占位）：');
   } finally {
     record.due = saved.due;
     record.project = saved.project;
-    const index = fakeListPayload.data.groups.later.indexOf(fullTodo);
-    if (index !== -1) fakeListPayload.data.groups.later.splice(index, 1);
+    record.source = saved.source;
   }
 });
 
-await testAsync('已过期标记：在小字组内的胶囊（来源之后、项目之前），日期槽里只放日期（96px 放不下整串）', async () => {
+await testAsync('已过期标记：独立 chip，严格排在日期之后、来源之后、项目之前；日期 chip 里只放日期', async () => {
   document.visibilityState = 'visible';
   const savedToday = fakeListPayload.data.today;
-  // 把 today 推到截止之后 → wt-1 变成已过期
+  const fullOverdue = {
+    id: 'wt-overdue-all', title: '日期/来源/已过期/项目全有的行', notes: '', status: 'pending',
+    priority: 'normal', due: '2026-10-20', project: 'alpha', source: 'agent',
+    createdAt: 7, updatedAt: 7, completedAt: null,
+  };
+  fakeListPayload.data.todos.push(fullOverdue);
+  fakeListPayload.data.groups.later.push(fullOverdue);
+  // 把 today 推到截止之后 → wt-1 与 fullOverdue 都变成已过期
   fakeListPayload.data.today = '2026-10-25';
   try {
     await settleList();
     const tree = renderPanel({ t: mkT() });
     const row = rowNode(tree, 'wt-1');
     const chip = allNodes(row).find((n) => n.props?.['data-wt-overdue-chip'] === 'true') ?? null;
-    eq(Boolean(chip), true, '已过期的行必须有「已过期」胶囊：');
+    eq(Boolean(chip), true, '已过期的行必须有「已过期」chip：');
     eq(textOf(chip), '[overdueTag]', '胶囊文案仍是「已过期」（术语没回退）：');
     const meta = rowChild(tree, 'wt-1', 'wt-meta');
     const main = rowChild(tree, 'wt-1', 'wt-row-main');
-    const overdueSlot = overdueSlotOf(tree, 'wt-1');
-    eq(Boolean(overdueSlot), true, '已过期的行必须有「已过期」槽：');
-    eq(allNodes(meta).includes(chip), true, '胶囊必须在右边小字组里：');
-    eq(allNodes(overdueSlot).includes(chip), true, '胶囊必须在「已过期」槽里：');
-    eq(allNodes(main).includes(chip), false, '胶囊不许再留在标题列右端：');
-    eq(allNodes(dateSlotOf(tree, 'wt-1')).includes(chip), false, '胶囊不许塞进日期槽：');
-    const slotOrder = directChildren(meta).map((n) => n.props?.['data-wt-meta-slot']);
-    eq(slotOrder, mod.META_SLOT_ORDER, `小字组槽序必须固定：${slotOrder.join(' | ')}`);
-    const overdueIndex = mod.META_SLOT_ORDER.indexOf('overdue');
-    eq(overdueIndex > mod.META_SLOT_ORDER.indexOf('source')
-      && overdueIndex < mod.META_SLOT_ORDER.indexOf('project'), true,
-      '「已过期」槽必须在来源之后、项目之前：');
-    eq(directChildren(meta).indexOf(overdueSlot), overdueIndex,
-      `「已过期」槽必须落在 META_SLOT_ORDER 的第 ${overdueIndex + 1} 槽：`);
+    eq(allNodes(meta).includes(chip), true, 'chip 必须在右边小字组里：');
+    eq(allNodes(main).includes(chip), false, 'chip 不许再留在标题列右端：');
+    eq(metaChipOf(tree, 'wt-1', 'overdue'), chip, 'chip 必须就是那一颗 overdue chip：');
+    // wt-1：日期 + 已过期 + 项目（人加的无来源）→ 顺序必须是 [date, overdue, project]
+    eq(metaChipKinds(tree, 'wt-1'), ['date', 'overdue', 'project'],
+      '已过期 chip 必须排在日期之后、项目之前：');
+    // 全有的行：日期 → 来源 → 已过期 → 项目（与 META_CHIP_ORDER 完全一致）
+    eq(metaChipKinds(tree, 'wt-overdue-all'), mod.META_CHIP_ORDER,
+      `四颗 chip 必须按 META_CHIP_ORDER 排列：${metaChipKinds(tree, 'wt-overdue-all').join(' | ')}`);
+    eq(metaChipOf(tree, 'wt-overdue-all', 'source').props.title, '[sourceAgent]',
+      '来源 chip 的完整文案仍在 title 里：');
     const dateBtn = dateBtnOf(tree, 'wt-1');
-    eq(textOf(dateBtn).includes('[overdueTag]'), false, '日期槽里不再塞「已过期」前缀：');
+    eq(textOf(dateBtn).includes('[overdueTag]'), false, '日期 chip 里不再塞「已过期」前缀：');
     eq(textOf(dateBtn).includes('2026-10-20'), true, '日期本身仍然显示：');
     eq(dateBtn.props.style.color, 'var(--dsw-alias-state-warn-primary)',
       `已过期日期仍用 warn 色：${dateBtn.props.style.color}`);
   } finally {
     fakeListPayload.data.today = savedToday;
+    const ti = fakeListPayload.data.todos.indexOf(fullOverdue);
+    if (ti !== -1) fakeListPayload.data.todos.splice(ti, 1);
+    const gi = fakeListPayload.data.groups.later.indexOf(fullOverdue);
+    if (gi !== -1) fakeListPayload.data.groups.later.splice(gi, 1);
   }
 });
 
-await testAsync('小字组换行态：注入换行类后，第二行仍复用四列（槽序 / 列宽按常量不变）', async () => {
+await testAsync('小字组换行态：第二行仍是同一套紧凑 chip（顺序 / gap 不变，右对齐）', async () => {
   document.visibilityState = 'visible';
   await settleList();
   const realResizeObserver = globalThis.ResizeObserver;
@@ -3519,41 +3608,38 @@ await testAsync('小字组换行态：注入换行类后，第二行仍复用四
       const row = rowNode(tree, 'wt-1');
       row.props.ref({ tag: 'wt-row' });
       const title = rowTitleBtnOf(tree, 'wt-1');
-      // 换行前的日期槽宽度（单行态），换行后拿来对比
-      const beforeWrapWidth = dateSlotOf(tree, 'wt-1').props['data-wt-meta-date-width'];
+      const beforeWrapKinds = metaChipKinds(tree, 'wt-1');
+      const beforeWrapGap = rowChild(tree, 'wt-1', 'wt-meta').props['data-wt-meta-gap'];
       rowChild(tree, 'wt-1', 'wt-meta').props.ref.current = { scrollWidth: 100, clientWidth: 100 };
       // 注入「标题固有宽 240 > 列宽 120」→ 整行换成两行
-      title.props.ref({ scrollWidth: 240, clientWidth: 120 });
+      injectTitleGeometry(title, { content: 240, client: 120 });
       await waitForMeasure();
       tree = renderPanel({ t: mkT() });
       const wrapped = rowNode(tree, 'wt-1');
       eq(String(wrapped.props.className).includes('wt-row--wrap'), true, `必须已进入换行态：${wrapped.props.className}`);
 
-      // 换行态不重定义列宽：.wt-row--wrap .wt-meta 只有 grid-area，没有 grid-template-columns
+      // 换行态不重定义小字组布局：.wt-row--wrap .wt-meta 只有 grid-area + 右对齐，不写列宽/gap
       const wrapMetaRule = /\.wt-row--wrap \.wt-meta\s*\{([^}]*)\}/.exec(mod.STYLE_TEXT)?.[1] ?? '';
       eq(/grid-area:\s*meta/.test(wrapMetaRule), true, '换行态小字组仍放进 meta 区：');
-      eq(/grid-template-columns/.test(wrapMetaRule), false, '换行态不许另写列宽（必须复用 .wt-meta 的四列）：');
-      eq(metaColumns(), expectedMetaColumns(),
-        `换行后列定义仍是四列（按 META_SLOT_ORDER + 导出宽度常量派生）：${metaColumns()}`);
+      eq(/grid-template-columns/.test(wrapMetaRule), false, '换行态不许另写成固定列：');
+      eq(/\bgap\s*:/.test(wrapMetaRule), false, '换行态不许改 chip 间距（仍复用 .wt-meta 的 6px gap）：');
+      eq(/\.wt-meta\s*\{[^}]*display:\s*flex/.test(mod.STYLE_TEXT), true, '小字组始终是 flex chip 组：');
 
-      // 第二行的小字组里，日期槽仍是第 1 个格子，宽度与换行前完全一致
-      const wrappedDate = dateSlotOf(tree, 'wt-1');
-      eq(Boolean(wrappedDate), true, '换行态第二行必须有日期槽：');
-      eq(wrappedDate.props['data-wt-meta-date-width'], mod.META_DATE_SLOT_PX, '换行态日期槽仍定宽 96px：');
-      eq(wrappedDate.props['data-wt-meta-date-width'], beforeWrapWidth,
-        '换行前后日期槽宽度必须一致（换行不改列宽）：');
-      const wrappedSlots = directChildren(rowChild(tree, 'wt-1', 'wt-meta'));
-      eq(wrappedSlots.map((n) => n.props?.['data-wt-meta-slot']), mod.META_SLOT_ORDER,
-        '换行态四槽顺序仍是 META_SLOT_ORDER：');
-      eq(wrappedSlots[0].props?.className, 'wt-meta-date',
-        '换行态日期槽仍是网格第 1 列：');
-      eq(wrappedSlots[mod.META_SLOT_ORDER.indexOf('project')].props?.className, 'wt-meta-project',
-        '换行态项目槽仍是网格最后一列（第 4 列）：');
-      // 第二行仍在标题那一列（grid-area:meta），并且**右对齐**（justify-self:end）：
-      // 不是缩进到旗子/勾选框下面，也不是右对齐到列尾。四列宽度（96/44/44/96）不变。
-      // 反向验证：把 start 改回 end → 下面第一条立刻红。
-      eq(/justify-self:\s*end/.test(wrapMetaRule), true, '换行态小字组必须右对齐（日期 x 跨换行不变）：');
-      eq(/justify-self:\s*start/.test(wrapMetaRule), false, '换行态小字组不许右对齐到列尾（左边缘就不与标题对齐了）：');
+      // 第二行的小字组仍是同一套 chip、同一个 gap、同样的顺序
+      const wrappedMeta = rowChild(tree, 'wt-1', 'wt-meta');
+      eq(Boolean(wrappedMeta), true, '换行态第二行必须有小字组：');
+      eq(wrappedMeta.props['data-wt-meta-gap'], beforeWrapGap, '换行前后 gap 必须一致：');
+      eq(wrappedMeta.props['data-wt-meta-gap'], mod.META_CHIP_GAP_PX, 'gap 仍等于常量：');
+      eq(metaChipKinds(tree, 'wt-1'), beforeWrapKinds, '换行前后 chip 种类/顺序必须一致：');
+      const wrappedChips = metaChipsOf(tree, 'wt-1');
+      eq(wrappedChips[0].props?.['data-wt-meta-chip'], 'date', '换行态第一颗仍是日期 chip：');
+      eq(wrappedChips[wrappedChips.length - 1].props?.['data-wt-meta-chip'], 'project',
+        '换行态最后一颗仍是项目 chip：');
+      eq(metaChipOf(tree, 'wt-1', 'date').props['data-wt-meta-date-width'], undefined,
+        '换行态日期 chip 也不许变回固定槽宽：');
+      // 第二行仍在标题那一列，并且**右对齐**（justify-self:end）
+      eq(/justify-self:\s*end/.test(wrapMetaRule), true, '换行态小字组必须右对齐（整组右边缘跨换行不变）：');
+      eq(/justify-self:\s*start/.test(wrapMetaRule), false, '换行态小字组不许左对齐：');
       eq(/grid-area:\s*meta/.test(wrapMetaRule), true, '换行态小字组必须留在标题列（不缩进到勾选框下）：');
     });
   } finally {
@@ -3561,7 +3647,7 @@ await testAsync('小字组换行态：注入换行类后，第二行仍复用四
   }
 });
 
-await testAsync('小字组固定列回归：旗子仍在行首；点日期 / 标题 / 项目仍各自提交', async () => {
+await testAsync('紧凑小字组回归：旗子仍在行首；点日期 / 标题 / 项目仍各自提交', async () => {
   document.visibilityState = 'visible';
   const savedProjects = fakeListPayload.data.projects;
   fakeListPayload.data.projects = ['dsh-worktodo', 'alpha'];
