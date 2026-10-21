@@ -1316,8 +1316,21 @@ test('updateBadgeState：unsupported 是温和态（muted），两种文案中�
     }
   }
   eq(dictionaries.zh.updateUnsupportedLink.includes('本地链接安装'), true, '中文 link 文案要说明是本地链接安装：');
-  eq(dictionaries.zh.updateUnsupportedLink.includes('git/pnpm'), true, '中文 link 文案要给出可执行的工作流：');
-  eq(dictionaries.en.updateUnsupportedLink.includes('git/pnpm workflow'), true, '英文 link 文案要给出可执行的工作流：');
+  eq(dictionaries.zh.updateUnsupportedLink.includes('手动更新'), true, '中文 link 文案要指向「手动更新」入口：');
+  eq(/git/.test(dictionaries.zh.updateUnsupportedLink), true, '中文 link 文案要给出可执行的工作流：');
+  eq(dictionaries.en.updateUnsupportedLink.includes('Manual update'), true, '英文 link 文案要指向「Manual update」入口：');
+  eq(/git/.test(dictionaries.en.updateUnsupportedLink), true, '英文 link 文案要给出可执行的工作流：');
+  // 手动更新兜底：文案必须齐全（标题/三步/复制/重启），且不能出现原始异常串
+  for (const key of ['updateManualTitle', 'updateManualHint', 'updateManualStepRemove', 'updateManualStepAdd',
+    'updateManualStepRestart', 'updateManualCopy', 'updateManualCopied', 'updateManualNoteRestart', 'updateManualWhy']) {
+    for (const lang of ['zh', 'en']) {
+      const text = dictionaries[lang]?.[key];
+      eq(typeof text === 'string' && text.length > 0, true, `${lang}.${key} 必须存在且非空：`);
+    }
+  }
+  eq(/卸载/.test(dictionaries.zh.updateManualStepRemove), true, '中文第一步是卸载旧版：');
+  eq(/安装/.test(dictionaries.zh.updateManualStepAdd), true, '中文第二步是安装最新版：');
+  eq(/退出/.test(dictionaries.zh.updateManualNoteRestart), true, '中文重启说明要写「退出 DSH」：');
   eq(dictionaries.zh.updateUnsupportedProfile.includes('未改动任何文件'), true, '中文 profile 文案要说明没动文件：');
   eq(dictionaries.en.updateUnsupportedProfile.includes('no files changed'), true, '英文 profile 文案要说明没动文件：');
   eq(mod.isUpdateBusy({ phase: 'unsupported' }), false, '预期内的不适用不是「进行中」，不该轮询：');
@@ -1326,6 +1339,37 @@ test('updateBadgeState：unsupported 是温和态（muted），两种文案中�
   const legacy = mod.updateBadgeState({ state: 'failed', reason: 'linked', error: 'link: 安装' }, null,
     (key) => dictionaries.zh?.[key] ?? key);
   eq(legacy.action, null, '老载荷的 linked 也不能给重试：');
+
+  // 手动更新兜底块：自动更新失败/不适用时用户能直接拿到可复制命令（不是只有「更新失败」四个字）。
+  const t = (key) => dictionaries.zh?.[key] ?? key;
+  const guide = {
+    profile: 'desktop',
+    linkMode: false,
+    steps: [
+      { id: 'remove', command: 'dsh plugin --profile desktop remove dsh-worktodo', note: 'run-in-terminal' },
+      { id: 'add', command: 'dsh plugin --profile desktop add dsh-worktodo@latest', note: 'run-in-terminal' },
+      { id: 'restart', command: null, note: 'restart-dsh' },
+    ],
+  };
+  const blockNodes = flattenTree(renderNode(mod.ManualUpdateBlock({
+    guide, t, copied: 'add', onCopy: () => {}, onClose: () => {},
+  })));
+  const blockText = blockNodes.map(textOf).join(' ');
+  eq(/卸载旧版/.test(blockText), true, '手动更新块要有「卸载旧版」步骤：');
+  eq(/安装最新版/.test(blockText), true, '手动更新块要有「安装最新版」步骤：');
+  eq(blockText.includes('remove dsh-worktodo'), true, '手动更新块要渲染卸载命令：');
+  eq(blockText.includes('add dsh-worktodo@latest'), true, '手动更新块要渲染安装命令：');
+  eq(/退出 DSH/.test(blockText), true, '手动更新块要有「退出 DSH」重启提示：');
+  eq(/已复制/.test(blockText), true, '复制成功后该条命令要显示「已复制」：');
+  const copyButtons = blockNodes.filter((n) => n.type === 'button' && /复制|已复制/.test(textOf(n)));
+  eq(copyButtons.length >= 2, true, '每条命令都要有复制按钮：');
+  // 老宿主没有 manualUpdate 字段：给 <profile> 占位命令 + 提示替换，绝不白屏
+  const fallbackNodes = flattenTree(renderNode(mod.ManualUpdateBlock({
+    guide: null, t, copied: null, onCopy: () => {}, onClose: () => {},
+  })));
+  const fallbackText = fallbackNodes.map(textOf).join(' ');
+  eq(/--profile <profile>/.test(fallbackText), true, '缺 guide 时要给 <profile> 占位命令：');
+  eq(/未识别出 profile/.test(fallbackText), true, '缺 guide 时要提示替换 profile：');
 });
 
 test('updateBadgeState：失败详情包含步骤/命令/退出码/版本/日志尾部（中英双语键，不 innerHTML）', () => {

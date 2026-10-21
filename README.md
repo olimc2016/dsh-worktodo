@@ -59,6 +59,29 @@ dsh plugin --profile desktop add dsh-worktodo
 
 装好后侧栏会多一个**「待办」**入口，设置 → 插件里也能看到它。
 
+## 更新 / 升级
+
+面板会检查新版本；DSH 不允许插件自行安装或重启 DSH，所以**自动更新失败时**，
+面板里的更新徽标旁会出现「手动更新」，点开就是可复制的命令。也可以先自己执行：
+
+```bash
+# 1) 卸载旧版
+dsh plugin --profile desktop remove dsh-worktodo
+# 2) 安装最新版（npm 上 dist-tags.latest 指向的版本）
+dsh plugin --profile desktop add dsh-worktodo@latest
+```
+
+然后**完全退出 DSH 再重新打开**（⌘Q / 菜单退出，不是只关窗口）。
+
+- 不确定 profile 名：`dsh plugin --list` 会显示；把命令里的 `--profile desktop` 换成它。
+- 装的是 GitHub 版：把第 2 步换成 `dsh plugin --profile desktop add github:olimc2016/dsh-worktodo`。
+- 开发模式（profile 里写的是 `link:` 到本地仓库）：不要在 profile 里重装，改在插件仓库执行
+  `git pull && pnpm install && pnpm run build`，再重启 DSH。
+- 装好后想确认版本：面板页脚显示 `版本 vX.Y.Z`，或 `dsh plugin --profile desktop list`。
+
+> 「手动更新」里的命令只含 profile 名，不含任何本机路径；命令执行失败时把输出贴到
+> [issues](https://github.com/olimc2016/dsh-worktodo/issues) 即可。
+
 ## 用起来
 
 **面板**：顶部是统计（未完成 / 已过期 / 今天 / 进行中 / 今日完成），中间是快速添加框（标题 + 截止日期 + 优先级，回车即存），下面是分组列表。每行可以直接勾完成、点标题行内改、删除（二次确认）。

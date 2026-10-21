@@ -57,6 +57,32 @@ dsh plugin --profile desktop add dsh-worktodo
 
 **Option 3**: use the DSH sidebar — **Plugins → Add plugin** — and enter `dsh-worktodo` or the repository URL.
 
+## Updating
+
+The panel checks for new versions. DSH does not let plugins install packages or restart DSH by themselves,
+so when an automatic update fails the update badge gets a **Manual update** button that expands copyable commands.
+You can also run them yourself:
+
+```bash
+# 1) remove the old version
+dsh plugin --profile desktop remove dsh-worktodo
+# 2) install the latest version (the one dist-tags.latest points to on npm)
+dsh plugin --profile desktop add dsh-worktodo@latest
+```
+
+Then **fully quit DSH and reopen it** (⌘Q / Quit menu — closing the window is not enough).
+
+- Don't know the profile name? `dsh plugin --list` prints it; replace `--profile desktop` in the commands.
+- Installed from GitHub instead? Replace step 2 with
+  `dsh plugin --profile desktop add github:olimc2016/dsh-worktodo`.
+- Dev mode (the profile uses `link:` to a local checkout): don't reinstall from the profile — run
+  `git pull && pnpm install && pnpm run build` inside the plugin repo, then restart DSH.
+- Verify the version afterwards: the panel footer shows `version vX.Y.Z`, or run
+  `dsh plugin --profile desktop list`.
+
+> The commands in **Manual update** contain only the profile name (no local paths). If one fails,
+> paste its output into [issues](https://github.com/olimc2016/dsh-worktodo/issues).
+
 ## Usage
 
 **Panel**: stats on top (open / overdue / today / in progress / completed today), a quick-add box (title + due date + priority, Enter to save), then the grouped list. Each row can be checked off, edited inline by clicking the title, or deleted (with a second-click confirmation).

@@ -203,7 +203,7 @@ const zh = {
   'updateDownloadFailed': '下载失败',
   'updateLinked': '这是本地链接安装（link:），请在仓库里用 git/pnpm 工作流更新',
   // 预期内的不适用（不是失败）：淡色提示、不亮红、不出现「失败」、不给重试。
-  'updateUnsupportedLink': '当前是本地链接安装（开发模式），面板不能自更新；请用 git/pnpm 工作流更新',
+  'updateUnsupportedLink': '当前是本地链接安装（开发模式），自动更新不适用；点「手动更新」查看步骤（git pull → pnpm install → 构建）',
   'updateUnsupportedProfile': '无法确定当前 profile 位置，为安全起见未执行升级（未改动任何文件）',
   'updateRetry': '重试',
   'updateRetryHint': '点击重试',
@@ -214,6 +214,23 @@ const zh = {
   'updateDetailSpawn': '启动错误',
   'updateDetailVersion': '版本',
   'updateDetailLog': '日志尾部',
+  // 手动更新兜底：自动更新失败 / 不适用时，直接给出可复制的命令（比一句「更新失败」有用）
+  'updateManualOpen': '手动更新',
+  'updateManualClose': '收起手动更新',
+  'updateManualTitle': '手动更新（推荐兜底）',
+  'updateManualHint': '自动更新失败或不适用时，复制下面命令逐条执行，然后完全退出 DSH 再重新打开。',
+  'updateManualNoteRunInTerminal': '在终端执行',
+  'updateManualNoteInPluginRepo': '在插件仓库目录执行（开发模式）',
+  'updateManualNoteRestart': '无需命令：完全退出 DSH 后重新打开',
+  'updateManualCopy': '复制',
+  'updateManualCopied': '已复制',
+  'updateManualProfileUnknown': '未识别出 profile：把命令里的 --profile 换成 `dsh plugin --list` 显示的名字',
+  'updateManualWhy': 'DSH 不允许插件自行安装或重启 DSH，所以自动更新失败时需要你手动执行。',
+  'updateManualStepRemove': '① 卸载旧版',
+  'updateManualStepAdd': '② 安装最新版',
+  'updateManualStepGit': '① 拉取最新代码',
+  'updateManualStepBuild': '② 重装依赖并构建',
+  'updateManualStepRestart': '③ 重启 DSH',
   // 更新方式（三档）+ 设置小浮层 + 重启提醒条
   'updateSettings': '更新设置',
   'updateSettingsTitle': '更新方式',
@@ -395,7 +412,7 @@ const en = {
   'updateDownloadFailed': 'Download failed',
   'updateLinked': 'This is a local link: install — update it with the git/pnpm workflow',
   // Expected non-applicability (not a failure): muted, no red, no "failed", no retry.
-  'updateUnsupportedLink': "Local link install (dev mode) — panel self-update doesn't apply; update via your git/pnpm workflow",
+  'updateUnsupportedLink': "Local link install (dev mode) — auto-update doesn't apply; click \"Manual update\" for the git pull → pnpm install → build steps",
   'updateUnsupportedProfile': "Couldn't determine the profile location; upgrade skipped for safety (no files changed)",
   'updateRetry': 'Retry',
   'updateRetryHint': 'Click to retry',
@@ -406,6 +423,23 @@ const en = {
   'updateDetailSpawn': 'spawn error',
   'updateDetailVersion': 'version',
   'updateDetailLog': 'log tail',
+  // Manual update fallback: when auto-update fails or doesn't apply, give copyable commands.
+  'updateManualOpen': 'Manual update',
+  'updateManualClose': 'Hide manual update',
+  'updateManualTitle': 'Manual update (fallback)',
+  'updateManualHint': 'If auto-update failed or does not apply, copy these commands, run them one by one, then fully quit and reopen DSH.',
+  'updateManualNoteRunInTerminal': 'run in a terminal',
+  'updateManualNoteInPluginRepo': 'run inside the plugin repo (dev mode)',
+  'updateManualNoteRestart': 'No command: fully quit DSH and reopen it',
+  'updateManualCopy': 'Copy',
+  'updateManualCopied': 'Copied',
+  'updateManualProfileUnknown': 'Profile not detected: replace --profile in the commands with the name shown by `dsh plugin --list`',
+  'updateManualWhy': 'DSH does not let plugins install packages or restart DSH, so a failed auto-update has to be finished by hand.',
+  'updateManualStepRemove': '① Uninstall the old version',
+  'updateManualStepAdd': '② Install the latest version',
+  'updateManualStepGit': '① Pull the latest code',
+  'updateManualStepBuild': '② Reinstall dependencies and rebuild',
+  'updateManualStepRestart': '③ Restart DSH',
   // Update mode (three options) + settings popover + restart banner
   'updateSettings': 'Update settings',
   'updateSettingsTitle': 'Update mode',
@@ -4190,6 +4224,124 @@ export function updateFailureDetail(run, t) {
   return parts.join(' · ');
 }
 
+/* ------------------------------------------------------------------ *
+ * 手动更新兜底（自动更新失败 / 不适用时给可复制的命令）
+ * ------------------------------------------------------------------ */
+
+/** 步骤 id → 文案 key；未知步骤只显示序号 + 命令。 */
+const MANUAL_STEP_LABEL = {
+  remove: 'updateManualStepRemove',
+  add: 'updateManualStepAdd',
+  'git-pull': 'updateManualStepGit',
+  'pnpm-rebuild': 'updateManualStepBuild',
+  restart: 'updateManualStepRestart',
+};
+
+/**
+ * 「三步手动更新」块。数据来自宿主 `update.manualUpdate`（只含 profile 名与命令，不含本机路径）；
+ * 老宿主没有该字段时退回一条带 `<profile>` 占位的通用命令，绝不让用户卡在「更新失败」四个字上。
+ *
+ * 只用文本节点渲染命令（没有 innerHTML）；复制按钮是原生 button，失败时命令仍可手动选中复制。
+ * @param {{guide: object|null, t: Function, copied: string|null, onCopy: Function, onClose: Function}} props
+ */
+export function ManualUpdateBlock(props) {
+  const { guide, t, copied, onCopy, onClose } = props;
+  const steps = Array.isArray(guide?.steps) && guide.steps.length
+    ? guide.steps
+    : [
+      { id: 'remove', command: 'dsh plugin --profile <profile> remove dsh-worktodo', note: 'run-in-terminal' },
+      { id: 'add', command: 'dsh plugin --profile <profile> add dsh-worktodo@latest', note: 'run-in-terminal' },
+      { id: 'restart', command: null, note: 'restart-dsh' },
+    ];
+  const noteOf = (note) => {
+    if (note === 'in-plugin-repo') return t('updateManualNoteInPluginRepo');
+    if (note === 'restart-dsh') return t('updateManualNoteRestart');
+    return t('updateManualNoteRunInTerminal');
+  };
+  const stepLabel = (step, index) => {
+    const key = MANUAL_STEP_LABEL[step?.id];
+    return key ? t(key) : `${index + 1}.`;
+  };
+  const needsProfileHint = !guide?.profile && !guide?.linkMode
+    && steps.some((step) => typeof step?.command === 'string' && step.command.includes('<profile>'));
+  return React.createElement('div', {
+    key: 'manual-help',
+    className: 'wt-manual-update',
+    role: 'group',
+    'aria-label': t('updateManualTitle'),
+    style: {
+      marginTop: 6,
+      marginBottom: 2,
+      padding: '8px 9px',
+      border: `1px dashed ${C.border1}`,
+      borderRadius: 8,
+      background: C.layer1,
+      color: C.label2,
+      lineHeight: 1.55,
+    },
+  }, [
+    React.createElement('div', {
+      key: 'head',
+      style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+    }, [
+      React.createElement('span', { key: 'title', style: { fontWeight: 600, color: C.label } }, t('updateManualTitle')),
+      typeof onClose === 'function'
+        ? React.createElement('button', {
+          key: 'close',
+          type: 'button',
+          onClick: onClose,
+          title: t('updateManualClose'),
+          'aria-label': t('updateManualClose'),
+          style: { border: 'none', background: 'transparent', color: C.label3, cursor: 'pointer', fontSize: 10, padding: 0 },
+        }, `× ${t('updateManualClose')}`)
+        : null,
+    ]),
+    React.createElement('div', { key: 'hint', style: { color: C.label3, marginTop: 2 } }, t('updateManualHint')),
+    ...steps.map((step, index) => React.createElement('div', {
+      key: `step-${step?.id ?? index}`,
+      style: { marginTop: 6, display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: 4 },
+    }, [
+      React.createElement('span', { key: 'label', style: { color: C.label, fontWeight: 500 } }, `${stepLabel(step, index)} · `),
+      step?.command
+        ? React.createElement('code', {
+          key: 'cmd',
+          style: {
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+            fontSize: 10,
+            background: C.layer2,
+            borderRadius: 4,
+            padding: '1px 5px',
+            wordBreak: 'break-all',
+            userSelect: 'all',
+          },
+        }, step.command)
+        : React.createElement('span', { key: 'restart', style: { color: C.label2 } }, noteOf(step?.note)),
+      step?.command
+        ? React.createElement('button', {
+          key: 'copy',
+          type: 'button',
+          onClick: () => onCopy?.(step),
+          title: step.command,
+          'aria-label': `${t('updateManualCopy')} ${step.command}`,
+          style: {
+            border: `1px solid ${C.border1}`,
+            background: 'transparent',
+            color: copied === step.id ? C.ok : C.label2,
+            borderRadius: 5,
+            padding: '0 5px',
+            fontSize: 10,
+            cursor: 'pointer',
+          },
+        }, copied === step.id ? t('updateManualCopied') : t('updateManualCopy'))
+        : null,
+    ])),
+    needsProfileHint
+      ? React.createElement('div', { key: 'profile-hint', style: { marginTop: 6, color: C.warn } }, t('updateManualProfileUnknown'))
+      : null,
+    React.createElement('div', { key: 'why', style: { marginTop: 6, color: C.label3 } }, t('updateManualWhy')),
+  ]);
+}
+
 /**
  * 失败/不可用那一格。`linked` 不是故障（那是开发工作流），单独给说明且不给重试。
  * 重试按钮的动作由「失败发生在哪一步」决定：下载失败重试下载，安装失败重试安装。
@@ -4312,6 +4464,48 @@ function WorkTodoPanel(props) {
   const updateBadge = updateBadgeState(run, update, t);
   // 顶部重启提醒条（restartRequired 时才有；off 下不显示，也没有「假重启按钮」）。
   const restart = restartNotice(update, t);
+
+  /**
+   * 手动更新兜底：自动更新失败 / link 安装（不适用）时**默认展开**，把「能照抄的命令」直接摆出来；
+   * 用户点页脚的「手动更新」也能随时展开。这是「更新失败」四个字之外必须给的第二层信息。
+   */
+  const manualGuide = update?.manualUpdate ?? null;
+  const [manualOpen, setManualOpen] = React.useState(false);
+  const [manualCopied, setManualCopied] = React.useState(null);
+  const manualShouldOpen = updateBadge?.tone === 'error'
+    || run?.updateUnsupported === 'link-install'
+    || update?.updateUnsupported === 'link-install';
+  React.useEffect(() => {
+    if (manualShouldOpen) setManualOpen(true);
+  }, [manualShouldOpen]);
+  /** 复制一条命令；clipboard 不可用时退到 textarea + execCommand，再不行就让用户手动选中。 */
+  const copyManualStep = React.useCallback((step) => {
+    const text = typeof step?.command === 'string' ? step.command : '';
+    if (!text) return;
+    const done = () => {
+      setManualCopied(step.id ?? null);
+      setTimeout(() => setManualCopied((cur) => (cur === (step.id ?? null) ? null : cur)), 1600);
+    };
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(() => {});
+        return;
+      }
+    } catch { /* 落到 textarea 兜底 */ }
+    try {
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.setAttribute('readonly', '');
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand?.('copy');
+      document.body.removeChild(area);
+      done();
+    } catch { /* 复制不了也不影响命令本身可手动选中 */ }
+  }, []);
+
 
   /**
    * 更新方式设置（三档小浮层）。
@@ -5024,7 +5218,36 @@ function WorkTodoPanel(props) {
               style: { fontSize: 10, ...UPDATE_TONE_STYLE[updateBadge.tone] },
             }, updateBadge.text))
           : null,
+        /* 手动更新兜底入口：任何更新状态下都能点开，拿到可复制的命令（不依赖自动更新是否可用） */
+        React.createElement('button', {
+          key: 'manual',
+          type: 'button',
+          className: 'wt-chip wt-manual-update',
+          title: t('updateManualHint'),
+          'aria-label': manualOpen ? t('updateManualClose') : t('updateManualOpen'),
+          'aria-expanded': manualOpen,
+          onClick: () => setManualOpen((value) => !value),
+          style: {
+            fontSize: 10,
+            cursor: 'pointer',
+            color: manualOpen ? C.brand : C.label2,
+            background: 'transparent',
+            border: `1px solid ${C.border1}`,
+            borderRadius: 6,
+            padding: '1px 6px',
+          },
+        }, manualOpen ? t('updateManualClose') : t('updateManualOpen')),
       ]),
+      manualOpen
+        ? React.createElement(ManualUpdateBlock, {
+          key: 'manual-help',
+          guide: manualGuide,
+          t,
+          copied: manualCopied,
+          onCopy: copyManualStep,
+          onClose: () => setManualOpen(false),
+        })
+        : null,
       /* 失败详情：一行小字（完整内容在 title 里，可 hover 查看；只用文本节点，绝不拼 HTML）。
          内容全部来自宿主 diagnostics：步骤 / 命令 / 退出码 / 目标与当前版本 / 日志尾部。 */
       updateBadge?.detail
