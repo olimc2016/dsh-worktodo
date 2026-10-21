@@ -337,9 +337,9 @@ console.log('契约：客户端发的字段必须被宿主真正消费');
 
 /** 各路由接受的字段（镜像 lib/index.js 的 handler 与 service 的输入）。 */
 const ACCEPTED = {
-  '/create': ['title', 'notes', 'priority', 'due', 'dueTime', 'project', 'status'],
+  '/create': ['title', 'notes', 'subtasks', 'priority', 'due', 'dueTime', 'project', 'status'],
   // `action:'plugin-update'` 是自升级开关（同一个路径两个动词/两种语义，见 lib/index.js 的 /update）
-  '/update': ['action', 'ref', 'id', 'title', 'notes', 'priority', 'due', 'dueTime', 'project', 'status', '...patch'],
+  '/update': ['action', 'ref', 'id', 'title', 'notes', 'subtasks', 'priority', 'due', 'dueTime', 'project', 'status', '...patch'],
   '/status': ['ref', 'id', 'status', 'toggle'],
   '/remove': ['ref', 'id'],
   '/adopt': ['todos'],

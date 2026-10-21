@@ -45,6 +45,8 @@ function fakeStore() {
   return {
     kind: 'domain',
     location: 'storage:worktodo/todos',
+    // 测试直接看盘上的原始记录（用来断言「非法输入一个字节都不写」）
+    map,
     async load() {
       return [...map.values()];
     },
@@ -607,6 +609,123 @@ await test('存储写失败时不抛，返回 store-write-failed', async () => {
   const created = await s.create({ title: 'a' });
   eq(created.ok, false);
   eq(created.reason, 'store-write-failed');
+});
+
+console.log('子待办与备注');
+
+await test('新增带 subtasks/notes：/list 原样带回（含独立 id、order、备注换行）', async () => {
+  const s = makeService();
+  const created = await s.create({
+    title: '整理评审意见',
+    notes: '第一行\n第二行',
+    subtasks: [
+      { title: '整理会议记录', done: true },
+      { title: '汇总争议', done: false },
+    ],
+  });
+  eq(created.ok, true);
+  eq(created.todo.notes, '第一行\n第二行');
+  eq(created.todo.subtasks.map((item) => item.title), ['整理会议记录', '汇总争议']);
+  eq(created.todo.subtasks.map((item) => item.order), [0, 1]);
+  eq(created.todo.subtasks.every((item) => typeof item.id === 'string' && item.id.length > 0), true,
+    '每条子待办必须有独立 id：');
+  eq(new Set(created.todo.subtasks.map((item) => item.id)).size, 2);
+
+  const list = await s.list({ filter: 'open', shapes: 'todos' });
+  eq(list.todos[0].notes, '第一行\n第二行');
+  eq(list.todos[0].subtasks.length, 2);
+});
+
+await test('update：子待办增 / 改 / 删 / 排序，备注可改可清空', async () => {
+  const s = makeService();
+  const created = await s.create({ title: '清单', subtasks: [{ id: 'a', title: '一' }, { id: 'b', title: '二' }] });
+  const id = created.todo.id;
+
+  const added = await s.update(id, {
+    subtasks: [
+      { id: 'a', title: '一', done: true, order: 0 },
+      { id: 'b', title: '二改', done: false, order: 1 },
+      { id: 'c', title: '三', done: false, order: 2 },
+    ],
+    notes: '新备注',
+  });
+  eq(added.ok, true);
+  eq(added.todo.subtasks.map((item) => item.title), ['一', '二改', '三']);
+  eq(added.todo.notes, '新备注');
+
+  const reordered = await s.update(id, {
+    subtasks: [
+      { id: 'c', title: '三', done: false, order: 0 },
+      { id: 'a', title: '一', done: true, order: 1 },
+    ],
+  });
+  eq(reordered.todo.subtasks.map((item) => item.id), ['c', 'a'], '删掉 b 并按 order 重排：');
+  eq(reordered.todo.subtasks.map((item) => item.order), [0, 1]);
+  eq((await s.list({ filter: 'open', shapes: 'todos' })).todos[0].subtasks.length, 2, '必须真的落盘：');
+
+  const cleared = await s.update(id, { notes: null });
+  eq(cleared.todo.notes, null);
+});
+
+await test('联动：勾父项 → 子项全 done；取消父项 → 只取消父项；勾完最后一个子项不自动完成父项', async () => {
+  const s = makeService();
+  const created = await s.create({
+    title: '父项',
+    subtasks: [{ id: 'a', title: '一' }, { id: 'b', title: '二' }],
+  });
+  const id = created.todo.id;
+
+  const done = await s.toggle(id);
+  eq(done.todo.status, 'completed');
+  eq(done.todo.subtasks.map((item) => item.done), [true, true], '勾父项必须级联：');
+
+  const reopened = await s.toggle(id);
+  eq(reopened.todo.status, 'pending');
+  eq(reopened.todo.subtasks.map((item) => item.done), [true, true], '取消父项不能回滚子项：');
+
+  const parent = await s.create({
+    title: '另一个父项',
+    subtasks: [{ id: 'c', title: '一' }, { id: 'd', title: '二' }],
+  });
+  const lastSub = await s.update(parent.todo.id, {
+    subtasks: [
+      { id: 'c', title: '一', done: true },
+      { id: 'd', title: '二', done: true },
+    ],
+  });
+  eq(lastSub.todo.status, 'pending', '勾完最后一个子项，父项必须仍未完成：');
+});
+
+await test('非法 subtasks/notes 整批拒绝：200 语义 + 记录一个字节都不变', async () => {
+  const store = fakeStore();
+  const s = createWorkTodoService({ store, clock: () => NOW, logger: { warn() {}, info() {} } });
+  const created = await s.create({
+    title: '校验基准',
+    notes: '原备注',
+    subtasks: [{ id: 'a', title: '一', done: false, order: 0 }],
+  });
+  const id = created.todo.id;
+  const before = JSON.stringify(store.map.get(id));
+
+  const cases = [
+    [{ subtasks: '不是数组' }, 'bad-subtasks'],
+    [{ subtasks: Array.from({ length: 51 }, (_, i) => ({ title: `第 ${i} 条` })) }, 'subtasks-too-many'],
+    [{ subtasks: [null] }, 'bad-subtask'],
+    [{ subtasks: [{ title: '   ' }] }, 'empty-subtask-title'],
+    [{ subtasks: [{ title: 'x'.repeat(201) }] }, 'subtask-title-too-long'],
+    [{ subtasks: [{ title: 'ok', done: 1 }] }, 'bad-subtask-done'],
+    [{ subtasks: [{ title: 'ok', order: '先' }] }, 'bad-subtask-order'],
+    [{ notes: 42 }, 'bad-notes'],
+    [{ notes: 'x'.repeat(4001) }, 'notes-too-long'],
+  ];
+  for (const [patch, reason] of cases) {
+    // eslint-disable-next-line no-await-in-loop
+    const failed = await s.update(id, patch);
+    eq(failed.ok, false, `${JSON.stringify(patch).slice(0, 60)} 必须被拒：`);
+    eq(failed.reason, reason, `${JSON.stringify(patch).slice(0, 60)} 的原因码：`);
+    eq(typeof failed.message, 'string');
+    eq(JSON.stringify(store.map.get(id)), before, '被拒的补丁不能写盘（逐字节不变）：');
+  }
 });
 
 console.log(`\n${passed} 通过，${failures.length} 失败`);

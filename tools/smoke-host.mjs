@@ -4339,6 +4339,109 @@ await test('元测试：模拟版本全部从 package.json 派生，源码里没
   }
 });
 
+console.log('子待办与备注（HTTP 契约）');
+
+/** 读全量记录里某一条（/list 是面板与测试共用的载荷）。 */
+async function readTodo(id) {
+  const list = (await call(routes.get('/worktodo/list').handler, {
+    method: 'GET', url: '/worktodo/list?filter=all&shapes=todos',
+  })).json();
+  return list.data.todos.find((todo) => todo.id === id) ?? null;
+}
+
+await test('POST /create 带 subtasks/notes → /list 原样带回（独立 id、order、备注换行）', async () => {
+  const response = await call(routes.get('/worktodo/create').handler, {
+    method: 'POST', url: '/worktodo/create',
+    body: {
+      title: '带子项的新建',
+      notes: '第一行\n第二行',
+      subtasks: [
+        { id: 'st-a', title: '第一步', done: true },
+        { id: 'st-b', title: '第二步', done: false },
+      ],
+    },
+  });
+  eq(response.statusCode, 200);
+  const body = response.json();
+  eq(body.ok, true);
+  eq(body.data.todo.notes, '第一行\n第二行');
+  eq(body.data.todo.subtasks.map((item) => item.id), ['st-a', 'st-b']);
+  eq(body.data.todo.subtasks.map((item) => item.order), [0, 1]);
+
+  const listed = await readTodo(body.data.todo.id);
+  eq(listed.notes, '第一行\n第二行', '/list 必须带备注全文：');
+  eq(listed.subtasks.map((item) => item.title), ['第一步', '第二步'], '/list 必须带子待办：');
+  eq(listed.subtasks.map((item) => item.done), [true, false]);
+});
+
+await test('POST /update 可增 / 改 / 删 / 排子待办并改备注；只带 subtasks 不会被误判成插件升级', async () => {
+  const created = await call(routes.get('/worktodo/create').handler, {
+    method: 'POST', url: '/worktodo/create',
+    body: { title: '子项更新基准', subtasks: [{ id: 's1', title: '一' }, { id: 's2', title: '二' }] },
+  });
+  const id = created.json().data.todo.id;
+
+  // 只带 subtasks：isPluginUpdateRequest 必须认成「改待办」（漏配 subtasks 时会去跑升级）
+  const updated = await call(routes.get('/worktodo/update').handler, {
+    method: 'POST', url: '/worktodo/update',
+    body: {
+      ref: id,
+      subtasks: [
+        { id: 's2', title: '二改', done: true, order: 0 },
+        { id: 's3', title: '三', done: false, order: 1 },
+      ],
+      notes: '新备注',
+    },
+  });
+  const body = updated.json();
+  eq(body.ok, true);
+  eq(body.data.todo.subtasks.map((item) => item.id), ['s2', 's3'], '删一增一：');
+  eq(body.data.todo.subtasks.map((item) => item.title), ['二改', '三']);
+  eq(body.data.todo.notes, '新备注');
+
+  const cleared = await call(routes.get('/worktodo/update').handler, {
+    method: 'POST', url: '/worktodo/update', body: { ref: id, notes: null },
+  });
+  eq(cleared.json().data.todo.notes, null);
+  eq((await readTodo(id)).subtasks.length, 2, '清备注不能动子待办：');
+});
+
+await test('非法 subtasks/notes → 200 + ok:false，且文件一个字节都不变', async () => {
+  const created = await call(routes.get('/worktodo/create').handler, {
+    method: 'POST', url: '/worktodo/create',
+    body: {
+      title: '非法输入基准',
+      notes: '原备注',
+      subtasks: [{ id: 'x1', title: '一', done: false }],
+    },
+  });
+  const id = created.json().data.todo.id;
+  const before = readFileSync(storePath, 'utf8');
+
+  const cases = [
+    [{ subtasks: 'nope' }, 'bad-subtasks'],
+    [{ subtasks: Array.from({ length: 51 }, (_, i) => ({ title: `第 ${i} 条` })) }, 'subtasks-too-many'],
+    [{ subtasks: [null] }, 'bad-subtask'],
+    [{ subtasks: [{ title: '  ' }] }, 'empty-subtask-title'],
+    [{ subtasks: [{ title: 'x'.repeat(201) }] }, 'subtask-title-too-long'],
+    [{ subtasks: [{ title: 'ok', done: 'yes' }] }, 'bad-subtask-done'],
+    [{ subtasks: [{ title: 'ok', order: '先' }] }, 'bad-subtask-order'],
+    [{ notes: 1 }, 'bad-notes'],
+    [{ notes: 'x'.repeat(4001) }, 'notes-too-long'],
+  ];
+  for (const [patch, reason] of cases) {
+    // eslint-disable-next-line no-await-in-loop
+    const response = await call(routes.get('/worktodo/update').handler, {
+      method: 'POST', url: '/worktodo/update', body: { ref: id, ...patch },
+    });
+    eq(response.statusCode, 200, '沿用「HTTP 200 + ok:false」：');
+    const body = response.json();
+    eq(body.ok, false);
+    eq(body.reason, reason, `${JSON.stringify(patch).slice(0, 50)} 的原因码：`);
+    eq(readFileSync(storePath, 'utf8'), before, '被拒的请求不能写盘（逐字节不变）：');
+  }
+});
+
 console.log(`\n${passed} 通过，${failures.length} 失败`);
 if (failures.length) {
   for (const f of failures) console.error(`- ${f.label}: ${f.error?.stack ?? f.error}`);

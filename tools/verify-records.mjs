@@ -6,9 +6,12 @@
  * 时间一律注入固定基准，避免测试在午夜或跨周时随机变红。
  */
 import {
+  NOTES_MAX,
   PRIORITIES,
   PROJECT_LIST_LIMIT,
   STATUSES,
+  SUBTASK_MAX,
+  SUBTASK_TITLE_MAX,
   WorkTodoError,
   adoptSessionTodos,
   createRecord,
@@ -21,12 +24,15 @@ import {
   groupRecords,
   listProjects,
   normalizeDue,
+  normalizeNotes,
   normalizePriority,
   normalizeStatus,
+  normalizeSubtasks,
   patchRecord,
   resolveRef,
   sortForView,
   statsOf,
+  subtaskProgress,
   weekStartKey,
 } from '../src/records.mjs';
 import { MISSING_TITLE_PLACEHOLDER, repairRecord, repairStoreDocument } from '../src/schema.mjs';
@@ -519,6 +525,137 @@ test('applyManualOrder 与 manual 排序：拖过的在前且按 order 升序，
   eq(order[2], 'B', '没拖过的按自动规则垫后：');
   // 纯函数：不改入参
   eq(a.order, null, 'applyManualOrder 不应修改入参：');
+});
+
+// ---- 子待办（subtasks）与备注（notes）：数据、上限、联动、读盘修复 ----
+
+test('老记录缺 subtasks / notes → 默认 [] / null；新建记录也带这两个字段', () => {
+  const record = createRecord({ title: '老样子' }, { now: NOW });
+  eq(record.subtasks, []);
+  eq(record.notes, null);
+  const repaired = repairRecord({ id: 'old-1', title: '旧版记录', status: 'pending' });
+  eq(repaired.subtasks, [], '老记录没有 subtasks 时补空数组：');
+  eq(repaired.notes, null, '老记录没有 notes 时补 null：');
+});
+
+test('子待办：只有 title/done/order/id，按 order 稳定排序并重编号；id 缺失/重复自动补且唯一', () => {
+  const list = normalizeSubtasks([
+    { id: 'a', title: '  第二条  ', done: false, order: 5, due: '2026-01-01', project: 'x' },
+    { title: '第一条', done: true, order: 1 },
+    { id: 'a', title: '第三条' },
+  ]);
+  eq(list.map((item) => item.title), ['第一条', '第三条', '第二条'], '按 order 排（缺省 order 用数组下标）：');
+  eq(list.map((item) => item.order), [0, 1, 2], 'order 重编号为 0..n-1：');
+  eq(list.map((item) => item.done), [true, false, false], 'done 缺省补 false：');
+  eq(list.every((item) => Object.keys(item).sort().join(',') === 'done,id,order,title'), true,
+    '只保留 id/title/done/order（子项不许有自己的日期/项目）：');
+  eq(new Set(list.map((item) => item.id)).size, 3, 'id 必须唯一：');
+  eq(list.filter((item) => item.id === 'a').length, 1, '重复 id 只保留第一个：');
+  eq(list[1].id !== 'a', true, '重复 id 必须换成新的独立 id：');
+});
+
+test('子待办上限 50；第 51 条、非数组、坏项 / 空标题 / 超长 / 非布尔 done / 非数字 order 全部整批拒绝', () => {
+  const many = Array.from({ length: SUBTASK_MAX }, (_, i) => ({ id: `s${i}`, title: `条目 ${i}`, done: false }));
+  eq(normalizeSubtasks(many).length, SUBTASK_MAX);
+  throwsWith(() => normalizeSubtasks([...many, { title: '第 51 条' }]), 'subtasks-too-many');
+  throwsWith(() => normalizeSubtasks({ title: '不是数组' }), 'bad-subtasks');
+  throwsWith(() => normalizeSubtasks([null]), 'bad-subtask');
+  throwsWith(() => normalizeSubtasks([{ title: '   ' }]), 'empty-subtask-title');
+  throwsWith(() => normalizeSubtasks([{ title: 'x'.repeat(SUBTASK_TITLE_MAX + 1) }]), 'subtask-title-too-long');
+  throwsWith(() => normalizeSubtasks([{ title: 'ok', done: 'yes' }]), 'bad-subtask-done');
+  throwsWith(() => normalizeSubtasks([{ title: 'ok', order: '第一' }]), 'bad-subtask-order');
+});
+
+test('备注：null/空串 = 没有备注；保留内部换行；4000 字可写、4001 明确报错（不截断）', () => {
+  eq(normalizeNotes(null), null);
+  eq(normalizeNotes('   '), null);
+  eq(normalizeNotes('第一行\n第二行').includes('\n'), true, '内部换行必须保留：');
+  eq(normalizeNotes('x'.repeat(NOTES_MAX)).length, NOTES_MAX);
+  throwsWith(() => normalizeNotes('x'.repeat(NOTES_MAX + 1)), 'notes-too-long');
+  throwsWith(() => normalizeNotes(42), 'bad-notes');
+  eq(NOTES_MAX, 4000, '备注上限按用户拍板是 4000：');
+});
+
+test('patchRecord：subtasks/notes 可整组替换、null 清空；未给出的字段不动', () => {
+  const base = createRecord({
+    title: '目标',
+    notes: '第一版',
+    subtasks: [{ id: 'a', title: '第一步', done: true }, { id: 'b', title: '第二步' }],
+  }, { now: NOW });
+  const updated = patchRecord(base, {
+    notes: '第二版\n第二行',
+    subtasks: [{ id: 'b', title: '第二步', done: true, order: 0 }, { id: 'a', title: '第一步', done: true, order: 1 }],
+  }, NOW + 1);
+  eq(updated.notes, '第二版\n第二行');
+  eq(updated.subtasks.map((item) => item.id), ['b', 'a'], '整组替换并按 order 落位：');
+  eq(updated.subtasks.map((item) => item.order), [0, 1]);
+  eq(updated.title, '目标', '未给出的标题不动：');
+  const cleared = patchRecord(updated, { notes: null, subtasks: null }, NOW + 2);
+  eq(cleared.notes, null);
+  eq(cleared.subtasks, []);
+});
+
+test('联动：勾父项（status=completed）→ 子项全部完成；取消父项 → 只取消父项；只改子项不自动完成父项', () => {
+  const base = createRecord({
+    title: '父项',
+    subtasks: [{ id: 'a', title: '一', done: false }, { id: 'b', title: '二', done: true }],
+  }, { now: NOW });
+  const completed = patchRecord(base, { status: 'completed' }, NOW + 1);
+  eq(completed.subtasks.map((item) => item.done), [true, true], '勾父项必须级联勾子项：');
+  const reopened = patchRecord(completed, { status: 'pending' }, NOW + 2);
+  eq(reopened.subtasks.map((item) => item.done), [true, true], '取消父项不能回滚子项：');
+  const allSubsDone = patchRecord(base, {
+    subtasks: base.subtasks.map((item) => ({ ...item, done: true })),
+  }, NOW + 3);
+  eq(allSubsDone.status, 'pending', '勾完子项不自动完成父项：');
+  eq(subtaskProgress(allSubsDone), { total: 2, done: 2, allDone: true });
+  eq(subtaskProgress(base), { total: 2, done: 1, allDone: false });
+  eq(subtaskProgress({}), { total: 0, done: 0, allDone: false }, '空清单不算全部完成：');
+});
+
+test('读盘修复：坏 subtasks 只丢坏项/截断，不丢整条记录；notes 超长不静默截断', () => {
+  const repaired = repairRecord({
+    id: 'bad-1',
+    title: '坏数据也要留下',
+    notes: 42,
+    subtasks: '不是数组',
+  });
+  eq(repaired.title, '坏数据也要留下');
+  eq(repaired.subtasks, []);
+  eq(repaired.notes, null);
+
+  const items = [
+    null,
+    { id: 'a', title: '保留', done: 'yes', order: 'x' },
+    { title: '   ' },
+    { id: 'a', title: '  重复 id  ', done: true, order: 2 },
+    { id: 'b', title: 'x'.repeat(SUBTASK_TITLE_MAX + 20) },
+  ];
+  const many = Array.from({ length: SUBTASK_MAX + 5 }, (_, i) => ({ id: `m${i}`, title: `条目 ${i}`, order: i }));
+  const badOnly = repairRecord({ id: 'bad-2a', title: '只修坏项', subtasks: items });
+  eq(badOnly.subtasks[0].title, '保留');
+  eq(badOnly.subtasks[0].done, false, '非 true 的 done 一律当 false：');
+  eq(badOnly.subtasks[0].order, 0, '非法 order 用数组下标后再重排序：');
+  eq(new Set(badOnly.subtasks.map((item) => item.id)).size, badOnly.subtasks.length, '修复后 id 仍唯一：');
+  eq(badOnly.subtasks.every((item) => item.title.length <= SUBTASK_TITLE_MAX), true, '读盘超长标题截断到上限：');
+  eq(badOnly.subtasks.some((item) => item.title === ''), false, '空标题项丢弃：');
+
+  const merged = repairRecord({ id: 'bad-2', title: '修复', subtasks: [...items, ...many] });
+  eq(merged.subtasks.length, SUBTASK_MAX, '超过 50 条只保留前 50 条（不丢整条记录）：');
+
+  const longNotes = 'x'.repeat(NOTES_MAX + 50);
+  const kept = repairRecord({ id: 'bad-3', title: '长备注', notes: longNotes });
+  eq(kept.notes.length, NOTES_MAX + 50, '读盘不截断备注（不静默丢用户文字）：');
+
+  const doc = repairStoreDocument({
+    todos: [
+      { id: 'keep', title: '坏字段但可读', subtasks: [null, { title: '好项' }] },
+      { title: '缺 id 也保留', subtasks: 'bad' },
+    ],
+  });
+  eq(doc.todos.length, 2, '坏 subtasks 绝不能导致整条记录被丢：');
+  eq(doc.todos[0].subtasks.map((item) => item.title), ['好项']);
+  eq(doc.todos[1].subtasks, []);
 });
 
 // ---- 自然语言日期解析（人类面板与 worktodo_* 工具共用同一份） ----

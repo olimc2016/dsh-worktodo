@@ -15,6 +15,8 @@ import {
   PRIORITIES,
   SOURCES,
   STATUSES,
+  SUBTASK_MAX,
+  SUBTASK_TITLE_MAX,
   WorkTodoError,
   dayKey,
   newId,
@@ -43,11 +45,55 @@ function coerce(job, fallback) {
 }
 
 /**
+ * 读盘时的子待办修复：**宽容但不整条丢**。
+ *
+ * 磁盘上的数据可能来自手改、旧版本或坏写入，所以这里不像写入路径那样整批拒绝：
+ *   - 非数组 / null → []；
+ *   - 数组里非对象、标题为空 → 丢弃该项（其余保留）；
+ *   - 标题超长 → 截到上限（读盘宽容；写入仍明确报错）；
+ *   - done 只有严格 true 才算完成；order 非法用数组下标；
+ *   - id 缺失/重复 → 用「文件内位置」派生稳定 id；
+ *   - 超过 50 条 → 按 order/数组顺序保留前 50 条。
+ * @param {unknown} raw
+ * @returns {{id: string, title: string, done: boolean, order: number}[]}
+ */
+export function repairSubtasks(raw) {
+  if (!Array.isArray(raw)) return [];
+  const used = new Set();
+  const items = [];
+  raw.forEach((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return;
+    let title = typeof item.title === 'string' ? item.title.trim() : '';
+    if (!title) return;
+    if (title.length > SUBTASK_TITLE_MAX) title = title.slice(0, SUBTASK_TITLE_MAX);
+    let id = typeof item.id === 'string' ? item.id.trim() : '';
+    if (!id || used.has(id)) {
+      let base = `st-recovered-${index + 1}`;
+      let n = 1;
+      id = base;
+      while (used.has(id)) id = `${base}-${n++}`;
+    }
+    used.add(id);
+    items.push({
+      id,
+      title,
+      done: item.done === true,
+      order: Number.isFinite(item.order) ? Number(item.order) : index,
+    });
+  });
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => (a.item.order - b.item.order) || (a.index - b.index))
+    .slice(0, SUBTASK_MAX)
+    .map(({ item }, order) => ({ ...item, order }));
+}
+
+/**
  * 把一条「可能来自磁盘/可能来自旧版本/可能是手改坏的」记录修复成合法记录。
  *
  * 修复策略：
  *   - 结构性字段（id、title）缺失或非法 → 抛错（由上层决定跳过或上抛）；
- *   - 可补的字段（status/priority/notes/project/source/时间戳）→ 用默认值补齐，
+ *   - 可补的字段（status/priority/notes/subtasks/project/source/时间戳）→ 用默认值补齐，
  *     这样旧版本写入或手改漏字段的记录不会让整个领域打不开。
  *
  * @param {unknown} raw 待校验的值
@@ -73,11 +119,14 @@ export function repairRecord(raw) {
   const completedAt = status === 'completed'
     ? (Number.isFinite(raw.completedAt) ? Number(raw.completedAt) : updatedAt)
     : null;
+  // 备注：旧记录没有该字段 / 空字符串 / 非字符串 → null；超长**不截断**（不静默丢用户文字）
+  const notes = typeof raw.notes === 'string' && raw.notes.trim() ? raw.notes : null;
 
   return {
     id,
     title,
-    notes: typeof raw.notes === 'string' ? raw.notes : '',
+    notes,
+    subtasks: repairSubtasks(raw.subtasks),
     status,
     priority,
     // 相对日期（today/+3d）按「读到的这一刻」折算：手改文件的人想的当然是今天

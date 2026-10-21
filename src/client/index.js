@@ -282,6 +282,27 @@ const zh = {
   'notesPlaceholder': '备注（可选）',
   'notesAdd': '加备注',
   'notesHide': '收起备注',
+  'notesEdit': '编辑备注',
+  'notesClose': '收起备注',
+  'notesSave': '保存备注',
+  'notesSaveFailed': '备注没保存上，已恢复原值',
+  'notesCount': '{count} / {max}',
+  'subtaskProgress': '子待办 {done}/{total}',
+  'subtaskExpand': '展开子待办',
+  'subtaskCollapse': '收起子待办',
+  'subtaskAdd': '＋ 添加子待办',
+  'subtaskAddLabel': '添加子待办',
+  'subtaskPlaceholder': '子待办标题',
+  'subtaskEmpty': '还没有子待办',
+  'subtaskLimit': '已达 50 条上限',
+  'subtaskMoveUp': '上移子待办',
+  'subtaskMoveDown': '下移子待办',
+  'subtaskDelete': '删除子待办',
+  'subtaskSaveFailed': '子待办没保存上，已恢复原状',
+  'subtaskCheck': '勾选子待办：{title}',
+  'subtaskEdit': '修改子待办标题',
+  'subtaskAllDone': '子项全部完成 · 勾掉这条？',
+  'subtaskHint': 'Space 勾选 · Enter 改名 · 可拖动排序',
   'adoptPre': '把本会话的',
   'adoptPost': '条待办提升为工作待办',
   'adoptHint': '这是模型在本会话里列的待办。提升后归你所有：跨会话保留，还能加优先级和截止日期。',
@@ -452,6 +473,27 @@ const en = {
   'notesPlaceholder': 'Notes (optional)',
   'notesAdd': 'Add notes',
   'notesHide': 'Hide notes',
+  'notesEdit': 'Edit notes',
+  'notesClose': 'Hide notes',
+  'notesSave': 'Save notes',
+  'notesSaveFailed': "Couldn't save the notes — reverted",
+  'notesCount': '{count} / {max}',
+  'subtaskProgress': 'Subtasks {done}/{total}',
+  'subtaskExpand': 'Expand subtasks',
+  'subtaskCollapse': 'Collapse subtasks',
+  'subtaskAdd': '＋ Add subtask',
+  'subtaskAddLabel': 'Add subtask',
+  'subtaskPlaceholder': 'Subtask title',
+  'subtaskEmpty': 'No subtasks yet',
+  'subtaskLimit': '50 subtasks max',
+  'subtaskMoveUp': 'Move subtask up',
+  'subtaskMoveDown': 'Move subtask down',
+  'subtaskDelete': 'Delete subtask',
+  'subtaskSaveFailed': "Couldn't save the subtasks — reverted",
+  'subtaskCheck': 'Toggle subtask: {title}',
+  'subtaskEdit': 'Edit subtask title',
+  'subtaskAllDone': 'All subtasks done · complete this one?',
+  'subtaskHint': 'Space toggles · Enter renames · drag to reorder',
   'adoptPre': "Promote this session's ",
   'adoptPost': ' to-dos into your work list',
   'adoptHint': 'These are the to-dos the model listed in this session. Promoting makes them yours: they survive across sessions and take priorities and due dates.',
@@ -610,11 +652,19 @@ export const FLAG_SLOT_PX = 18;
  * 空槽撑成隔着大段留白的三段。整组仍贴行右端（.wt-meta 的 margin-left:auto +
  * 标题列的 flex:1），标题长短变化时整组右边缘固定。
  *
- * 顺序仍是 [日期][来源][已过期][项目]（DOM 顺序 = 视觉顺序，测试与实现共用这份声明）。
+ * 顺序仍是 [进度][日期][来源][已过期][项目]（进度 chip 有子待办才渲染；
+ * DOM 顺序 = 视觉顺序，测试与实现共用这份声明）。
  */
 export const META_CHIP_GAP_PX = 6;
-/** 小字组 chip 的固定顺序（DOM 顺序 = 视觉顺序）。 */
-export const META_CHIP_ORDER = ['date', 'source', 'overdue', 'project'];
+/** 小字组 chip 的固定顺序（DOM 顺序 = 视觉顺序）。进度 chip 放最前，紧跟日期。 */
+export const META_CHIP_ORDER = ['subtasks', 'date', 'source', 'overdue', 'project'];
+/** 子待办上限与标题上限：与宿主 records.mjs / 写入校验同一口径（客户端只做先行拦截）。 */
+export const SUBTASK_MAX = 50;
+export const SUBTASK_TITLE_MAX = 200;
+/** 备注上限（纯文本、保留换行）。 */
+export const NOTES_MAX = 4000;
+/** 「子项全部完成 · 勾掉这条？」轻提示的自动消失时间（忽略即消失，不唠叨）。 */
+export const SUBTASK_PROMPT_MS = 10000;
 /**
  * 项目 chip 的最大宽度（px）≈ 8 个汉字（11px 字号下≈88px + 两侧内边距）：
  * 常见项目名完整显示，更长的名字由省略号收尾，完整名字在 title 里。
@@ -983,6 +1033,71 @@ export const STYLE_TEXT = `
 }
 /* 「已过期」小胶囊：独立 chip，排在来源之后、项目之前；未过期时整颗不渲染（不占位）。 */
 .wt-tag.wt-overdue-tag { color: ${C.warn}; border-color: ${tint(C.warn, 45)}; }
+/* 进度 chip（2/3）：与日期/项目同一套胶囊视觉；0 条完成用 muted、全完成用 ok 色。 */
+.wt-subtask-chip {
+  appearance: none; font: inherit; font-size: 10.5px; cursor: pointer;
+  background: transparent; color: ${C.label2};
+}
+.wt-subtask-chip:hover { background: ${tint(C.brand, 10)}; color: ${C.label}; }
+.wt-subtask-chip:focus-visible { outline: 2px solid ${C.brand}; outline-offset: 1px; }
+.wt-subtask-chip.is-zero { color: ${C.label3}; }
+.wt-subtask-chip.is-done { color: ${C.ok}; border-color: ${tint(C.ok, 50)}; background: ${tint(C.ok, 10)}; }
+/* 「子项全部完成 · 勾掉这条？」：轻提示也是一颗可点的 chip，不抢主操作。 */
+.wt-subtask-prompt {
+  appearance: none; font: inherit; font-size: 10.5px; cursor: pointer;
+  color: ${C.ok}; border-color: ${tint(C.ok, 50)}; background: ${tint(C.ok, 8)};
+}
+.wt-subtask-prompt:hover { background: ${tint(C.ok, 16)}; }
+/* 备注图标：有备注才渲染（无备注不占位）；标题之后、小字组之前。 */
+.wt-notes-btn { width: 18px; height: 18px; color: ${C.label3}; }
+.wt-notes-btn:hover, .wt-notes-btn.is-open { color: ${C.brand}; background: ${tint(C.brand, 10)}; }
+/* 子待办 / 备注的展开区：都在行**下方**，左侧缩进到标题起始位置（18 + 8 + 26 + 8 + 8 ≈ 68px）。 */
+.wt-row-expand {
+  display: flex; flex-direction: column; gap: 6px;
+  margin: 0 8px 6px 68px; padding: 2px 0 4px 10px;
+  border-left: 1px solid ${C.border1};
+}
+.wt-sub-panel, .wt-notes-panel { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.wt-sub-head { display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: ${C.label3}; }
+.wt-sub-head-title { font-weight: 600; color: ${C.label2}; }
+.wt-sub-hint { font-size: 10px; color: ${C.label3}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wt-sub-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; }
+.wt-sub-item { display: flex; align-items: center; gap: 5px; min-height: 24px; border-radius: 6px; padding: 0 2px; }
+.wt-sub-item:hover { background: ${C.hover}; }
+.wt-sub-item input[type="checkbox"] { flex: none; width: 14px; height: 14px; margin: 0; accent-color: ${C.brand}; cursor: pointer; }
+.wt-sub-title {
+  appearance: none; flex: 1 1 auto; min-width: 0; text-align: left;
+  border: 0; background: transparent; font: inherit; font-size: 11.5px; line-height: 1.7;
+  padding: 1px 0; color: ${C.label}; cursor: text;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.wt-sub-item.is-done .wt-sub-title { color: ${C.label3}; text-decoration: line-through; }
+.wt-sub-title:hover { text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
+.wt-sub-input { flex: 1 1 auto; min-width: 0; font-size: 11.5px; padding: 2px 6px; }
+.wt-sub-move, .wt-sub-del { width: 18px; height: 18px; font-size: 11px; color: ${C.label3}; }
+.wt-sub-move:disabled { opacity: .3; cursor: default; }
+.wt-sub-add-row { display: flex; align-items: center; gap: 5px; }
+.wt-sub-add { align-self: flex-start; }
+.wt-sub-empty, .wt-sub-error { font-size: 10.5px; color: ${C.label3}; }
+.wt-sub-error { color: ${C.warn}; }
+.wt-notes-head { display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: ${C.label3}; }
+.wt-notes-count { font-variant-numeric: tabular-nums; }
+.wt-notes-view {
+  font-size: 11.5px; line-height: 1.65; color: ${C.label2};
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 180px; overflow: auto; padding: 2px 4px; border-radius: 6px; cursor: text;
+}
+.wt-notes-view:hover { background: ${C.hover}; }
+.wt-notes-view:focus-visible { outline: 2px solid ${C.brand}; outline-offset: 1px; }
+.wt-notes-textarea {
+  width: 100%; box-sizing: border-box; min-height: 74px; resize: vertical;
+  font-size: 11.5px; line-height: 1.65; font-family: inherit;
+}
+/* 视觉隐藏但读屏可读：进度变化用 aria-live 播报。 */
+.wt-sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
 .wt-link { cursor: pointer; user-select: none; color: var(--dsw-alias-link); font-size: 11px; }
 .wt-link:hover { text-decoration: underline; }
 /* 自升级那一格：可点时是 <button>，外观必须与旁边的 chip 一致 */
@@ -1573,6 +1688,20 @@ const IconPencil = () => React.createElement('svg', { width: 13, height: 13, vie
   React.createElement('path', { key: 'l', d: 'M8.9 4.3 11.7 7.1' }),
 ]);
 
+/** 清单：进度 chip 的前缀图标（三条短横 + 两个对勾点）。纯装饰，可读名由按钮 aria-label 提供。 */
+const IconList = () => React.createElement('svg', { width: 11, height: 11, viewBox: '0 0 12 12', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' }, [
+  React.createElement('path', { key: 'a', d: 'M4.4 3h6M4.4 6h6M4.4 9h6' }),
+  React.createElement('path', { key: 'b', d: 'm1.4 3 1 1 1.4-1.8' }),
+  React.createElement('path', { key: 'c', d: 'm1.4 7.6 1 1 1.4-1.8' }),
+]);
+
+/** 备注：标题之后的小图标（一张带折角的纸 + 两行字）。 */
+const IconNote = () => React.createElement('svg', { width: 12, height: 12, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true' }, [
+  React.createElement('path', { key: 'p', d: 'M3.2 2.4h6.2l3.4 3.4v7.8H3.2z' }),
+  React.createElement('path', { key: 'f', d: 'M9.4 2.4v3.4h3.4' }),
+  React.createElement('path', { key: 'l', d: 'M5.4 8.4h5.2M5.4 11h3.6' }),
+]);
+
 /**
  * 「项目」选择器弹层里的查重：把用户输入对齐到已有项目。
  *
@@ -1914,10 +2043,37 @@ function QuickAdd({ t, onAdd, busy, projects, projectsTruncated }) {
  *   - `drag`：共享的 dragHandlers 对象（useMemo），每一行不再各造一个新对象；
  *     每一行与拖动相关的差异只有布尔 `dragging`。
  * ------------------------------------------------------------------ */
-const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove, onSave, onPriority, onDue, onTitle, onProject, projects, projectsTruncated, celebrate, drag, dragging }) {
+const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove, onSave, onPriority, onDue, onTitle, onProject, onSubtasks, onNotes, projects, projectsTruncated, celebrate, drag, dragging }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(null);
   const [notesOpen, setNotesOpen] = React.useState(false);
+  /**
+   * 行内子待办 / 备注（本轮新增）：
+   *   - `subtasksOpen`：行下方的清单是否展开；`inlineNotesOpen`：行下方的备注区是否展开；
+   *   - `subtasksOverride` / `notesOverride`：乐观值，与日期/标题同一条口径 —— 只对
+   *     「点击那一刻的 todo 对象」有效，refresh 拿回新对象后自动失效，以服务端为准；
+   *   - 失败一律回滚乐观值并给一句温和的行内提示（不把原始异常带进 DOM）；
+   *   - `promptVisible`：「子项全部完成 · 勾掉这条？」轻提示，忽略 10s 后自己消失。
+   */
+  const [subtasksOpen, setSubtasksOpen] = React.useState(false);
+  const [subtasksOverride, setSubtasksOverride] = React.useState(null);
+  const [subtasksOverrideFor, setSubtasksOverrideFor] = React.useState(null);
+  const [subtaskError, setSubtaskError] = React.useState(null);
+  const [subtaskAdding, setSubtaskAdding] = React.useState(false);
+  const [subtaskDraft, setSubtaskDraft] = React.useState('');
+  const [subtaskEditingId, setSubtaskEditingId] = React.useState(null);
+  const [subtaskEditDraft, setSubtaskEditDraft] = React.useState('');
+  const [subtaskDragId, setSubtaskDragId] = React.useState(null);
+  const subtaskDragRef = React.useRef(null);
+  const [promptVisible, setPromptVisible] = React.useState(false);
+  const subtaskEditCommittedRef = React.useRef(false);
+  const [inlineNotesOpen, setInlineNotesOpen] = React.useState(false);
+  const [notesEditing, setNotesEditing] = React.useState(false);
+  const [notesDraft, setNotesDraft] = React.useState('');
+  const [notesOverride, setNotesOverride] = React.useState(undefined);
+  const [notesOverrideFor, setNotesOverrideFor] = React.useState(null);
+  const [notesError, setNotesError] = React.useState(null);
+  const notesCommittedRef = React.useRef(false);
   const [confirming, setConfirming] = React.useState(false);
   /** 四旗弹层是否打开。 */
   const [flagOpen, setFlagOpen] = React.useState(false);
@@ -1972,6 +2128,8 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
   const [titleOverrideFor, setTitleOverrideFor] = React.useState(null);
   const [titleError, setTitleError] = React.useState(null);
   const titleCommittedRef = React.useRef(false);
+  /** 标题按钮元素：Esc 取消编辑后把焦点还给它，下一次 Esc 才能继续冒泡收起备注（依次收起）。 */
+  const titleButtonRef = React.useRef(null);
   /**
    * 行内项目编辑：
    *   - `projectOpen`：选择浮层是否挂载（与 QuickAdd 共用 ProjectPopover）；
@@ -2010,6 +2168,24 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
   const baseProject = typeof row.project === 'string' && row.project ? row.project : null;
   const projectOverrideActive = projectOverride !== undefined && projectOverrideFor === todo;
   const shownProject = projectOverrideActive ? projectOverride : baseProject;
+  // 子待办 / 备注：与日期/标题/项目同一套乐观值口径（引用变了就回到服务端真相）
+  const baseSubtasks = Array.isArray(row.subtasks) ? row.subtasks : [];
+  const subtasksOverrideActive = subtasksOverride !== null && subtasksOverrideFor === todo;
+  const shownSubtasks = subtasksOverrideActive ? subtasksOverride : baseSubtasks;
+  const subtaskTotal = shownSubtasks.length;
+  const subtaskDone = shownSubtasks.filter((item) => item?.done === true).length;
+  const allSubtasksDone = subtaskTotal > 0 && subtaskDone === subtaskTotal;
+  const baseNotes = typeof row.notes === 'string' ? row.notes : '';
+  const notesOverrideActive = notesOverride !== undefined && notesOverrideFor === todo;
+  const shownNotes = notesOverrideActive ? notesOverride : baseNotes;
+  const hasNotes = Boolean(String(shownNotes ?? '').trim());
+
+  // 「子项全部完成」的轻提示只存活 10s：用户忽略它就自己消失，不唠叨
+  React.useEffect(() => {
+    if (!promptVisible) return undefined;
+    const id = setTimeout(() => setPromptVisible(false), SUBTASK_PROMPT_MS);
+    return () => clearTimeout(id);
+  }, [promptVisible]);
 
   /* ---------------- 行布局：默认单行（B） / 标题被截断时换行（C） ---------------- */
 
@@ -2123,6 +2299,12 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     measureRow(el);
   }, [clearMeasureTimer, measureRow]);
 
+  /** 标题按钮的 ref：同时承担换行测量与「Esc 后交还焦点」两件事。 */
+  const attachTitleButton = React.useCallback((el) => {
+    titleButtonRef.current = el;
+    attachTitleEl(el);
+  }, [attachTitleEl]);
+
   /**
    * 标题文字变了（编辑提交 / 服务端刷新）而元素本身没换时，也要重量一次。
    *
@@ -2215,6 +2397,12 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     setTitleDraft(shownTitle);
     setTitleError(null);
     setTitleEditing(true);
+    // 用户拍板：点标题进入编辑态时，同时在其下方展开备注（只读；再点正文才编辑）。
+    // 只展开「确实有备注」的行：无备注时展开一块空区域只会打断标题编辑。
+    if (hasNotes) {
+      setInlineNotesOpen(true);
+      setNotesEditing(false);
+    }
   };
 
   /**
@@ -2261,6 +2449,11 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     titleCommittedRef.current = true;
     setTitleEditing(false);
     setTitleDraft('');
+    // input 卸载后焦点会掉到 body：把它还给标题按钮，下一次 Esc 才能继续收起备注；
+    // 用 setTimeout 是因为按钮要等这一轮 setState 渲染后才挂上。
+    setTimeout(() => {
+      try { titleButtonRef.current?.focus?.(); } catch { /* 测试替身 / 旧内核没有 focus */ }
+    }, 0);
   };
 
   /* ---------------- 行内项目：点标签 → 选择浮层 ---------------- */
@@ -2344,6 +2537,161 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     setEditing(true);
   };
 
+  /* ---------------- 行内子待办 / 备注 ---------------- */
+
+  /** 客户端生成子待办 id：优先 crypto.randomUUID（独立 id），测试/旧内核退回时间 + 随机数。 */
+  const newClientSubtaskId = () => {
+    try {
+      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return `st-${crypto.randomUUID()}`;
+      }
+    } catch { /* 没有 crypto 就退回等价实现 */ }
+    return `st-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  };
+
+  /** 数组顺序是唯一真相：提交前把 order 重排成 0..n-1。 */
+  const withSubtaskOrder = (list) => list.map((item, order) => ({ ...item, order }));
+
+  /**
+   * 提交整个子待办数组：**先乐观更新**，再 POST `/update {ref, subtasks}`；
+   * 失败回滚到点击前的数组并给一句温和的行内提示（与日期/项目同一条写路径）。
+   * @returns {Promise<boolean>}
+   */
+  const commitSubtasks = (next) => {
+    const previous = shownSubtasks;
+    setSubtasksOverride(next);
+    setSubtasksOverrideFor(todo);
+    setSubtaskError(null);
+    const fail = () => {
+      setSubtasksOverride(previous);
+      setSubtasksOverrideFor(todo);
+      setSubtaskError(t('subtaskSaveFailed'));
+      return false;
+    };
+    return Promise.resolve(onSubtasks?.(row.id, next)).then(
+      (result) => (result && result.ok === false ? fail() : true),
+      fail,
+    );
+  };
+
+  /** 勾一条子待办：最后一条勾完 → 父项仍不自动完成，只弹一次轻提示。 */
+  const toggleSubtask = (id) => {
+    const next = shownSubtasks.map((item) => (item.id === id ? { ...item, done: !item.done } : item));
+    commitSubtasks(next).then((ok) => {
+      if (!ok) return;
+      const allDone = next.length > 0 && next.every((item) => item.done);
+      if (allDone && !done) setPromptVisible(true);
+    });
+  };
+
+  /** 上/下移动（键盘可达的排序方式，order 落盘）。 */
+  const moveSubtask = (id, delta) => {
+    const from = shownSubtasks.findIndex((item) => item.id === id);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= shownSubtasks.length) return;
+    const next = [...shownSubtasks];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    commitSubtasks(withSubtaskOrder(next));
+  };
+
+  /** 拖拽落点：把被拖的项插到目标项之前（与面板拖行同一心智）。 */
+  const dropSubtask = (targetId) => {
+    const dragged = subtaskDragRef.current;
+    subtaskDragRef.current = null;
+    setSubtaskDragId(null);
+    if (!dragged || dragged === targetId) return;
+    const moving = shownSubtasks.find((item) => item.id === dragged);
+    const next = shownSubtasks.filter((item) => item.id !== dragged);
+    if (!moving) return;
+    const to = next.findIndex((item) => item.id === targetId);
+    next.splice(to < 0 ? next.length : to, 0, moving);
+    commitSubtasks(withSubtaskOrder(next));
+  };
+
+  const startSubtaskEdit = (item) => {
+    subtaskEditCommittedRef.current = false;
+    setSubtaskEditingId(item.id);
+    setSubtaskEditDraft(item.title);
+  };
+
+  const commitSubtaskEdit = () => {
+    if (subtaskEditCommittedRef.current) return;
+    subtaskEditCommittedRef.current = true;
+    const title = String(subtaskEditDraft ?? '').trim();
+    const target = shownSubtasks.find((item) => item.id === subtaskEditingId);
+    setSubtaskEditingId(null);
+    setSubtaskEditDraft('');
+    if (!target || !title || title === target.title) return;
+    commitSubtasks(shownSubtasks.map((item) => (item.id === target.id ? { ...item, title } : item)));
+  };
+
+  const cancelSubtaskEdit = () => {
+    subtaskEditCommittedRef.current = true;
+    setSubtaskEditingId(null);
+    setSubtaskEditDraft('');
+  };
+
+  /** 新增：Enter 连续添加（输入框保持打开、清空）；达到上限后入口消失。 */
+  const addSubtask = () => {
+    const title = String(subtaskDraft ?? '').trim();
+    if (!title || subtaskTotal >= SUBTASK_MAX) return;
+    if (title.length > SUBTASK_TITLE_MAX) return;
+    const next = [...shownSubtasks, { id: newClientSubtaskId(), title, done: false, order: subtaskTotal }];
+    setSubtaskDraft('');
+    commitSubtasks(withSubtaskOrder(next)).then((ok) => {
+      if (!ok) setSubtaskDraft(title);
+    });
+  };
+
+  const removeSubtask = (id) => {
+    commitSubtasks(withSubtaskOrder(shownSubtasks.filter((item) => item.id !== id)));
+  };
+
+  const startNotesEdit = () => {
+    notesCommittedRef.current = false;
+    setNotesDraft(shownNotes);
+    setNotesError(null);
+    setInlineNotesOpen(true);
+    setNotesEditing(true);
+  };
+
+  const commitNotes = () => {
+    if (notesCommittedRef.current) return;
+    notesCommittedRef.current = true;
+    const next = String(notesDraft ?? '').trim();
+    setNotesEditing(false);
+    setNotesDraft('');
+    if (next === String(baseNotes ?? '').trim()) return;
+    setNotesOverride(next);
+    setNotesOverrideFor(todo);
+    setNotesError(null);
+    const fail = () => {
+      setNotesOverride(undefined);
+      setNotesOverrideFor(null);
+      setNotesError(t('notesSaveFailed'));
+    };
+    Promise.resolve(onNotes?.(row.id, next || null)).then(
+      (result) => { if (result && result.ok === false) fail(); },
+      fail,
+    );
+  };
+
+  /** Esc 取消备注编辑：标记已收口，挡住随后的 blur；保留展开的只读区。 */
+  const cancelNotes = () => {
+    notesCommittedRef.current = true;
+    setNotesEditing(false);
+    setNotesDraft('');
+  };
+
+  /** 行下方的 Esc：依次收起输入 → 子清单 → 备注区；输入框自己会 stopPropagation。 */
+  const handleExpandKeyDown = (event) => {
+    if (event?.key !== 'Escape') return;
+    if (subtaskAdding) { setSubtaskAdding(false); setSubtaskDraft(''); return; }
+    if (subtasksOpen) { setSubtasksOpen(false); return; }
+    if (inlineNotesOpen) setInlineNotesOpen(false);
+  };
+
   const stopEdit = () => { setEditing(false); setDraft(null); };
 
   /**
@@ -2358,6 +2706,15 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
   const handleCheck = () => {
     const willComplete = !done;
     const canCelebrate = willComplete && celebrate !== false && !prefersReducedMotion();
+    const subtasksBeforeToggle = shownSubtasks;
+    // 联动（用户拍板）：勾父项 → 子项全部完成（乐观更新，失败一起回滚）。
+    // 取消父项只取消父项，子项保持原状（这里什么都不动）。
+    const cascades = willComplete && subtasksBeforeToggle.some((item) => item.done !== true);
+    if (cascades) {
+      setSubtasksOverride(subtasksBeforeToggle.map((item) => ({ ...item, done: true })));
+      setSubtasksOverrideFor(todo);
+      setPromptVisible(false);
+    }
     if (canCelebrate) {
       setOptimisticDone(true);
       setOptimisticFor(todo); // B2：乐观态绑定点击那一刻的数据对象
@@ -2376,12 +2733,20 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
           setOptimisticDone(null);
           setOptimisticFor(null);
           setCelebrating(false);
+          if (cascades) {
+            setSubtasksOverride(subtasksBeforeToggle);
+            setSubtasksOverrideFor(todo);
+          }
         }
       },
       () => {
         setOptimisticDone(null);
         setOptimisticFor(null);
         setCelebrating(false);
+        if (cascades) {
+          setSubtasksOverride(subtasksBeforeToggle);
+          setSubtasksOverrideFor(todo);
+        }
       },
     );
   };
@@ -2705,10 +3070,50 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     }, row.source === 'agent' ? t('sourceAgent') : t('sourceSession'))
     : null;
 
-  // 小字组＝按内容定宽的 chip 组，顺序固定为 [日期][来源][已过期][项目]。
+  // 进度 chip：有子待办才渲染（没有就不显示、不占位），放在小字组最前（紧跟日期）。
+  // 完成数 0 用 muted、全完成用 ok 色；可点开/收起行内清单。
+  const progressLabel = t('subtaskProgress')
+    .replace('{done}', String(subtaskDone))
+    .replace('{total}', String(subtaskTotal));
+  const progressChip = subtaskTotal > 0
+    ? React.createElement('button', {
+      key: 'subtasks',
+      type: 'button',
+      className: `wt-tag wt-subtask-chip wt-meta-chip${subtaskDone === 0 ? ' is-zero' : ''}${allSubtasksDone ? ' is-done' : ''}`,
+      'data-wt-meta-chip': 'subtasks',
+      'data-wt-subtask-progress': 'true',
+      'data-wt-subtask-done': String(subtaskDone),
+      'data-wt-subtask-total': String(subtaskTotal),
+      'aria-label': progressLabel,
+      'aria-expanded': subtasksOpen,
+      'aria-controls': `wt-sub-${row.id}`,
+      title: subtasksOpen ? t('subtaskCollapse') : t('subtaskExpand'),
+      onClick: () => setSubtasksOpen((open) => !open),
+    }, [
+      React.createElement(IconList, { key: 'i' }),
+      React.createElement('span', { key: 'n' }, `${subtaskDone}/${subtaskTotal}`),
+      React.createElement('span', {
+        key: 'live', className: 'wt-sr-only', 'aria-live': 'polite',
+      }, progressLabel),
+    ])
+    : null;
+  // 「子项全部完成 · 勾掉这条？」：只提示、不自动完成父项；点它 = 直接勾掉父项，忽略 10s 后消失。
+  const promptChip = promptVisible && allSubtasksDone && !done
+    ? React.createElement('button', {
+      key: 'subtask-prompt',
+      type: 'button',
+      className: 'wt-tag wt-subtask-prompt wt-meta-chip',
+      'data-wt-subtask-prompt': 'true',
+      title: t('subtaskAllDone'),
+      onClick: () => { setPromptVisible(false); handleCheck(); },
+    }, t('subtaskAllDone'))
+    : null;
+
+  // 小字组＝按内容定宽的 chip 组，顺序固定为 [进度][日期][来源][已过期][项目]。
   // 有内容才 push ⇒ 没有来源 / 未过期 / 没有项目时，对应的 chip 与它的占位一起消失。
   // 错误信息跨四列另起一行（grid-column:1/-1）。
-  // 有内容才占位：日期（或 hover 时的「＋日期」）→ 来源 → 已过期 → 项目。
+  if (progressChip) meta.push(progressChip);
+  if (promptChip) meta.push(promptChip);
   if (shownDue || datePeek || dateOpen) meta.push(dateNode);
   if (sourceChip) meta.push(sourceChip);
   if (overdueChip) meta.push(overdueChip);
@@ -2756,7 +3161,7 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     // 高优先级行与普通行的标题左边缘因此严格对齐（不会差一个边框宽度）。
     ...(flagValue === 'high' ? { borderLeft: `2px solid ${C.error}`, paddingLeft: 6 } : {}),
   };
-  return React.createElement('div', {
+  const rowNode = React.createElement('div', {
     ref: attachRowEl,
     // B/C 的两种形态共用同一份 DOM：默认单行；标题会被截断时加 --wrap（小字组去第二行）
     className: `wt-row ${rowWrap ? 'wt-row--wrap' : 'wt-row--single'}${celebrating ? ' is-celebrating' : ''}`,
@@ -2830,6 +3235,8 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
               commitTitle();
             } else if (event?.key === 'Escape') {
               event.preventDefault?.();
+              // 不让 Esc 冒泡到行容器：第一次 Esc 只退出标题编辑，备注区保持展开（依次收起）
+              event.stopPropagation?.();
               cancelTitle();
             }
           },
@@ -2843,7 +3250,7 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
         })
         : React.createElement('button', {
           key: 'title',
-          ref: attachTitleEl,
+          ref: attachTitleButton,
           type: 'button',
           className: 'wt-title wt-title-btn',
           'data-wt-title-btn': 'true',
@@ -2856,6 +3263,24 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
             fontWeight: row.priority === 'high' && !done ? 650 : 400,
           },
         }, shownTitle || t('untitled')),
+      // 备注图标：**只在有备注时渲染**（无备注不显示、不占位），位置在标题之后、小字组之前。
+      // 点它 = 展开/收起行下方的只读备注；要编辑再点备注正文（或行尾「添加备注」）。
+      hasNotes && !titleEditing
+        ? React.createElement('button', {
+          key: 'notes-icon',
+          type: 'button',
+          className: `wt-icon-btn wt-notes-btn${inlineNotesOpen ? ' is-open' : ''}`,
+          'data-wt-notes-icon': 'true',
+          'aria-label': t('notesLabel'),
+          'aria-expanded': inlineNotesOpen,
+          'aria-controls': `wt-notes-${row.id}`,
+          title: inlineNotesOpen ? t('notesClose') : t('notesEdit'),
+          onClick: () => {
+            setInlineNotesOpen((open) => !open);
+            setNotesEditing(false);
+          },
+        }, React.createElement(IconNote, { key: 'i' }))
+        : null,
       // 来源 / 「已过期」chip 都在小字组里，标题列不再放胶囊
       titleError
         ? React.createElement('span', {
@@ -2883,6 +3308,29 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       className: `wt-actions${confirming ? ' is-armed' : ''}`,
       'data-wt-actions': 'true',
     }, [
+      // 轻入口：**只在没有内容时**出现在行尾（有内容时用进度 chip / 备注图标进入，不挤常驻区）。
+      !subtaskTotal
+        ? React.createElement('button', {
+          key: 'add-subtask',
+          type: 'button',
+          className: 'wt-icon-btn',
+          'data-wt-subtask-add-action': 'true',
+          title: t('subtaskAddLabel'),
+          'aria-label': t('subtaskAddLabel'),
+          onClick: () => { setSubtasksOpen(true); setSubtaskAdding(true); setSubtaskError(null); },
+        }, React.createElement(IconList, { key: 'i' }))
+        : null,
+      !hasNotes
+        ? React.createElement('button', {
+          key: 'add-notes',
+          type: 'button',
+          className: 'wt-icon-btn',
+          'data-wt-notes-add-action': 'true',
+          title: t('notesAdd'),
+          'aria-label': t('notesAdd'),
+          onClick: startNotesEdit,
+        }, React.createElement(IconNote, { key: 'i' }))
+        : null,
       // 标题单击改成行内编辑之后，完整表单（备注 / 日期 / 优先级 / 项目）从这里进
       React.createElement('button', {
         key: 'details',
@@ -2907,12 +3355,263 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       }, confirming ? t('confirmDelete') : React.createElement(IconTrash, { key: 'i' })),
     ]),
   ]);
+
+  // 展开/收起会改变行的行高：重新量一次换行（行宽没变，但保持与标题变化同一条测量路径）。
+  React.useLayoutEffect(() => {
+    if (!titleElRef.current) return;
+    scheduleMeasure();
+  }, [subtasksOpen, inlineNotesOpen, scheduleMeasure]);
+
+  const subtaskItem = (item, index) => React.createElement('li', {
+    key: item.id,
+    role: 'listitem',
+    className: `wt-sub-item${item.done ? ' is-done' : ''}`,
+    'data-wt-subtask-id': item.id,
+    draggable: true,
+    title: t('subtaskHint'),
+    onDragStart: (event) => {
+      subtaskDragRef.current = item.id;
+      setSubtaskDragId(item.id);
+      try {
+        event.dataTransfer?.setData('text/plain', item.id);
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+      } catch { /* 少数环境不允许写 dataTransfer，忽略 */ }
+    },
+    onDragOver: (event) => event.preventDefault?.(),
+    onDrop: (event) => { event.preventDefault?.(); dropSubtask(item.id); },
+    onDragEnd: () => { subtaskDragRef.current = null; setSubtaskDragId(null); },
+    style: subtaskDragId === item.id ? { opacity: 0.45 } : undefined,
+  }, [
+    React.createElement('input', {
+      key: 'check',
+      type: 'checkbox',
+      checked: item.done === true,
+      'data-wt-subtask-check': item.id,
+      'aria-label': t('subtaskCheck').replace('{title}', item.title),
+      onChange: () => toggleSubtask(item.id),
+    }),
+    subtaskEditingId === item.id
+      ? React.createElement('input', {
+        key: 'edit',
+        className: 'wt-input wt-sub-input',
+        value: subtaskEditDraft,
+        autoFocus: true,
+        maxLength: SUBTASK_TITLE_MAX,
+        'aria-label': t('subtaskEdit'),
+        'data-wt-subtask-input': item.id,
+        onChange: (event) => setSubtaskEditDraft(String(event?.target?.value ?? '')),
+        onBlur: commitSubtaskEdit,
+        onKeyDown: (event) => {
+          if (event?.key === 'Enter') {
+            event.preventDefault?.();
+            commitSubtaskEdit();
+          } else if (event?.key === 'Escape') {
+            event.preventDefault?.();
+            event.stopPropagation?.();
+            cancelSubtaskEdit();
+          }
+        },
+      })
+      : React.createElement('button', {
+        key: 'title',
+        type: 'button',
+        className: 'wt-sub-title',
+        'data-wt-subtask-title': item.id,
+        title: t('subtaskEdit'),
+        onClick: () => startSubtaskEdit(item),
+      }, item.title),
+    React.createElement('span', { key: 'sp', style: { flex: 1 } }),
+    React.createElement('button', {
+      key: 'up',
+      type: 'button',
+      className: 'wt-icon-btn wt-sub-move',
+      'data-wt-subtask-move': 'up',
+      disabled: index === 0,
+      title: t('subtaskMoveUp'),
+      'aria-label': t('subtaskMoveUp'),
+      onClick: () => moveSubtask(item.id, -1),
+    }, '↑'),
+    React.createElement('button', {
+      key: 'down',
+      type: 'button',
+      className: 'wt-icon-btn wt-sub-move',
+      'data-wt-subtask-move': 'down',
+      disabled: index === shownSubtasks.length - 1,
+      title: t('subtaskMoveDown'),
+      'aria-label': t('subtaskMoveDown'),
+      onClick: () => moveSubtask(item.id, 1),
+    }, '↓'),
+    React.createElement('button', {
+      key: 'del',
+      type: 'button',
+      className: 'wt-icon-btn wt-icon-btn-danger wt-sub-del',
+      'data-wt-subtask-delete': item.id,
+      title: t('subtaskDelete'),
+      'aria-label': `${t('subtaskDelete')}：${item.title}`,
+      onClick: () => removeSubtask(item.id),
+    }, '×'),
+  ]);
+
+  const subtaskPanel = subtasksOpen
+    ? React.createElement('div', {
+      key: 'subtasks',
+      className: 'wt-sub-panel',
+      id: `wt-sub-${row.id}`,
+      'data-wt-subpanel': 'true',
+    }, [
+      React.createElement('div', { key: 'head', className: 'wt-sub-head' }, [
+        React.createElement('span', { key: 'l', className: 'wt-sub-head-title' }, t('subtaskAddLabel').replace(/^＋\s*/, '')),
+        React.createElement('span', { key: 'n' }, `${subtaskDone}/${subtaskTotal}`),
+        React.createElement('span', { key: 'sp', style: { flex: 1 } }),
+        React.createElement('span', { key: 'h', className: 'wt-sub-hint' }, t('subtaskHint')),
+      ]),
+      subtaskTotal
+        ? React.createElement('ul', {
+          key: 'list',
+          className: 'wt-sub-list',
+          role: 'list',
+          'aria-label': t('subtaskProgress').replace('{done}', String(subtaskDone)).replace('{total}', String(subtaskTotal)),
+        }, shownSubtasks.map(subtaskItem))
+        : React.createElement('div', { key: 'empty', className: 'wt-sub-empty' }, t('subtaskEmpty')),
+      subtaskAdding
+        ? React.createElement('div', { key: 'add', className: 'wt-sub-add-row' }, [
+          React.createElement('input', {
+            key: 'in',
+            className: 'wt-input wt-sub-input',
+            value: subtaskDraft,
+            autoFocus: true,
+            maxLength: SUBTASK_TITLE_MAX,
+            placeholder: t('subtaskPlaceholder'),
+            'aria-label': t('subtaskPlaceholder'),
+            'data-wt-subtask-new': 'true',
+            onChange: (event) => setSubtaskDraft(String(event?.target?.value ?? '')),
+            onKeyDown: (event) => {
+              if (event?.key === 'Enter') {
+                event.preventDefault?.();
+                addSubtask();
+              } else if (event?.key === 'Escape') {
+                event.preventDefault?.();
+                event.stopPropagation?.();
+                setSubtaskAdding(false);
+                setSubtaskDraft('');
+              }
+            },
+          }),
+          React.createElement('button', {
+            key: 'ok', type: 'button', className: 'wt-btn', onClick: addSubtask,
+          }, t('add')),
+        ])
+        : (subtaskTotal < SUBTASK_MAX
+          ? React.createElement('button', {
+            key: 'add-btn',
+            type: 'button',
+            className: 'wt-link wt-sub-add',
+            'data-wt-subtask-add': 'true',
+            onClick: () => { setSubtaskAdding(true); setSubtaskError(null); },
+          }, t('subtaskAdd'))
+          : React.createElement('div', { key: 'limit', className: 'wt-sub-hint' }, t('subtaskLimit'))),
+      subtaskError
+        ? React.createElement('div', { key: 'err', className: 'wt-sub-error', role: 'status' }, subtaskError)
+        : null,
+    ])
+    : null;
+
+  const notesPanel = inlineNotesOpen
+    ? React.createElement('div', {
+      key: 'notes',
+      className: 'wt-notes-panel',
+      id: `wt-notes-${row.id}`,
+      'data-wt-notes-panel': 'true',
+    }, [
+      React.createElement('div', { key: 'head', className: 'wt-notes-head' }, [
+        React.createElement('span', { key: 'l' }, t('notesLabel')),
+        React.createElement('span', { key: 'sp', style: { flex: 1 } }),
+        notesEditing
+          ? React.createElement('span', {
+            key: 'n', className: 'wt-notes-count',
+          }, t('notesCount').replace('{count}', String(notesDraft.length)).replace('{max}', String(NOTES_MAX)))
+          : null,
+        notesEditing
+          ? React.createElement('button', {
+            key: 'save', type: 'button', className: 'wt-btn', 'data-wt-notes-save': 'true', onClick: commitNotes,
+          }, t('notesSave'))
+          : React.createElement('button', {
+            key: 'edit', type: 'button', className: 'wt-btn', 'data-wt-notes-edit': 'true', onClick: startNotesEdit,
+          }, t('notesEdit')),
+        React.createElement('button', {
+          key: 'close',
+          type: 'button',
+          className: 'wt-icon-btn',
+          'aria-label': t('notesClose'),
+          title: t('notesClose'),
+          onClick: () => { setInlineNotesOpen(false); setNotesEditing(false); },
+        }, React.createElement(IconClose, { key: 'i' })),
+      ]),
+      notesEditing
+        ? React.createElement('textarea', {
+          key: 'ta',
+          className: 'wt-input wt-notes-textarea',
+          'data-wt-notes-input': 'true',
+          rows: 4,
+          maxLength: NOTES_MAX,
+          autoFocus: true,
+          value: notesDraft,
+          'aria-label': t('notesLabel'),
+          placeholder: t('notesPlaceholder'),
+          onChange: (event) => setNotesDraft(String(event?.target?.value ?? '')),
+          onBlur: commitNotes,
+          onKeyDown: (event) => {
+            if (event?.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault?.();
+              commitNotes();
+            } else if (event?.key === 'Escape') {
+              event.preventDefault?.();
+              event.stopPropagation?.();
+              cancelNotes();
+            }
+          },
+        })
+        : React.createElement('div', {
+          key: 'view',
+          className: 'wt-notes-view',
+          'data-wt-notes-view': 'true',
+          role: 'button',
+          tabIndex: 0,
+          title: t('notesEdit'),
+          onClick: startNotesEdit,
+          onKeyDown: (event) => {
+            if (event?.key === 'Enter' || event?.key === ' ') {
+              event.preventDefault?.();
+              startNotesEdit();
+            }
+          },
+        }, shownNotes),
+      notesError
+        ? React.createElement('div', { key: 'err', className: 'wt-sub-error', role: 'status' }, notesError)
+        : null,
+    ])
+    : null;
+
+  return React.createElement('div', {
+    className: 'wt-row-shell',
+    'data-wt-row-shell': row.id ?? '',
+    onKeyDown: handleExpandKeyDown,
+  }, [
+    rowNode,
+    (subtaskPanel || notesPanel)
+      ? React.createElement('div', {
+        key: 'expand',
+        className: 'wt-row-expand',
+        'data-wt-row-expand': 'true',
+      }, [subtaskPanel, notesPanel])
+      : null,
+  ]);
 });
 
 /* ------------------------------------------------------------------ *
  * 分组：空组整块不渲染，避免五个空标题堆在面板上
  * ------------------------------------------------------------------ */
-function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTodo, onRemove, onSave, onPriority, onDue, onTitle, onProject, projects, projectsTruncated, celebrate, drag }) {
+function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTodo, onRemove, onSave, onPriority, onDue, onTitle, onProject, onSubtasks, onNotes, projects, projectsTruncated, celebrate, drag }) {
   const list = asArray(items);
   if (!list.length) return null;
   return React.createElement('div', { style: { marginTop: 6 } }, [
@@ -2942,6 +3641,8 @@ function Group({ label, items, meta, closed, t, today, onToggleOpen, onToggleTod
       onDue,
       onTitle,
       onProject,
+      onSubtasks,
+      onNotes,
       projects,
       projectsTruncated,
       celebrate,
@@ -3764,6 +4465,19 @@ function WorkTodoPanel(props) {
     () => postJson('/update', { ref, project: project ?? null }),
     { quietError: true },
   ), [runWrite]);
+  /**
+   * 子待办：每次都发**完整数组**（`POST /worktodo/update {ref, subtasks}`），
+   * 由宿主整批校验+落盘；失败由行内回滚 + 温和提示收口（quietError）。
+   */
+  const handleSubtasks = React.useCallback((ref, subtasks) => runWrite(
+    () => postJson('/update', { ref, subtasks }),
+    { quietError: true },
+  ), [runWrite]);
+  /** 备注：`POST /worktodo/update {ref, notes}`；空值显式发 null（清空）。 */
+  const handleNotes = React.useCallback((ref, notes) => runWrite(
+    () => postJson('/update', { ref, notes: notes ?? null }),
+    { quietError: true },
+  ), [runWrite]);
 
   /** 把 dragId 挪到目标之前，得到新的完整顺序并落盘（manual 模式生效） */
 
@@ -4145,6 +4859,8 @@ function WorkTodoPanel(props) {
         onDue: handleDue,
         onTitle: handleTitle,
         onProject: handleProject,
+        onSubtasks: handleSubtasks,
+        onNotes: handleNotes,
         projects: projectOptions,
         projectsTruncated: Boolean(data?.projectsTruncated),
         celebrate,

@@ -3423,7 +3423,7 @@ await testAsync('双向换行：标题编辑变短后重新判定 —— 提交�
  *   - 每颗 chip 的宽度由内容决定；项目 chip 只有 max-width:96px（≈8 汉字）；
  *   - 有内容才渲染 chip，没内容就不占位（无来源 / 未过期 / 无项目时整颗消失）；
  *   - 相邻 chip 之间只有一个 META_CHIP_GAP_PX（6px）的 gap，没有固定空槽。
- * 顺序仍是 META_CHIP_ORDER = [日期][来源][已过期][项目]。
+ * 顺序仍是 META_CHIP_ORDER = [进度][日期][来源][已过期][项目]（进度 chip 有子待办才渲染）。
  *
  * 反向验证：把 .wt-meta 改回 grid 四列 / 给 chip 加回 96/44/44/96 的固定宽度
  * → 用例 1 必红（会断言 .wt-meta 是 flex、chip 上没有固定宽度、旧槽常量不存在）。
@@ -3461,8 +3461,8 @@ await testAsync('小字组紧凑：三项都有 / 只有日期 / 只有项目 �
     await settleList();
     const tree = renderPanel({ t: mkT() });
 
-    // 1) chip 顺序：日期 → 来源 → 已过期 → 项目；没有内容的 chip 不渲染（不是空槽）
-    eq(mod.META_CHIP_ORDER, ['date', 'source', 'overdue', 'project'], 'chip 顺序声明不变：');
+    // 1) chip 顺序：进度（有子待办才渲染）→ 日期 → 来源 → 已过期 → 项目；没有内容的 chip 不渲染（不是空槽）
+    eq(mod.META_CHIP_ORDER, ['subtasks', 'date', 'source', 'overdue', 'project'], 'chip 顺序声明包含进度 chip：');
     eq(metaChipKinds(tree, 'wt-all'), ['date', 'source', 'project'], '三项都有时按序渲染三颗 chip：');
     eq(metaChipKinds(tree, 'wt-date'), ['date'], '只有日期时只渲染日期 chip：');
     eq(metaChipKinds(tree, 'wt-proj'), ['project'], '只有项目时只渲染项目 chip：');
@@ -3617,9 +3617,9 @@ await testAsync('已过期标记：独立 chip，严格排在日期之后、来�
     // wt-1：日期 + 已过期 + 项目（人加的无来源）→ 顺序必须是 [date, overdue, project]
     eq(metaChipKinds(tree, 'wt-1'), ['date', 'overdue', 'project'],
       '已过期 chip 必须排在日期之后、项目之前：');
-    // 全有的行：日期 → 来源 → 已过期 → 项目（与 META_CHIP_ORDER 完全一致）
-    eq(metaChipKinds(tree, 'wt-overdue-all'), mod.META_CHIP_ORDER,
-      `四颗 chip 必须按 META_CHIP_ORDER 排列：${metaChipKinds(tree, 'wt-overdue-all').join(' | ')}`);
+    // 全有的行：日期 → 来源 → 已过期 → 项目（没有子待办时进度 chip 不渲染，不占位）
+    eq(metaChipKinds(tree, 'wt-overdue-all'), ['date', 'source', 'overdue', 'project'],
+      `四颗 chip 必须按序排列：${metaChipKinds(tree, 'wt-overdue-all').join(' | ')}`);
     eq(metaChipOf(tree, 'wt-overdue-all', 'source').props.title, '[sourceAgent]',
       '来源 chip 的完整文案仍在 title 里：');
     const dateBtn = dateBtnOf(tree, 'wt-1');
@@ -3771,10 +3771,13 @@ test('行尾操作：默认 opacity:0 + pointer-events:none；行 hover / focus-
   const actions = rowChild(tree, 'wt-1', 'wt-actions');
   eq(Boolean(actions), true, '行尾操作容器必须始终渲染：');
   const buttons = allNodes(actions).filter((n) => n.type === 'button');
-  eq(buttons.length, 2, `行尾必须恰好两个按钮（铅笔 + 删除），实际 ${buttons.length}：`);
+  // 无子待办 / 无备注的行：铅笔 + 删除 + 「＋子待办」「添加备注」两个轻入口
+  eq(buttons.length, 4, `无内容的行尾应有 4 个按钮（铅笔 + 删除 + 两个轻入口），实际 ${buttons.length}：`);
   eq(buttons.some((n) => n.props?.['data-wt-edit-details'] === 'true'), true, '铅笔（整单编辑）必须在行尾操作里：');
+  eq(buttons.some((n) => n.props?.['data-wt-subtask-add-action'] === 'true'), true, '「＋子待办」轻入口必须在行尾操作里：');
+  eq(buttons.some((n) => n.props?.['data-wt-notes-add-action'] === 'true'), true, '「添加备注」轻入口必须在行尾操作里：');
   eq(buttons.every((n) => n.props?.tabIndex !== -1 && n.props?.disabled !== true), true,
-    '两个按钮都必须留在 Tab 顺序里（不许 tabIndex:-1 / disabled）：');
+    '四个按钮都必须留在 Tab 顺序里（不许 tabIndex:-1 / disabled）：');
 });
 
 await testAsync('勾选完成的动效：挂 is-celebrating / wt-check-celebrate / 对勾描边，动画结束自己摘掉', async () => {
@@ -4200,6 +4203,350 @@ await testAsync('卸载：待刷新定时器会被清理（不留悬空回调）
     });
   } finally {
     clock.restore();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * 子待办（进度 chip / 行内清单 / 联动 / 拖拽与键盘排序）+ 备注（图标 / 展开 / 编辑）
+ *
+ * 反向验证：删掉父项→子项级联 → 联动用例红；删掉「全完成」轻提示 → 红；
+ * 把备注图标改成常驻（无备注也渲染）→ 红。
+ * ------------------------------------------------------------------ */
+
+const SUB_ROW_ID = 'wt-sub';
+const mkSubT = () => (key) => {
+  if (key === 'subtaskProgress') return '子待办 {done}/{total}';
+  if (key === 'notesCount') return '{count} / {max}';
+  return `[${key}]`;
+};
+const subRow = (extra = {}) => ({
+  id: SUB_ROW_ID,
+  title: '带子项的行',
+  notes: '第一行\n第二行',
+  status: 'pending',
+  priority: 'normal',
+  due: null,
+  dueTime: null,
+  project: null,
+  source: 'human',
+  createdAt: 7,
+  updatedAt: 7,
+  completedAt: null,
+  order: null,
+  subtasks: [
+    { id: 's1', title: '第一项', done: true, order: 0 },
+    { id: 's2', title: '第二项', done: false, order: 1 },
+    { id: 's3', title: '第三项', done: false, order: 2 },
+  ],
+  ...extra,
+});
+const pushSubRow = (row) => {
+  fakeListPayload.data.todos.push(row);
+  fakeListPayload.data.groups.later.push(row);
+};
+const popSubRow = (row) => {
+  fakeListPayload.data.todos = fakeListPayload.data.todos.filter((todo) => todo.id !== row.id);
+  fakeListPayload.data.groups.later = fakeListPayload.data.groups.later.filter((todo) => todo.id !== row.id);
+};
+const subNode = (tree, dataKey, value) => allNodes(tree)
+  .find((n) => (value === undefined ? n.props?.[dataKey] !== undefined : n.props?.[dataKey] === value)) ?? null;
+const progressOf = (tree, id = SUB_ROW_ID) => {
+  const row = rowNode(tree, id);
+  return row ? allNodes(row).find((n) => n.props?.['data-wt-subtask-progress'] === 'true') ?? null : null;
+};
+const notesIconOf = (tree, id = SUB_ROW_ID) => {
+  const row = rowNode(tree, id);
+  return row ? allNodes(row).find((n) => n.props?.['data-wt-notes-icon'] === 'true') ?? null : null;
+};
+
+await testAsync('子待办/备注：进度 chip 2/3 文案与 aria、无子待办不渲染、备注图标仅在有备注时出现、点开备注', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow({
+    subtasks: [
+      { id: 's1', title: '第一项', done: true, order: 0 },
+      { id: 's2', title: '第二项', done: true, order: 1 },
+      { id: 's3', title: '第三项', done: false, order: 2 },
+    ],
+  });
+  pushSubRow(fixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      // 无子待办的行：不渲染进度 chip（不占位）
+      eq(progressOf(tree, 'wt-1'), null, '没有子待办的行不许渲染进度 chip：');
+      eq(metaChipKinds(tree, 'wt-1').includes('subtasks'), false, '没有子待办时小字组里不许有进度 chip：');
+
+      const chip = progressOf(tree);
+      eq(Boolean(chip), true, '有子待办必须渲染进度 chip：');
+      eq(textOf(chip).includes('2/3'), true, `进度 chip 文案必须是 2/3：${textOf(chip)}`);
+      eq(chip.props['aria-label'], '子待办 2/3', 'aria-label 要带进度：');
+      eq(chip.props['aria-expanded'], false);
+      eq(metaChipKinds(tree, SUB_ROW_ID), ['subtasks'], '进度 chip 排在小字组最前：');
+
+      // 备注图标：有备注才渲染，且位置在标题之后、小字组之前
+      const icon = notesIconOf(tree);
+      eq(Boolean(icon), true, '有备注时标题之后必须有备注图标：');
+      eq(icon.props['aria-expanded'], false);
+      eq(notesIconOf(tree, 'wt-1'), null, '没有备注的行不许渲染备注图标（不占位）：');
+      eq(allNodes(rowChild(tree, SUB_ROW_ID, 'wt-row-main')).includes(icon), true, '备注图标必须在标题列里（标题之后、小字组之前）：');
+      eq(allNodes(rowChild(tree, SUB_ROW_ID, 'wt-meta')).includes(icon), false, '备注图标不许挤进小字组：');
+
+      // 点备注图标 → 行下方展开只读备注
+      eq(subNode(tree, 'data-wt-notes-panel'), null, '默认不展开备注：');
+      icon.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      const panel = allNodes(tree).find((n) => n.props?.['data-wt-notes-panel'] === 'true');
+      eq(Boolean(panel), true, '点备注图标必须展开备注区：');
+      const view = allNodes(panel).find((n) => n.props?.['data-wt-notes-view'] === 'true');
+      eq(textOf(view), '第一行\n第二行', '备注正文必须原样保留换行：');
+      eq(notesIconOf(tree).props['aria-expanded'], true, '展开后 aria-expanded 必须为 true：');
+
+      // 再点图标收起
+      notesIconOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(subNode(tree, 'data-wt-notes-panel'), null, '再点图标必须收起备注：');
+    });
+  } finally {
+    popSubRow(fixture);
+  }
+});
+
+await testAsync('点标题进入编辑态：同时展开备注（只读），Esc 取消不提交标题、备注仍在', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow();
+  pushSubRow(fixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      rowTitleBtnOf(tree, SUB_ROW_ID).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(Boolean(rowTitleInputOf(tree, SUB_ROW_ID)), true, '点标题必须进入行内标题编辑：');
+      const panel = allNodes(tree).find((n) => n.props?.['data-wt-notes-panel'] === 'true');
+      eq(Boolean(panel), true, '点标题必须同时展开备注区（用户明确要求）：');
+      eq(Boolean(allNodes(panel).find((n) => n.props?.['data-wt-notes-view'] === 'true')), true,
+        '标题点击展开的备注是只读展示：');
+      eq(Boolean(allNodes(panel).find((n) => n.props?.['data-wt-notes-input'] === 'true')), false,
+        '还没点备注正文，不该直接进入编辑：');
+
+      const before = fetchCalls.length;
+      rowTitleInputOf(tree, SUB_ROW_ID).props.onKeyDown({ key: 'Escape', preventDefault() {}, stopPropagation() {} });
+      tree = renderPanel({ t: mkSubT() });
+      eq(Boolean(rowTitleInputOf(tree, SUB_ROW_ID)), false, 'Esc 必须退出标题编辑：');
+      eq(allNodes(tree).some((n) => n.props?.['data-wt-notes-panel'] === 'true'), true,
+        '第一次 Esc 只收标题、备注区保持展开（依次收起）：');
+      eq(fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/update')).length, 0,
+        'Esc 取消绝不能提交标题：');
+    });
+  } finally {
+    popSubRow(fixture);
+  }
+});
+
+await testAsync('备注编辑：只读 → textarea；Cmd/Ctrl+Enter 保存 POST {ref, notes}；Esc 取消不提交', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow();
+  pushSubRow(fixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      notesIconOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      allNodes(tree).find((n) => n.props?.['data-wt-notes-view'] === 'true').props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      let input = allNodes(tree).find((n) => n.props?.['data-wt-notes-input'] === 'true');
+      eq(Boolean(input), true, '点备注正文必须进入编辑（textarea）：');
+      eq(input.props.rows >= 3, true, '备注编辑必须是多行 textarea：');
+      eq(input.props.maxLength, mod.NOTES_MAX, 'textarea 必须带上限：');
+
+      input.props.onChange({ target: { value: '改过的备注\n第二行' } });
+      tree = renderPanel({ t: mkSubT() });
+      input = allNodes(tree).find((n) => n.props?.['data-wt-notes-input'] === 'true');
+      input.props.onKeyDown({ key: 'Enter', metaKey: true, preventDefault() {} });
+      await settleList();
+      const posts = fetchCalls.filter((c) => c.url.includes('/worktodo/update')).map((c) => JSON.parse(c.options.body));
+      eq(posts[posts.length - 1], { ref: SUB_ROW_ID, notes: '改过的备注\n第二行' }, '保存必须打 /update {ref, notes}：');
+
+      // Esc 取消：不提交（备注区此时仍开着，直接点正文进入编辑）
+      tree = renderPanel({ t: mkSubT() });
+      allNodes(tree).find((n) => n.props?.['data-wt-notes-view'] === 'true').props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      input = allNodes(tree).find((n) => n.props?.['data-wt-notes-input'] === 'true');
+      input.props.onChange({ target: { value: '不要保存' } });
+      const before = fetchCalls.length;
+      input = allNodes(renderPanel({ t: mkSubT() })).find((n) => n.props?.['data-wt-notes-input'] === 'true');
+      input.props.onKeyDown({ key: 'Escape', preventDefault() {}, stopPropagation() {} });
+      eq(fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/update')).length, 0,
+        'Esc 取消绝不能保存备注：');
+    });
+  } finally {
+    popSubRow(fixture);
+  }
+});
+
+await testAsync('子待办清单：勾选乐观更新 2/3 → 3/3；最后一条不自动完成父项，只给可点轻提示', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow();
+  pushSubRow(fixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      progressOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      const panel = allNodes(tree).find((n) => n.props?.['data-wt-subpanel'] === 'true');
+      eq(Boolean(panel), true, '点进度 chip 必须展开子待办清单：');
+      eq(allNodes(panel).find((n) => n.props?.role === 'list') !== null, true, '清单要有 role=list：');
+      eq(allNodes(panel).filter((n) => n.props?.role === 'listitem').length, 3, '每项 role=listitem：');
+
+      // 勾第二项（s2）：乐观 2/3，并提交完整数组
+      allNodes(tree).find((n) => n.props?.['data-wt-subtask-check'] === 's2').props.onChange();
+      tree = renderPanel({ t: mkSubT() });
+      eq(progressOf(tree).props['aria-label'], '子待办 2/3', '勾选后进度必须乐观更新到 2/3：');
+      let posts = fetchCalls.filter((c) => c.url.includes('/worktodo/update')).map((c) => JSON.parse(c.options.body));
+      eq(posts[posts.length - 1].ref, SUB_ROW_ID);
+      eq(posts[posts.length - 1].subtasks.map((item) => [item.id, item.done, item.order]),
+        [['s1', true, 0], ['s2', true, 1], ['s3', false, 2]], '必须提交完整数组（含调好的 order）：');
+
+      // 勾最后一项（s3）：3/3，但父项仍未完成；出现轻提示
+      allNodes(tree).find((n) => n.props?.['data-wt-subtask-check'] === 's3').props.onChange();
+      await settleList();
+      tree = renderPanel({ t: mkSubT() });
+      eq(progressOf(tree).props['aria-label'], '子待办 3/3');
+      eq(allNodes(rowNode(tree, SUB_ROW_ID)).some((n) => n.props?.['data-wt-check-hit'] !== undefined
+        && String(n.props?.className ?? '').includes('wt-check-done')), false, '子项全完成不许自动勾父项：');
+      const prompt = allNodes(tree).find((n) => n.props?.['data-wt-subtask-prompt'] === 'true');
+      eq(Boolean(prompt), true, '最后一条子项完成后必须出现「勾掉这条？」轻提示：');
+      eq(textOf(prompt).includes('[subtaskAllDone]'), true);
+
+      // 点提示 = 完成父项（/status）
+      const before = fetchCalls.length;
+      prompt.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      const calls = fetchCalls.slice(before).map((c) => c.url);
+      eq(calls.some((url) => url.includes('/worktodo/status')), true, '点轻提示必须走 /status 完成父项：');
+      eq(allNodes(tree).some((n) => n.props?.['data-wt-subtask-prompt'] === 'true'), false, '点完提示必须消失：');
+    });
+  } finally {
+    popSubRow(fixture);
+  }
+});
+
+await testAsync('子待办排序：上/下移动按钮与拖拽都会改 order 并提交完整数组', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow({
+    subtasks: [
+      { id: 's1', title: '第一项', done: false, order: 0 },
+      { id: 's2', title: '第二项', done: false, order: 1 },
+      { id: 's3', title: '第三项', done: false, order: 2 },
+    ],
+  });
+  pushSubRow(fixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      progressOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+
+      // 键盘可达的上/下移动：s1 ↓ → s2,s1,s3
+      const itemOf = (id) => allNodes(tree).find((n) => n.props?.['data-wt-subtask-id'] === id);
+      allNodes(itemOf('s1')).find((n) => n.props?.['data-wt-subtask-move'] === 'down').props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      let posts = fetchCalls.filter((c) => c.url.includes('/worktodo/update')).map((c) => JSON.parse(c.options.body));
+      eq(posts[posts.length - 1].subtasks.map((item) => item.id), ['s2', 's1', 's3'], '下移必须落盘新顺序：');
+      eq(posts[posts.length - 1].subtasks.map((item) => item.order), [0, 1, 2]);
+
+      // 拖拽 s3 到 s1 之前 → s2,s3,s1
+      const dragged = allNodes(tree).find((n) => n.props?.['data-wt-subtask-id'] === 's3');
+      dragged.props.onDragStart({ dataTransfer: { setData() {}, effectAllowed: '' } });
+      const target = allNodes(tree).find((n) => n.props?.['data-wt-subtask-id'] === 's1');
+      target.props.onDrop({ preventDefault() {} });
+      tree = renderPanel({ t: mkSubT() });
+      posts = fetchCalls.filter((c) => c.url.includes('/worktodo/update')).map((c) => JSON.parse(c.options.body));
+      eq(posts[posts.length - 1].subtasks.map((item) => item.id), ['s2', 's3', 's1'], '拖拽必须改 order 并提交：');
+    });
+  } finally {
+    popSubRow(fixture);
+  }
+});
+
+await testAsync('子待办新增：Enter 连加（输入框保持打开），追加到末尾并提交', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow({
+    subtasks: [{ id: 's1', title: '第一项', done: false, order: 0 }],
+  });
+  pushSubRow(fixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      progressOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      allNodes(tree).find((n) => n.props?.['data-wt-subtask-add'] === 'true').props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      let input = allNodes(tree).find((n) => n.props?.['data-wt-subtask-new'] === 'true');
+      eq(Boolean(input), true, '点「＋添加子待办」必须出现输入框：');
+      input.props.onChange({ target: { value: '新增项' } });
+      input = allNodes(renderPanel({ t: mkSubT() })).find((n) => n.props?.['data-wt-subtask-new'] === 'true');
+      input.props.onKeyDown({ key: 'Enter', preventDefault() {} });
+      tree = renderPanel({ t: mkSubT() });
+      const posts = fetchCalls.filter((c) => c.url.includes('/worktodo/update')).map((c) => JSON.parse(c.options.body));
+      const last = posts[posts.length - 1].subtasks;
+      eq(last.map((item) => item.title), ['第一项', '新增项'], '新项必须追加到末尾：');
+      eq(last[1].done, false);
+      eq(last[1].order, 1);
+      eq(typeof last[1].id === 'string' && last[1].id.startsWith('st-'), true, '新项必须有独立 id：');
+      eq(Boolean(allNodes(tree).find((n) => n.props?.['data-wt-subtask-new'] === 'true')), true,
+        'Enter 连加时输入框必须保持打开：');
+    });
+  } finally {
+    popSubRow(fixture);
+  }
+});
+
+await testAsync('子待办写失败：回滚到点击前的数组 + 温和提示（不含原始异常串）', async () => {
+  document.visibilityState = 'visible';
+  await settleList();
+  const fixture = subRow();
+  pushSubRow(fixture);
+  const realFetch = globalThis.fetch;
+  const failingFetch = (url, options) => {
+    if (String(url).includes('/worktodo/update')) {
+      fetchCalls.push({ url: String(url), options });
+      const detail = 'HTTP 500 subtask boom';
+      return Promise.resolve({
+        ok: false,
+        status: 500,
+        json: () => Promise.resolve({ ok: false, error: detail }),
+        text: () => Promise.resolve(detail),
+      });
+    }
+    return realFetch(url, options);
+  };
+  globalThis.fetch = failingFetch;
+  globalThis.window.fetch = failingFetch;
+  try {
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      progressOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      allNodes(tree).find((n) => n.props?.['data-wt-subtask-check'] === 's2').props.onChange();
+      tree = renderPanel({ t: mkSubT() });
+      eq(progressOf(tree).props['aria-label'], '子待办 2/3', '失败前先乐观更新：');
+      await settleList();
+      tree = renderPanel({ t: mkSubT() });
+      eq(progressOf(tree).props['aria-label'], '子待办 1/3', '写失败必须回滚到 1/3：');
+      const text = textOf(allNodes(tree).find((n) => n.props?.['data-wt-subpanel'] === 'true'));
+      eq(text.includes('[subtaskSaveFailed]'), true, `失败要给温和提示：${text}`);
+      eq(text.includes('HTTP 500'), false, '提示里不许出现原始异常串：');
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.window.fetch = realFetch;
+    popSubRow(fixture);
   }
 });
 

@@ -24,8 +24,12 @@ export const SOURCES = ['human', 'agent', 'session'];
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** 标题长度上限：够写清一件事，又不至于把面板撑爆。 */
 const TITLE_MAX = 200;
-/** 备注长度上限。 */
-const NOTES_MAX = 2000;
+/** 备注长度上限（纯文本，保留内部换行）。 */
+export const NOTES_MAX = 4000;
+/** 一条父项最多带多少条子待办：够列检查清单，又不至于把 /list 撑大。 */
+export const SUBTASK_MAX = 50;
+/** 子待办标题上限：与父标题同口径，UI 建议一行内。 */
+export const SUBTASK_TITLE_MAX = 200;
 /** 项目名长度上限。 */
 const PROJECT_MAX = 60;
 
@@ -123,13 +127,94 @@ export function normalizeTitle(value) {
   return title;
 }
 
-/** 备注：允许空；允许 undefined（表示不改）。 */
+/**
+ * 备注：纯文本、保留内部换行；空/null/undefined 都归为 null（「没有备注」只有一种表示）。
+ * 写入严格：超过上限直接报错，绝不静默截断用户文字。
+ */
 export function normalizeNotes(value) {
-  if (value === undefined || value === null) return '';
+  if (value === undefined || value === null) return null;
   if (typeof value !== 'string') throw new WorkTodoError('bad-notes', '备注必须是文本');
   const notes = value.trim();
+  if (!notes) return null;
   if (notes.length > NOTES_MAX) throw new WorkTodoError('notes-too-long', `备注过长（上限 ${NOTES_MAX} 字）`);
   return notes;
+}
+
+/**
+ * 生成子待办 id：形如 `st-<base36 时间>-<4 位随机>`，与父项 id 同一套做法。
+ * 单条父项内唯一即可（内嵌数组，不需要全局唯一），但实际也很难撞。
+ * @param {number} [now]
+ * @param {() => number} [rand]
+ * @returns {string}
+ */
+export function newSubtaskId(now = Date.now(), rand = Math.random) {
+  const t = Math.floor(now).toString(36);
+  const r = Math.floor(rand() * 36 ** 4).toString(36).padStart(4, '0');
+  return `st-${t}-${r}`;
+}
+
+/**
+ * 子待办数组：写入路径的严格校验 + 归一化。
+ *
+ * 规则（用户拍板的规格）：
+ *   - 必须是数组（null/undefined = 清空，返回 []）；最多 SUBTASK_MAX 条；
+ *   - 每项 title 必须是非空字符串（trim 后 ≤ SUBTASK_TITLE_MAX）；
+ *   - done 必须是布尔（缺省按 false 补）；order 必须是数字（缺省按数组下标补）；
+ *   - id 缺失/重复时自动补一个独立 id；只保留 {id,title,done,order}，不存日期/优先级/项目；
+ *   - 返回前按 order 稳定排序并重编号为 0..n-1（数组顺序是唯一真相）。
+ * 任何一项不合法 → 整批拒绝，绝不部分写入。
+ * @param {unknown} value
+ * @returns {{id: string, title: string, done: boolean, order: number}[]}
+ */
+export function normalizeSubtasks(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new WorkTodoError('bad-subtasks', '子待办必须是列表');
+  if (value.length > SUBTASK_MAX) {
+    throw new WorkTodoError('subtasks-too-many', `子待办最多 ${SUBTASK_MAX} 条`);
+  }
+  const used = new Set();
+  const items = value.map((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new WorkTodoError('bad-subtask', '子待办格式不对');
+    }
+    const title = typeof item.title === 'string' ? item.title.trim() : '';
+    if (!title) throw new WorkTodoError('empty-subtask-title', '子待办标题不能为空');
+    if (title.length > SUBTASK_TITLE_MAX) {
+      throw new WorkTodoError('subtask-title-too-long', `子待办标题过长（上限 ${SUBTASK_TITLE_MAX} 字）`);
+    }
+    if (item.done !== undefined && item.done !== null && typeof item.done !== 'boolean') {
+      throw new WorkTodoError('bad-subtask-done', '子待办的完成状态必须是 true / false');
+    }
+    if (item.order !== undefined && item.order !== null && !Number.isFinite(item.order)) {
+      throw new WorkTodoError('bad-subtask-order', '子待办的顺序必须是数字');
+    }
+    let id = typeof item.id === 'string' ? item.id.trim() : '';
+    // 缺 id / id 重复都补一个新的：同一父项内的 React key 与后续按 id 改/删必须唯一
+    while (!id || used.has(id)) id = newSubtaskId();
+    used.add(id);
+    return {
+      id,
+      title,
+      done: item.done === true,
+      order: Number.isFinite(item.order) ? Number(item.order) : index,
+    };
+  });
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => (a.item.order - b.item.order) || (a.index - b.index))
+    .map(({ item }, order) => ({ ...item, order }));
+}
+
+/**
+ * 派生进度（不落库，避免「总数」与「数组」两处真相）。
+ * @param {object} record
+ * @returns {{total: number, done: number, allDone: boolean}}
+ */
+export function subtaskProgress(record) {
+  const list = Array.isArray(record?.subtasks) ? record.subtasks : [];
+  const total = list.length;
+  const done = list.filter((item) => item?.done === true).length;
+  return { total, done, allDone: total > 0 && done === total };
 }
 
 /** 项目：允许空；去空白。 */
@@ -261,6 +346,7 @@ export function createRecord(input = {}, { now = Date.now(), source = 'human', i
     id: id ?? newId(now),
     title: normalizeTitle(input.title),
     notes: normalizeNotes(input.notes),
+    subtasks: normalizeSubtasks(input.subtasks),
     status,
     priority: normalizePriority(input.priority) ?? 'none',
     due,
@@ -291,6 +377,7 @@ export function patchRecord(record, patch = {}, now = Date.now()) {
 
   if (take('title')) { next.title = normalizeTitle(patch.title); touched = true; }
   if (take('notes')) { next.notes = normalizeNotes(patch.notes); touched = true; }
+  if (take('subtasks')) { next.subtasks = normalizeSubtasks(patch.subtasks); touched = true; }
   if (take('project')) { next.project = normalizeProject(patch.project); touched = true; }
   if (take('priority')) { next.priority = normalizePriority(patch.priority) ?? next.priority; touched = true; }
   if (take('due')) {
@@ -305,11 +392,16 @@ export function patchRecord(record, patch = {}, now = Date.now()) {
   }
 
   const status = normalizeStatus(patch.status);
-  if (status && status !== next.status) {
-    next.status = status;
-    next.completedAt = status === 'completed' ? now : null;
-    touched = true;
-  } else if (status) {
+  if (status) {
+    if (status !== next.status) {
+      next.status = status;
+      next.completedAt = status === 'completed' ? now : null;
+    }
+    // 联动（用户拍板）：勾父项 → 子项全部完成；取消父项 → 只取消父项，子项保持原状。
+    // 做成 patchRecord 的纯函数规则，面板勾选、/status 路由与 agent 工具走的是同一条路径。
+    if (status === 'completed' && Array.isArray(next.subtasks) && next.subtasks.some((item) => item.done !== true)) {
+      next.subtasks = next.subtasks.map((item) => ({ ...item, done: true }));
+    }
     // 状态没变也要算「被指定过」，否则纯 status 的调用会被当成空 patch
     touched = true;
   }
