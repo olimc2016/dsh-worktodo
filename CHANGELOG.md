@@ -2,6 +2,23 @@
 
 > 本文提到的 `tools/`、`docs/` 等路径都在**仓库**里，不在 npm 发布包内：<https://github.com/olimc2016/dsh-worktodo>
 
+## 0.2.19
+
+### 修复：Windows 上自动更新必然失败（替换 dsh-worktodo 失败：EPERM ... rename）
+
+真机截图（v0.2.16 / Windows）报：
+`更新失败：替换 dsh-worktodo 失败：EPERM: operation not permitted, rename 'C:\Users\…\.dsh\profil…`。
+
+- **根因**：独立安装器被 host 以 `cwd = <target>/tools`（也就是**要被替换的目录内部**）拉起；
+  Windows 不允许 rename「任何进程当前目录的祖先目录」（POSIX 允许），所以备份/替换的第一次
+  `rename` 直接 `EPERM`，重试 10 次也没用（不是瞬时占用）。这就是「自动更新永远失败」的真因。
+- **修复**：
+  - 宿主：`buildApplyInstallerSpec` 的 `cwd` 改成系统临时目录（中性目录，不属于任何被替换路径）；
+  - 安装器：入口解析完绝对路径后先 `process.chdir(tmpdir())`，即使被旧版宿主以旧 cwd 拉起也能自保；
+  - 回归断言：`smoke-host` 钉住「安装器 cwd 必须是 tmpdir，且不能落在 target/profile 里」。
+- **注意**：已经停在 0.2.16 及更早的 Windows 用户，**这一次**需要用「卸载 → 安装 @latest」手动跨过去
+  （旧版本的安装器本身有 bug，没法自动修自己）；装到 0.2.19 之后，后续自动更新就正常了。
+
 ## 0.2.18
 
 ### 更新体验：手动更新兜底 + 失败不再只有四个字

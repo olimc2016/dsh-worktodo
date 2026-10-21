@@ -2207,6 +2207,10 @@ await test('独立安装器：spawn 规格必须是 detached + stdio ignore + un
   eq(spec.options.stdio, 'ignore', '必须 stdio:ignore（不继承宿主管道）：');
   eq(spec.unref, true, '必须显式 unref（宿主不等待它退出）：');
   eq(spec.options.windowsHide, true, 'Windows 上不弹窗：');
+  // 回归（0.2.16 Windows 真机 EPERM）：cwd 绝不能落在被替换的 target 目录里，
+  // 否则 Windows 拒绝 rename「进程当前目录的祖先」→「替换 dsh-worktodo 失败：EPERM」。
+  eq(spec.options.cwd, tmpdir(), '安装器 cwd 必须是中性临时目录（不能在被替换目录内）：');
+  eq(String(spec.options.cwd).startsWith('/tmp/profile'), false, '安装器 cwd 不能是 profile/target 路径：');
   eq(spec.command, '/usr/local/bin/node', '用 node 可执行文件跑安装器：');
   eq(spec.args[0], resolveApplyUpdatePath({ env: {} }), '第一个参数是我们自己的安装器脚本：');
   for (const key of ['--staged', '--target', '--version', '--state', '--log']) {

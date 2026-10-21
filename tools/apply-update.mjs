@@ -38,6 +38,7 @@ import {
   realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const PACKAGE_NAME = 'dsh-worktodo';
@@ -526,6 +527,10 @@ async function main() {
   const stateFile = args.state ? resolve(args.state) : '';
   const logFile = args.log ? resolve(args.log) : join(dirname(stateFile || process.cwd()), 'apply.log');
   const resultFile = stateFile ? join(dirname(stateFile), RESULT_FILENAME) : join(process.cwd(), RESULT_FILENAME);
+  // 关键（Windows）：路径都解析成绝对路径后，立刻离开「即将被替换的目录」。
+  // 旧宿主把安装器的 cwd 设成 <target>/tools；Windows 上 rename 一个进程当前目录的祖先目录会 EPERM
+  //（POSIX 不限制，所以这个 bug 只在 Windows 真机复现）。这里再兜一层：即使宿主是旧版也不怕。
+  try { process.chdir(tmpdir()); } catch { /* 退不出去也不影响后续用绝对路径 */ }
   const log = createLogger(logFile);
   const startedAt = Date.now();
   log.step(`安装器启动 pid=${process.pid} version=${version || '（缺失）'}`);
