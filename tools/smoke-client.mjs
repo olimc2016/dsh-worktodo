@@ -4217,6 +4217,7 @@ const SUB_ROW_ID = 'wt-sub';
 const mkSubT = () => (key) => {
   if (key === 'subtaskProgress') return '子待办 {done}/{total}';
   if (key === 'notesCount') return '{count} / {max}';
+  if (key === 'collapsePanel') return '收起';
   return `[${key}]`;
 };
 const subRow = (extra = {}) => ({
@@ -4257,6 +4258,16 @@ const progressOf = (tree, id = SUB_ROW_ID) => {
 const notesIconOf = (tree, id = SUB_ROW_ID) => {
   const row = rowNode(tree, id);
   return row ? allNodes(row).find((n) => n.props?.['data-wt-notes-icon'] === 'true') ?? null : null;
+};
+/** 在指定行里找某个开关/入口（避免误取别的行的同名按钮）。 */
+const rowAction = (tree, id, dataKey) => {
+  const row = rowNode(tree, id);
+  return row ? allNodes(row).find((n) => n.props?.[dataKey] === 'true') ?? null : null;
+};
+/** 展开区在行体之外（.wt-row-shell 里），收起按钮要按 shell 找。 */
+const shellAction = (tree, id, dataKey) => {
+  const shell = allNodes(tree).find((n) => n.props?.['data-wt-row-shell'] === id);
+  return shell ? allNodes(shell).find((n) => n.props?.[dataKey] === 'true') ?? null : null;
 };
 
 await testAsync('子待办/备注：进度 chip 2/3 文案与 aria、无子待办不渲染、备注图标仅在有备注时出现、点开备注', async () => {
@@ -4547,6 +4558,232 @@ await testAsync('子待办写失败：回滚到点击前的数组 + 温和提示
     globalThis.fetch = realFetch;
     globalThis.window.fetch = realFetch;
     popSubRow(fixture);
+  }
+});
+
+await testAsync('展开/收起开关（双向）：进度 chip 再点必须收起，aria-expanded 与 ▾/▴ 暗示同步', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow();
+  pushSubRow(fixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      const chip0 = progressOf(tree);
+      eq(chip0.props['aria-expanded'], false, '默认收起：');
+      eq(chip0.props['data-wt-subtask-expanded'], 'false', '收起态 data 标记：');
+      eq(chip0.props.className.includes('is-open'), false, '收起态 chip 不许高亮：');
+      eq(Boolean(allNodes(chip0).find((n) => n.props?.['data-wt-chip-caret'] === 'down')), true,
+        '收起态要有 ▾ 展开暗示：');
+
+      chip0.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(progressOf(tree).props['aria-expanded'], true, '点 chip → 展开，aria-expanded=true：');
+      eq(Boolean(subNode(tree, 'data-wt-subpanel', 'true')), true, '点 chip → 子待办清单出现：');
+      eq(progressOf(tree).props.className.includes('is-open'), true, '展开态 chip 必须高亮：');
+      eq(Boolean(allNodes(progressOf(tree)).find((n) => n.props?.['data-wt-chip-caret'] === 'up')), true,
+        '展开态要有 ▴ 收起暗示：');
+
+      progressOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(Boolean(subNode(tree, 'data-wt-subpanel', 'true')), false, '再点 chip 必须收起（不能只开不收）：');
+      eq(progressOf(tree).props['aria-expanded'], false, '收起后 aria-expanded 必须回到 false：');
+
+      const icon0 = notesIconOf(tree);
+      eq(icon0.props['aria-expanded'], false, '备注默认收起：');
+      icon0.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(notesIconOf(tree).props['aria-expanded'], true, '点备注图标 → 展开：');
+      eq(Boolean(subNode(tree, 'data-wt-notes-panel', 'true')), true);
+      notesIconOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(notesIconOf(tree).props['aria-expanded'], false, '再点备注图标必须收起：');
+      eq(subNode(tree, 'data-wt-notes-panel', 'true'), null);
+    });
+  } finally {
+    popSubRow(fixture);
+  }
+});
+
+await testAsync('行尾「＋子待办 / 添加备注」入口也是开关；空清单可用底部「收起」', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow({ subtasks: [], notes: '' });
+  pushSubRow(fixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      let addSub = rowAction(tree, SUB_ROW_ID, 'data-wt-subtask-add-action');
+      eq(Boolean(addSub), true, '空清单要有「＋子待办」入口：');
+      eq(addSub.props['aria-expanded'], false);
+      addSub.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      addSub = rowAction(tree, SUB_ROW_ID, 'data-wt-subtask-add-action');
+      eq(Boolean(subNode(tree, 'data-wt-subpanel', 'true')), true, '点入口 → 清单展开：');
+      eq(addSub.props['aria-expanded'], true, '入口展开后 aria-expanded=true：');
+      eq(Boolean(allNodes(tree).find((n) => n.props?.['data-wt-subtask-new'] === 'true')), true,
+        '从入口展开时直接进入新增态：');
+
+      addSub.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(subNode(tree, 'data-wt-subpanel', 'true'), null, '再点同一个入口必须收起：');
+      eq(rowAction(tree, SUB_ROW_ID, 'data-wt-subtask-add-action').props['aria-expanded'], false);
+
+      // 空清单也要有显式「收起」，且点击后清单消失
+      rowAction(tree, SUB_ROW_ID, 'data-wt-subtask-add-action').props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      const subCollapse = shellAction(tree, SUB_ROW_ID, 'data-wt-subtask-collapse');
+      eq(Boolean(subCollapse), true, '空清单底部必须有显式「收起」：');
+      eq(subCollapse.props.type, 'button', '收起必须是原生 button（Enter/Space 可切）：');
+      eq(textOf(subCollapse), '收起', '收起控件文案：');
+      eq(subCollapse.props['aria-controls'], `wt-sub-${SUB_ROW_ID}`, '收起控件 aria-controls 指向清单 id：');
+      subCollapse.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(subNode(tree, 'data-wt-subpanel', 'true'), null, '空清单点「收起」必须能收：');
+
+      // 备注入口同理
+      let addNotes = rowAction(tree, SUB_ROW_ID, 'data-wt-notes-add-action');
+      eq(addNotes.props['aria-expanded'], false);
+      addNotes.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      addNotes = rowAction(tree, SUB_ROW_ID, 'data-wt-notes-add-action');
+      eq(Boolean(subNode(tree, 'data-wt-notes-panel', 'true')), true, '点「添加备注」→ 备注区展开：');
+      eq(Boolean(allNodes(tree).find((n) => n.props?.['data-wt-notes-input'] === 'true')), true,
+        '空备注从入口展开时直接进入编辑：');
+      eq(addNotes.props['aria-expanded'], true);
+      addNotes.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(subNode(tree, 'data-wt-notes-panel', 'true'), null, '再点「添加备注」必须收起：');
+
+      rowAction(tree, SUB_ROW_ID, 'data-wt-notes-add-action').props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      const notesCollapse = shellAction(tree, SUB_ROW_ID, 'data-wt-notes-collapse');
+      eq(Boolean(notesCollapse), true, '备注区必须有显式「收起」：');
+      eq(textOf(notesCollapse), '收起', '备注收起文案：');
+      eq(notesCollapse.props['aria-controls'], `wt-notes-${SUB_ROW_ID}`, '备注收起 aria-controls 指向备注区：');
+      notesCollapse.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(subNode(tree, 'data-wt-notes-panel', 'true'), null, '备注点「收起」必须能收：');
+    });
+  } finally {
+    popSubRow(fixture);
+  }
+});
+
+await testAsync('子待办与备注互不干扰：同时展开，收起一个另一个保持展开', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow();
+  pushSubRow(fixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      progressOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      notesIconOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(Boolean(subNode(tree, 'data-wt-subpanel', 'true')), true, '子待办展开：');
+      eq(Boolean(subNode(tree, 'data-wt-notes-panel', 'true')), true, '备注也展开：');
+
+      // 收起备注：子待办保持
+      shellAction(tree, SUB_ROW_ID, 'data-wt-notes-collapse').props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(subNode(tree, 'data-wt-notes-panel', 'true'), null, '收起备注：');
+      eq(Boolean(subNode(tree, 'data-wt-subpanel', 'true')), true, '收备注不许把子待办一起收掉：');
+      eq(progressOf(tree).props['aria-expanded'], true, '子待办 aria 仍是展开：');
+      eq(notesIconOf(tree).props['aria-expanded'], false, '备注 aria 已收起：');
+
+      // 再展开备注，收起子待办：备注保持
+      notesIconOf(tree).props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      shellAction(tree, SUB_ROW_ID, 'data-wt-subtask-collapse').props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      eq(subNode(tree, 'data-wt-subpanel', 'true'), null, '收起子待办：');
+      eq(Boolean(subNode(tree, 'data-wt-notes-panel', 'true')), true, '收子待办不许把备注一起收掉：');
+      eq(notesIconOf(tree).props['aria-expanded'], true, '备注 aria 仍是展开：');
+      eq(progressOf(tree).props['aria-expanded'], false, '子待办 aria 已收起：');
+    });
+  } finally {
+    popSubRow(fixture);
+  }
+});
+
+await testAsync('开关不误触：点 chip / 入口 / 收起不会发 /status 或 /update，也不进标题编辑', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow();
+  pushSubRow(fixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      const before = fetchCalls.length;
+      let stopped = 0;
+      const evt = () => ({ stopPropagation() { stopped += 1; } });
+
+      progressOf(tree).props.onClick(evt());
+      tree = renderPanel({ t: mkSubT() });
+      notesIconOf(tree).props.onClick(evt());
+      tree = renderPanel({ t: mkSubT() });
+      progressOf(tree).props.onClick(evt());
+      tree = renderPanel({ t: mkSubT() });
+      notesIconOf(tree).props.onClick(evt());
+      tree = renderPanel({ t: mkSubT() });
+
+      const fired = fetchCalls.slice(before).filter((c) => c.url.includes('/worktodo/status') || c.url.includes('/worktodo/update'));
+      eq(fired.length, 0, `开关绝不能触发完成 / 更新请求：${JSON.stringify(fired.map((c) => c.url))}`);
+      eq(Boolean(allNodes(tree).find((n) => n.props?.['data-wt-title-input'] === 'true')), false,
+        '开关绝不能进入标题编辑：');
+      eq(stopped, 4, '四个开关都必须阻止事件冒泡到行：');
+
+      // 显式收起同样不误触
+      const beforeCollapse = fetchCalls.length;
+      progressOf(tree).props.onClick(evt());
+      tree = renderPanel({ t: mkSubT() });
+      shellAction(tree, SUB_ROW_ID, 'data-wt-subtask-collapse').props.onClick(evt());
+      tree = renderPanel({ t: mkSubT() });
+      eq(fetchCalls.slice(beforeCollapse).filter((c) => c.url.includes('/worktodo/status') || c.url.includes('/worktodo/update')).length, 0,
+        '「收起」同样不能触发完成 / 更新请求：');
+      eq(Boolean(allNodes(tree).find((n) => n.props?.['data-wt-title-input'] === 'true')), false,
+        '「收起」不能进入标题编辑：');
+    });
+  } finally {
+    popSubRow(fixture);
+  }
+});
+
+await testAsync('无障碍：chip / 备注图标 / 两个入口 / 两个收起都是原生 button，aria-controls 指向展开区', async () => {
+  document.visibilityState = 'visible';
+  const fixture = subRow({ subtasks: [{ id: 's1', title: '第一项', done: false, order: 0 }], notes: '有备注' });
+  const emptyFixture = subRow({ id: 'wt-sub-empty', title: '空行', subtasks: [], notes: '' });
+  pushSubRow(fixture);
+  pushSubRow(emptyFixture);
+  try {
+    await settleList();
+    await withStableHooksAsync(async () => {
+      let tree = renderPanel({ t: mkSubT() });
+      const chip = progressOf(tree);
+      eq(chip.props.type, 'button', 'chip 必须是原生 button：');
+      eq(chip.props['aria-controls'], `wt-sub-${SUB_ROW_ID}`, 'chip aria-controls：');
+      const icon = notesIconOf(tree);
+      eq(icon.props.type, 'button', '备注图标必须是原生 button：');
+      eq(icon.props['aria-controls'], `wt-notes-${SUB_ROW_ID}`, '备注图标 aria-controls：');
+
+      chip.props.onClick();
+      tree = renderPanel({ t: mkSubT() });
+      const panel = subNode(tree, 'data-wt-subpanel', 'true');
+      eq(panel.props.id, `wt-sub-${SUB_ROW_ID}`, '展开区 id 必须与 aria-controls 一致：');
+      const subCollapse = shellAction(tree, SUB_ROW_ID, 'data-wt-subtask-collapse');
+      eq(subCollapse.props.type, 'button', '子待办「收起」必须是原生 button：');
+
+      // 无备注行：入口也是原生 button 且带 aria
+      const addNotes = rowAction(tree, 'wt-sub-empty', 'data-wt-notes-add-action');
+      eq(addNotes.props.type, 'button', '「添加备注」入口必须是原生 button：');
+      eq(addNotes.props['aria-controls'], 'wt-notes-wt-sub-empty', '「添加备注」入口 aria-controls：');
+      eq(addNotes.props['aria-expanded'], false);
+    });
+  } finally {
+    popSubRow(fixture);
+    popSubRow(emptyFixture);
   }
 });
 

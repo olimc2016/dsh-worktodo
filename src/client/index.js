@@ -284,6 +284,7 @@ const zh = {
   'notesHide': '收起备注',
   'notesEdit': '编辑备注',
   'notesClose': '收起备注',
+  'collapsePanel': '收起',
   'notesSave': '保存备注',
   'notesSaveFailed': '备注没保存上，已恢复原值',
   'notesCount': '{count} / {max}',
@@ -475,6 +476,7 @@ const en = {
   'notesHide': 'Hide notes',
   'notesEdit': 'Edit notes',
   'notesClose': 'Hide notes',
+  'collapsePanel': 'Collapse',
   'notesSave': 'Save notes',
   'notesSaveFailed': "Couldn't save the notes — reverted",
   'notesCount': '{count} / {max}',
@@ -1042,6 +1044,9 @@ export const STYLE_TEXT = `
 .wt-subtask-chip:focus-visible { outline: 2px solid ${C.brand}; outline-offset: 1px; }
 .wt-subtask-chip.is-zero { color: ${C.label3}; }
 .wt-subtask-chip.is-done { color: ${C.ok}; border-color: ${tint(C.ok, 50)}; background: ${tint(C.ok, 10)}; }
+/* 展开态高亮 + ▾/▴ 暗示：同一颗 chip 点开再点收，状态一眼可见。 */
+.wt-subtask-chip.is-open { color: ${C.label}; border-color: ${tint(C.brand, 45)}; background: ${tint(C.brand, 12)}; }
+.wt-chip-caret { font-size: 9px; line-height: 1; opacity: .8; }
 /* 「子项全部完成 · 勾掉这条？」：轻提示也是一颗可点的 chip，不抢主操作。 */
 .wt-subtask-prompt {
   appearance: none; font: inherit; font-size: 10.5px; cursor: pointer;
@@ -1051,6 +1056,10 @@ export const STYLE_TEXT = `
 /* 备注图标：有备注才渲染（无备注不占位）；标题之后、小字组之前。 */
 .wt-notes-btn { width: 18px; height: 18px; color: ${C.label3}; }
 .wt-notes-btn:hover, .wt-notes-btn.is-open { color: ${C.brand}; background: ${tint(C.brand, 10)}; }
+/* 行尾「＋子待办 / 添加备注」入口展开时同样高亮，表明再点一下就是收起。 */
+.wt-icon-btn.is-open { color: ${C.brand}; background: ${tint(C.brand, 10)}; }
+/* 展开区底部的显式「收起」：普通链接样式，左对齐、不做成主按钮抢视线。 */
+.wt-panel-collapse { align-self: flex-start; margin-top: 2px; }
 /* 子待办 / 备注的展开区：都在行**下方**，左侧缩进到标题起始位置（18 + 8 + 26 + 8 + 8 ≈ 68px）。 */
 .wt-row-expand {
   display: flex; flex-direction: column; gap: 6px;
@@ -2684,12 +2693,72 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     setNotesDraft('');
   };
 
+  /* ---------------- 行下展开区的开关 ---------------- */
+
+  /**
+   * 收起子待办清单：连同进行中的「新增 / 改名」一起收口。
+   * 显式收起是用户主动放弃这次输入（与 Esc 同一口径），避免半截草稿留在下一次展开里。
+   */
+  const collapseSubtasks = () => {
+    setSubtasksOpen(false);
+    setSubtaskAdding(false);
+    setSubtaskDraft('');
+    setSubtaskEditingId(null);
+    setSubtaskEditDraft('');
+  };
+
+  /** 事件入口：先阻止冒泡（点击开关绝不能触发父行完成 / 标题编辑），再收起。 */
+  const closeSubtasks = (event) => {
+    event?.stopPropagation?.();
+    collapseSubtasks();
+  };
+
+  /**
+   * 子待办开关（进度 chip 与行尾「＋子待办」入口共用）：
+   * **已展开时再点 = 收起**，不能只开不收；入口打开时顺便进入新增态。
+   * 事件不冒泡到行（行本身虽没有 click，但开关绝不能顺带触发完成 / 标题编辑）。
+   */
+  const toggleSubtasks = (event, { startAdding = false } = {}) => {
+    event?.stopPropagation?.();
+    if (subtasksOpen) { collapseSubtasks(); return; }
+    setSubtasksOpen(true);
+    setSubtaskError(null);
+    if (startAdding) setSubtaskAdding(true);
+  };
+
+  /** 收起备注区：停止编辑并清掉草稿（与备注区右上角 X 同一路径）。 */
+  const collapseNotes = () => {
+    setInlineNotesOpen(false);
+    setNotesEditing(false);
+    setNotesDraft('');
+  };
+
+  /** 事件入口：先阻止冒泡，再收起。 */
+  const closeNotes = (event) => {
+    event?.stopPropagation?.();
+    collapseNotes();
+  };
+
+  /** 备注图标开关：有备注时点图标展开阅读，再点收起。 */
+  const toggleNotes = (event) => {
+    event?.stopPropagation?.();
+    if (inlineNotesOpen) { collapseNotes(); return; }
+    setInlineNotesOpen(true);
+  };
+
+  /** 行尾「添加备注」入口：没有备注时点开编辑；已经开着时再点就是收起。 */
+  const toggleNotesEntry = (event) => {
+    event?.stopPropagation?.();
+    if (inlineNotesOpen) { collapseNotes(); return; }
+    startNotesEdit();
+  };
+
   /** 行下方的 Esc：依次收起输入 → 子清单 → 备注区；输入框自己会 stopPropagation。 */
   const handleExpandKeyDown = (event) => {
     if (event?.key !== 'Escape') return;
-    if (subtaskAdding) { setSubtaskAdding(false); setSubtaskDraft(''); return; }
-    if (subtasksOpen) { setSubtasksOpen(false); return; }
-    if (inlineNotesOpen) setInlineNotesOpen(false);
+    if (subtaskAdding) { collapseSubtasks(); return; }
+    if (subtasksOpen) { collapseSubtasks(); return; }
+    if (inlineNotesOpen) collapseNotes();
   };
 
   const stopEdit = () => { setEditing(false); setDraft(null); };
@@ -3079,19 +3148,27 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
     ? React.createElement('button', {
       key: 'subtasks',
       type: 'button',
-      className: `wt-tag wt-subtask-chip wt-meta-chip${subtaskDone === 0 ? ' is-zero' : ''}${allSubtasksDone ? ' is-done' : ''}`,
+      className: `wt-tag wt-subtask-chip wt-meta-chip${subtaskDone === 0 ? ' is-zero' : ''}${allSubtasksDone ? ' is-done' : ''}${subtasksOpen ? ' is-open' : ''}`,
       'data-wt-meta-chip': 'subtasks',
       'data-wt-subtask-progress': 'true',
       'data-wt-subtask-done': String(subtaskDone),
       'data-wt-subtask-total': String(subtaskTotal),
+      'data-wt-subtask-expanded': subtasksOpen ? 'true' : 'false',
       'aria-label': progressLabel,
       'aria-expanded': subtasksOpen,
       'aria-controls': `wt-sub-${row.id}`,
       title: subtasksOpen ? t('subtaskCollapse') : t('subtaskExpand'),
-      onClick: () => setSubtasksOpen((open) => !open),
+      onClick: toggleSubtasks,
     }, [
       React.createElement(IconList, { key: 'i' }),
       React.createElement('span', { key: 'n' }, `${subtaskDone}/${subtaskTotal}`),
+      // 展开/收起暗示：收起态 ▾、展开态 ▴（纯视觉，读屏靠 aria-expanded）
+      React.createElement('span', {
+        key: 'caret',
+        className: 'wt-chip-caret',
+        'data-wt-chip-caret': subtasksOpen ? 'up' : 'down',
+        'aria-hidden': 'true',
+      }, subtasksOpen ? '▴' : '▾'),
       React.createElement('span', {
         key: 'live', className: 'wt-sr-only', 'aria-live': 'polite',
       }, progressLabel),
@@ -3271,14 +3348,12 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
           type: 'button',
           className: `wt-icon-btn wt-notes-btn${inlineNotesOpen ? ' is-open' : ''}`,
           'data-wt-notes-icon': 'true',
+          'data-wt-notes-expanded': inlineNotesOpen ? 'true' : 'false',
           'aria-label': t('notesLabel'),
           'aria-expanded': inlineNotesOpen,
           'aria-controls': `wt-notes-${row.id}`,
           title: inlineNotesOpen ? t('notesClose') : t('notesEdit'),
-          onClick: () => {
-            setInlineNotesOpen((open) => !open);
-            setNotesEditing(false);
-          },
+          onClick: toggleNotes,
         }, React.createElement(IconNote, { key: 'i' }))
         : null,
       // 来源 / 「已过期」chip 都在小字组里，标题列不再放胶囊
@@ -3309,26 +3384,34 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       'data-wt-actions': 'true',
     }, [
       // 轻入口：**只在没有内容时**出现在行尾（有内容时用进度 chip / 备注图标进入，不挤常驻区）。
+      // 它也是开关：点开清单（并进入新增态）后，再点同一个入口就收起 —— 不能只开不收。
       !subtaskTotal
         ? React.createElement('button', {
           key: 'add-subtask',
           type: 'button',
-          className: 'wt-icon-btn',
+          className: `wt-icon-btn${subtasksOpen ? ' is-open' : ''}`,
           'data-wt-subtask-add-action': 'true',
-          title: t('subtaskAddLabel'),
-          'aria-label': t('subtaskAddLabel'),
-          onClick: () => { setSubtasksOpen(true); setSubtaskAdding(true); setSubtaskError(null); },
+          'data-wt-subtask-expanded': subtasksOpen ? 'true' : 'false',
+          'aria-expanded': subtasksOpen,
+          'aria-controls': `wt-sub-${row.id}`,
+          title: subtasksOpen ? t('subtaskCollapse') : t('subtaskAddLabel'),
+          'aria-label': subtasksOpen ? t('subtaskCollapse') : t('subtaskAddLabel'),
+          onClick: (event) => toggleSubtasks(event, { startAdding: true }),
         }, React.createElement(IconList, { key: 'i' }))
         : null,
+      // 「添加备注」入口同样双向：没有备注时点开编辑，已经开着时再点收起。
       !hasNotes
         ? React.createElement('button', {
           key: 'add-notes',
           type: 'button',
-          className: 'wt-icon-btn',
+          className: `wt-icon-btn${inlineNotesOpen ? ' is-open' : ''}`,
           'data-wt-notes-add-action': 'true',
-          title: t('notesAdd'),
-          'aria-label': t('notesAdd'),
-          onClick: startNotesEdit,
+          'data-wt-notes-expanded': inlineNotesOpen ? 'true' : 'false',
+          'aria-expanded': inlineNotesOpen,
+          'aria-controls': `wt-notes-${row.id}`,
+          title: inlineNotesOpen ? t('notesClose') : t('notesAdd'),
+          'aria-label': inlineNotesOpen ? t('notesClose') : t('notesAdd'),
+          onClick: toggleNotesEntry,
         }, React.createElement(IconNote, { key: 'i' }))
         : null,
       // 标题单击改成行内编辑之后，完整表单（备注 / 日期 / 优先级 / 项目）从这里进
@@ -3513,6 +3596,16 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       subtaskError
         ? React.createElement('div', { key: 'err', className: 'wt-sub-error', role: 'status' }, subtaskError)
         : null,
+      // 显式收起：清单底部（空清单也有）一个可见的「收起」按钮，
+      // 不依赖再点一次 chip / 入口，也不依赖 Esc。
+      React.createElement('button', {
+        key: 'collapse',
+        type: 'button',
+        className: 'wt-link wt-panel-collapse',
+        'data-wt-subtask-collapse': 'true',
+        'aria-controls': `wt-sub-${row.id}`,
+        onClick: closeSubtasks,
+      }, t('collapsePanel')),
     ])
     : null;
 
@@ -3544,7 +3637,8 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
           className: 'wt-icon-btn',
           'aria-label': t('notesClose'),
           title: t('notesClose'),
-          onClick: () => { setInlineNotesOpen(false); setNotesEditing(false); },
+          'aria-controls': `wt-notes-${row.id}`,
+          onClick: closeNotes,
         }, React.createElement(IconClose, { key: 'i' })),
       ]),
       notesEditing
@@ -3589,6 +3683,15 @@ const TodoRow = React.memo(function TodoRow({ todo, today, t, onToggle, onRemove
       notesError
         ? React.createElement('div', { key: 'err', className: 'wt-sub-error', role: 'status' }, notesError)
         : null,
+      // 备注展开区里同样有显式「收起」：阅读态 / 编辑态 /（空备注）新增态都能一键收。
+      React.createElement('button', {
+        key: 'collapse',
+        type: 'button',
+        className: 'wt-link wt-panel-collapse',
+        'data-wt-notes-collapse': 'true',
+        'aria-controls': `wt-notes-${row.id}`,
+        onClick: closeNotes,
+      }, t('collapsePanel')),
     ])
     : null;
 
