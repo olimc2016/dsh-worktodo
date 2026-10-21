@@ -38,6 +38,8 @@ const SUITES = [
   ['smoke-host.mjs', '宿主接线与工具'],
   ['smoke-contract.mjs', '客户端↔宿主契约'],
   ['smoke-client.mjs', '客户端 bundle'],
+  ['verify-docs.mjs', '文档引用与跨仓同步'],
+  ['verify-meta.mjs', '版本字面量元测试'],
   ['verify-workflows.mjs', 'CI workflow 契约'],
   ['verify-privacy.mjs', '发布面审计（隐私与文档完整性）'],
   ['verify-submission.mjs', '收录提交门禁'],

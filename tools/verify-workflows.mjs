@@ -106,6 +106,20 @@ test('发布前先锁文件安装、跑测试、构建客户端', () => {
   eq(order.every((i, idx) => i !== -1 && (idx === 0 || i > order[idx - 1])), true, `步骤顺序不对：${order}`);
 });
 
+test('npm install -g npm@latest 必须在 actions/setup-node 之后，且只出现一次', () => {
+  // `npm stage publish` 需要 npm ≥ 11.15，而 node 22 自带 npm 10.x。
+  // 若把这行放在 setup-node **之前**，setup-node 装的 node / npm 会把它覆盖掉，
+  // 症状是 `npm stage` 未知命令（L12-⑥）。用行号索引比较，不靠字符串包含。
+  const lines = publish.split('\n');
+  const setupLine = lines.findIndex((line) => /uses:\s*actions\/setup-node@/.test(line)) + 1;
+  const npmLines = lines
+    .map((line, index) => (line.includes('npm install -g npm@latest') ? index + 1 : 0))
+    .filter((line) => line > 0);
+  eq(setupLine > 0, true, 'publish.yml 里找不到 uses: actions/setup-node：');
+  eq(npmLines.length, 1, `npm install -g npm@latest 必须恰好出现一次，实际在 ${JSON.stringify(npmLines)} 行：`);
+  eq(npmLines[0] > setupLine, true, `npm install -g npm@latest（第 ${npmLines[0]} 行）必须在 setup-node（第 ${setupLine} 行）之后：`);
+});
+
 test('所有 action 都固定在大版本 tag（不用浮动分支）', () => {
   const uses = [...publish.matchAll(/uses:\s*([^\s#]+)/g)].map((m) => m[1]);
   eq(uses.length > 0, true, '没有找到 uses：');

@@ -94,6 +94,28 @@ function platformDependencyViolations(manifest) {
 }
 
 /**
+ * 所有 `@deepseek-ai/*` peer 都必须标 `optional`。
+ *
+ * 为什么不止三个平台包：`@deepseek-ai/cordis` 同样是**宿主提供的平台包**。把任何一个
+ * 写成必装 peer，都会在宿主缺失 / 版本不符时让安装直接失败——「插件的可选依赖」就变成
+ * 「宿主的硬依赖」。这条与「dependencies 里不得出现 @deepseek-ai/*」是同一道防线的两面。
+ *
+ * 返回违规项而不是直接抛错，同样是为了让「反向自检」能拿故意改坏的清单证明它会红。
+ * @param {object} manifest
+ * @returns {string[]}
+ */
+function optionalPeerViolations(manifest) {
+  const peers = manifest.peerDependencies ?? {};
+  const meta = manifest.peerDependenciesMeta ?? {};
+  const violations = [];
+  for (const name of Object.keys(peers)) {
+    if (!name.startsWith('@deepseek-ai/')) continue;
+    if (meta[name]?.optional !== true) violations.push(`${name} 未在 peerDependenciesMeta 里标 optional`);
+  }
+  return violations;
+}
+
+/**
  * 服务端源码（`lib/index.js` + `src/*.mjs`）的 import 清单。
  *
  * 只按行扫，避免正则跨语句把注释/多行字符串误当成 import。
@@ -297,6 +319,25 @@ test('平台包只能是可选 peer：dependencies 里出现 @deepseek-ai/* 即�
   eq(staticBare, [], '服务端源码在模块顶层静态 import 了非 node: 包（平台包缺失时会连累宿主加载）：');
   eq([...new Set(dynamicBare)].sort(), [...PLATFORM_PACKAGES].sort(),
     '运行期动态 import 的平台包集合必须与 peer 声明一致：');
+});
+
+test('所有 @deepseek-ai/* peer 都必须标 optional（含 cordis，不只是三个平台包）', () => {
+  // cordis 必须在 peer 里被覆盖到，否则这条断言会「跳过一个真实存在于清单里的平台包」
+  eq(Object.hasOwn(pkg.peerDependencies ?? {}, '@deepseek-ai/cordis'), true, 'peerDependencies 里没有 @deepseek-ai/cordis：');
+  eq(optionalPeerViolations(pkg), [], '有 @deepseek-ai/* peer 没标 optional：');
+
+  // 反向自检：只去掉 cordis 的 optional，其他平台包保持原样——必须报红
+  const withoutCordisOptional = {
+    ...pkg,
+    peerDependenciesMeta: Object.fromEntries(
+      Object.entries(pkg.peerDependenciesMeta ?? {}).filter(([name]) => name !== '@deepseek-ai/cordis'),
+    ),
+  };
+  eq(
+    optionalPeerViolations(withoutCordisOptional).some((item) => item.includes('@deepseek-ai/cordis')),
+    true,
+    `把 cordis 的 optional 去掉却没被抓住：${JSON.stringify(optionalPeerViolations(withoutCordisOptional))}`,
+  );
 });
 
 test('反向自检：把平台包塞回 dependencies，上面的校验必须变红', () => {

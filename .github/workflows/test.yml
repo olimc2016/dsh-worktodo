@@ -1,6 +1,6 @@
 # 测试与构建（每次 push / PR 都跑）。
 #
-# 为什么值得有：这个插件的卖点之一是「可被验证」——175 个用例不需要启动 DSH。
+# 为什么值得有：这个插件的卖点之一是「可被验证」——构建 + 12 步自检不需要启动 DSH。
 # CI 把这句话变成可核对的事实，也让目录源与下载者一眼看到它是绿的。
 #
 # 为什么用 pnpm 而不是 npm：**pnpm 是本地唯一被验证过的路径**。本地没装 npm，而
@@ -51,7 +51,9 @@ jobs:
       - name: Build client bundle
         run: pnpm run build
 
-      - name: Test (175 cases, no DSH instance needed)
+      # 覆盖面：构建 + 11 个 suite = 12 步（verify-all 的汇总口径）。
+      # 「175 cases」是旧说法，会随 suite 增减漂移；这里写步骤口径，并由 verify-workflows 守着。
+      - name: Test (build + 12 steps green, no DSH instance needed)
         run: pnpm test
 
       - name: Check the published tarball contains the browser half
@@ -63,3 +65,27 @@ jobs:
           for required in package/lib/index.js package/lib/client.js package/cordis.patch.yml package/icon.svg; do
             grep -q "$required" /tmp/pack.txt || { echo "::error::tarball is missing $required"; exit 1; }
           done
+
+  # Windows 观测 job：只跑三个纯文本 / 结构 suite（不 import 平台包、不装依赖），
+  # 用来攒跨平台证据（路径分隔符 / 换行 / 大小写）。
+  # continue-on-error: true 表示「允许失败」：观测中，转正条件见 docs/process/development-standard.md §3.3
+  # （全量 suite 在 Windows 连续绿 N 次后改成正式门禁）。
+  windows-observe:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      # 不装依赖：这三个 suite 只读文本与 package.json，跑在裸 node 上即可。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: verify-docs (observational)
+        run: node tools/verify-docs.mjs
+
+      - name: verify-meta (observational)
+        run: node tools/verify-meta.mjs
+
+      - name: verify-workflows (observational)
+        run: node tools/verify-workflows.mjs

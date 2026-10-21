@@ -67,6 +67,27 @@ function trackedFiles() {
   return run.stdout.split('\n').filter(Boolean).sort();
 }
 
+/**
+ * 发布包边界违规项。
+ *
+ * tools/ 默认不上传（构建与测试脚本）；**唯一例外**是运行时独立安装器：
+ * 宿主在安装时必须 spawn 本包自带的 tools/apply-update.mjs，所以它必须进发布包。
+ * 两个方向都要查：多出别的 tools/* 要红；少了安装器同样要红。
+ *
+ * 返回数组而不是直接抛错，是为了让下面的「反向自检」能拿一份故意改坏的清单
+ * 验证这套判定真的会红——没有反向验证的测试不算测试。
+ * @param {string[]} files
+ * @returns {string[]}
+ */
+function publishBoundaryViolations(files) {
+  const violations = [];
+  for (const file of files.filter((f) => f.startsWith('tools/'))) {
+    if (file !== 'tools/apply-update.mjs') violations.push(`多余的 tools 文件：${file}`);
+  }
+  if (!files.includes('tools/apply-update.mjs')) violations.push('缺少运行时安装器：tools/apply-update.mjs');
+  return violations;
+}
+
 /* ------------------------------------------------------------------- 规则 */
 
 /** 允许出现的 IPv4：本地回环与 RFC 5737 文档示例段（192.0.2.0/24、198.51.100.0/24、203.0.113.0/24）。 */
@@ -133,8 +154,23 @@ process.stdout.write('发布包内容边界\n');
 // 这里不放宽成「允许 tools/」：除这一个文件外出现任何 tools/* 仍然判红。
 check(
   '发布包里 tools/ 只允许运行时安装器 tools/apply-update.mjs',
-  dist.filter((f) => f.startsWith('tools/')).every((f) => f === 'tools/apply-update.mjs'),
-  dist.filter((f) => f.startsWith('tools/')).join(', '),
+  publishBoundaryViolations(dist).length === 0,
+  publishBoundaryViolations(dist).join(', '),
+);
+check(
+  '发布包必须包含 tools/apply-update.mjs（宿主安装时要 spawn 它）',
+  dist.includes('tools/apply-update.mjs'),
+  '缺了它，宿主在安装 / 升级时会找不到独立安装器',
+);
+check(
+  '反向自检：合成清单删掉 tools/apply-update.mjs，上面的校验必须变红',
+  publishBoundaryViolations(dist.filter((f) => f !== 'tools/apply-update.mjs')).some((item) => item.includes('apply-update')),
+  '删掉安装器却没被抓住',
+);
+check(
+  '反向自检：合成清单塞进 tools/build-client.mjs，上面的校验必须变红',
+  publishBoundaryViolations([...dist, 'tools/build-client.mjs']).some((item) => item.includes('build-client')),
+  '多出构建脚本却没被抓住',
 );
 check(
   '发布包里没有 docs/ 与 .github/（内部文档与 CI 配置不该上传）',

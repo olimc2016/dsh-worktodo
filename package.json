@@ -120,6 +120,8 @@
     "build": "node tools/build-client.mjs",
     "watch": "node tools/build-client.mjs --watch",
     "test": "node tools/verify-all.mjs",
+    "preflight": "node tools/preflight.mjs",
+    "verify:docs": "node tools/verify-docs.mjs",
     "prepublishOnly": "node tools/build-client.mjs && node tools/verify-all.mjs"
   },
   "publishConfig": {
